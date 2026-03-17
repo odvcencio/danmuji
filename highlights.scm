@@ -160,3 +160,4 @@
 
 ;; consistently_block
 (consistently_block name: (_) @string)
+

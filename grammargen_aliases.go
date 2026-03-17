@@ -71,3 +71,5 @@ var (
 
 // GenerateHighlightQueries re-exports the highlight query generator.
 var GenerateHighlightQueries = grammargen.GenerateHighlightQueries
+
+var ExportGrammarJSON = grammargen.ExportGrammarJSON
