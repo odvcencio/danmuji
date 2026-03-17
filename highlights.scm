@@ -152,8 +152,6 @@
 ;; matrix_block
 (matrix_block name: (_) @string)
 
-;; property_block
-(property_block name: (_) @string)
 
 ;; eventually_block
 (eventually_block name: (_) @string)

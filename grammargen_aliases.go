@@ -73,3 +73,5 @@ var (
 var GenerateHighlightQueries = grammargen.GenerateHighlightQueries
 
 var ExportGrammarJSON = grammargen.ExportGrammarJSON
+
+var ImportGrammarJSON = grammargen.ImportGrammarJSON
