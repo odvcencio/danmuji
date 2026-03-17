@@ -2,6 +2,8 @@
 
 A BDD testing language for Go. Write expressive test specs in `.dmj` files, compile them to standard `go test` code. No runtime library, no reflection, no magic.
 
+Built on [gotreesitter](https://github.com/odvcencio/gotreesitter) — a pure-Go Tree-sitter implementation with grammar composition.
+
 ```dmj
 package cart_test
 
@@ -109,6 +111,7 @@ Each block becomes a `t.Run` subtest. Nest them as deep as you want.
 expect x == 1                  // assert.Equal(t, 1, x)
 expect x != 0                  // assert.NotEqual(t, 0, x)
 expect err == nil              // require.NoError(t, err)
+expect result is_nil           // assert.Nil(t, result)
 expect result not_nil          // assert.NotNil(t, result)
 expect items contains "apple"  // assert.Contains(t, items, "apple")
 reject ok                      // assert.False(t, ok)
@@ -132,22 +135,24 @@ unit "auth" {
 }
 ```
 
-### Eventual and Consistent Assertions
+### Eventual and consistent assertions
 
 ```dmj
 unit "retries" {
 	then "waits for background work" {
-		eventually "job has finished" within 5 * time.Second {
+		eventually "job has finished" within 5s {
 			expect jobDone
 		}
-		consistently "job sends once" for 2 * time.Second {
+		consistently "job sends once" for 2s {
 			reject duplicateSend
 		}
 	}
 }
 ```
 
-These are compiled into polling loops in generated Go so you can express temporal behavior without writing custom helper goroutine scaffolding.
+Duration shorthand literals are supported: `5s`, `2.5m`, `30ms`, `100us`, `1h`. You can also use full Go expressions like `5 * time.Second`. The `within` and `for` clauses are optional — omit them to use defaults.
+
+These compile into polling loops so you can express temporal behavior without writing custom helper goroutine scaffolding.
 
 ### Mocks
 
@@ -169,6 +174,14 @@ unit "service" {
 
 Generates a struct with call counters and canned return values. No code generation step, no external tool.
 
+Verification supports:
+
+```dmj
+verify repo.Save called 1 times
+verify repo.Save called with ("alice")
+verify repo.Save not_called
+```
+
 ### Fakes
 
 ```dmj
@@ -185,8 +198,8 @@ Like mocks, but with real method bodies. Use when you need working behavior, not
 
 ```dmj
 spy EventBus {
-    Publish(topic string, data interface{})
-    Subscribe(topic string) -> chan interface{}
+    Publish(topic string)
+    Subscribe(topic string) -> error = nil
 }
 ```
 
@@ -202,11 +215,17 @@ unit "database tests" {
     after each {
         db.Close()
     }
+    before all {
+        initTestEnvironment()
+    }
+    after all {
+        teardownTestEnvironment()
+    }
     // ...
 }
 ```
 
-`before each` inlines at the top of each subtest. `after each` becomes `t.Cleanup`.
+`before each` inlines at the top of each subtest. `after each` becomes `t.Cleanup`. `before all` / `after all` run once for the enclosing test function.
 
 ### Tags
 
@@ -216,7 +235,7 @@ unit "database tests" {
 integration "heavy test" { ... }
 ```
 
-`@slow` adds `if testing.Short() { t.Skip() }`. `@skip` skips unconditionally. `@parallel` adds `t.Parallel()`.
+`@slow` adds `if testing.Short() { t.Skip() }`. `@skip` skips unconditionally. `@parallel` adds `t.Parallel()`. Any `@identifier` is a valid tag.
 
 ### Scenario-driven tests
 
@@ -274,12 +293,31 @@ unit "integer rules" {
 
 This compiles into `testing/quick.Check` with a predicate-style function, so the body is evaluated over generated values instead of a fixed example table. The optional `up to N` clause overrides the default sample count.
 
+### Data tables
+
+```dmj
+unit "addition" {
+    table cases {
+        | 1 | 2 | 3 |
+        | 4 | 5 | 9 |
+        | 100 | 200 | 300 |
+    }
+    each row in cases {
+        then "adds correctly" {
+            expect row.Col0 + row.Col1 == row.Col2
+        }
+    }
+}
+```
+
+Generates a typed struct per table and iterates with `for...range`.
+
 ### Containers (testcontainers-go)
 
 ```dmj
 integration "database round-trip" {
-    needs postgres "db" {}
-    needs redis "cache" {}
+    needs postgres db {}
+    needs redis cache {}
 
     given "a connected database" {
         // db and cache containers are running
@@ -326,7 +364,7 @@ Generates `b.RunParallel`.
 load "checkout endpoint" {
     rate 50
     duration 30
-    target post "http://localhost:8080/api/checkout" {}
+    target post "http://localhost:8080/api/checkout"
 
     then "fast enough" {
         expect true
@@ -335,6 +373,8 @@ load "checkout endpoint" {
 ```
 
 Generates [vegeta](https://github.com/tsenart/vegeta) attack code with rate limiting, duration, and metrics collection. Load tests get `//go:build e2e` by default.
+
+Additional load config options: `rampup` and `concurrency`.
 
 ### Profiling
 
@@ -351,6 +391,8 @@ unit "goroutine check" {
 ```
 
 Captures `runtime/pprof` profiles inline with your tests. Supports: `cpu`, `mem`, `allocs`, `routines`, `blockprofile`, `mutexprofile`.
+
+Profile directives: `show top N` to print top N entries, `save "path"` to write a profile file.
 
 ### Goroutine leak detection
 
@@ -385,6 +427,8 @@ unit "scheduler" {
 }
 ```
 
+Three forms: `fake_clock at "time" in "tz"`, `fake_clock at "time"`, or bare `fake_clock` for a default zero-value clock.
+
 Generates a `Clock` interface and `fakeClock` struct with `Advance`, `Set`, and `SetLocation` methods.
 
 ### Shell commands
@@ -394,6 +438,7 @@ unit "migrations" {
     exec "run migrations" {
         run "migrate -database $DB_URL up"
         expect exit_code == 0
+        expect stdout contains "applied"
     }
 }
 ```
@@ -418,7 +463,7 @@ First run creates `testdata/snapshots/user_json.golden`. Subsequent runs compare
 
 ## How it works
 
-Danmuji extends Go's grammar using [gotreesitter](https://github.com/odvcencio/gotreesitter)'s `grammargen` package. The extended grammar parses `.dmj` files into a concrete syntax tree, then a transpiler walks the tree and emits Go code.
+Danmuji extends Go's grammar using [gotreesitter](https://github.com/odvcencio/gotreesitter)'s `grammargen` package. The extended grammar parses `.dmj` files into a concrete syntax tree, then a transpiler walks the tree and emits Go code. The grammar adds ~50 new productions on top of Go's base grammar, all defined in pure Go using gotreesitter's composable DSL.
 
 The generated code depends on:
 - [testify](https://github.com/stretchr/testify) for assertions
@@ -429,7 +474,7 @@ These are dependencies of your test code, not of danmuji itself. Add them to you
 
 ## File convention
 
-```dmj
+```
 myservice/
   user.go                  # implementation
   user_test.go             # existing Go tests (keep these)
@@ -441,7 +486,7 @@ Danmuji doesn't replace your existing tests. It layers on top.
 
 ## Status
 
-Working and tested. 48 tests pass including end-to-end compile-and-run tests that verify the generated Go code actually works.
+Working and tested. 92 tests pass across grammar parsing, transpiler output, highlight queries, and end-to-end compile-and-run tests that verify the generated Go code actually compiles and executes correctly.
 
 This is an early release. The grammar and transpiler are functional but the generated code patterns may evolve.
 
