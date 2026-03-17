@@ -1,0 +1,12 @@
+package load_test
+
+import "testing"
+
+load "api throughput" {
+	rate 10
+	duration 5
+	target get "http://localhost:8080/health"
+	then "healthy" {
+		expect true
+	}
+}

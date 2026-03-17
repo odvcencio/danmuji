@@ -1,0 +1,17 @@
+package bench_test
+
+import "testing"
+
+benchmark "string concat" {
+	setup {
+		parts := []string{"hello", " ", "world"}
+	}
+	measure {
+		result := ""
+		for _, p := range parts {
+			result += p
+		}
+		_ = result
+	}
+	report_allocs
+}

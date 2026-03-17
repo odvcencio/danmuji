@@ -1,0 +1,31 @@
+package myservice_test
+
+import "testing"
+
+mock UserRepo {
+	FindByID(id int) -> error = nil
+	Save(u string) -> error = nil
+}
+
+unit "UserService.Create" {
+	given "valid input" {
+		when "creating a user" {
+			name := "alice"
+			then "returns the name" {
+				expect name == "alice"
+			}
+			then "name is not empty" {
+				expect name != ""
+			}
+		}
+	}
+
+	given "empty input" {
+		when "creating with empty string" {
+			name := ""
+			then "name is empty" {
+				expect name == ""
+			}
+		}
+	}
+}

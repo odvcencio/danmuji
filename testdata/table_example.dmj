@@ -1,0 +1,17 @@
+package math_test
+
+import "testing"
+
+unit "addition" {
+	table cases {
+		| 1 | 2 | 3 |
+		| 0 | 0 | 0 |
+		| -1 | 1 | 0 |
+		| 100 | 200 | 300 |
+	}
+	each row in cases {
+		then "adds correctly" {
+			expect true
+		}
+	}
+}

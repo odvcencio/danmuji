@@ -1,0 +1,40 @@
+package fullstack_test
+
+import "testing"
+
+mock UserRepo {
+	FindByID(id int) -> error = nil
+	Save(name string) -> error = nil
+}
+
+unit "UserService" {
+	before each {
+		repo := &mockUserRepo{}
+	}
+
+	after each {
+		repo = nil
+	}
+
+	given "valid input" {
+		when "creating a user" {
+			name := "alice"
+			err := repo.Save(name)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "returns name" {
+				expect name == "alice"
+			}
+		}
+	}
+}
+
+benchmark "string operations" {
+	measure {
+		s := "hello" + " " + "world"
+		_ = s
+	}
+	report_allocs
+}
