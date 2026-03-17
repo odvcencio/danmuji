@@ -77,6 +77,11 @@ func DanmujiGrammar() *Grammar {
 						Seq(Str("contains"), Field("expected", Sym("_expression"))),
 						Str("is_nil"),
 						Str("not_nil"),
+						// Domain matcher style: expect user to_have_role "admin"
+						Seq(
+							Field("matcher", Sym("identifier")),
+							Optional(Field("expected", Sym("_expression"))),
+						),
 					),
 				),
 			))
@@ -86,6 +91,11 @@ func DanmujiGrammar() *Grammar {
 				Str("reject"),
 				Field("actual", Sym("_expression")),
 			))
+
+		// Optional shorthand durations for polling and time DSL (e.g., 5s, 2.5m, 30ms).
+		g.Define("duration_literal",
+			ImmToken(Pat(`[0-9]+(?:\.[0-9]+)?(?:ns|us|µs|ms|s|m|h)`)),
+		)
 
 		// ---------------------------------------------------------------
 		// Test doubles: mock, fake, spy
@@ -300,6 +310,7 @@ func DanmujiGrammar() *Grammar {
 		g.Define("profile_block", Seq(
 			Str("profile"),
 			Field("type", Sym("profile_type")),
+			Optional(Field("directive", Sym("profile_directive"))),
 			Optional(Sym("block")),
 		))
 
@@ -398,6 +409,58 @@ func DanmujiGrammar() *Grammar {
 			Field("body", Sym("block")),
 		))
 
+		// property_block: "property" string "for" "all" parameter_list
+		// ["up" "to" max_count] block
+		//
+		//   property "commutative sum" for all (a int, b int) up to 200 {
+		//     expect a + b == b + a
+		//   }
+		g.Define("property_block", Seq(
+			Str("property"),
+			Field("name", Sym("_string_literal")),
+			Str("for"),
+			Str("all"),
+			Field("params", Sym("parameter_list")),
+			Optional(Seq(
+				Str("up"),
+				Str("to"),
+				Field("max_count", Sym("_expression")),
+			)),
+			Field("body", Sym("block")),
+		))
+
+		// ---------------------------------------------------------------
+		// Polling semantics
+		//
+		// eventually "description" within <duration> { ... }
+		// consistently "description" for <duration> { ... }
+		// ---------------------------------------------------------------
+		g.Define("eventually_block", Seq(
+			Str("eventually"),
+			Field("name", Sym("_string_literal")),
+			Optional(Seq(
+				Str("within"),
+				Field("duration", Choice(
+					Sym("_expression"),
+					Sym("duration_literal"),
+				)),
+			)),
+			Field("body", Sym("block")),
+		))
+
+		g.Define("consistently_block", Seq(
+			Str("consistently"),
+			Field("name", Sym("_string_literal")),
+			Optional(Seq(
+				Str("for"),
+				Field("duration", Choice(
+					Sym("_expression"),
+					Sym("duration_literal"),
+				)),
+			)),
+			Field("body", Sym("block")),
+		))
+
 		// ---------------------------------------------------------------
 		// Wire into Go: extend _top_level_declaration and _statement
 		// ---------------------------------------------------------------
@@ -437,6 +500,9 @@ func DanmujiGrammar() *Grammar {
 			Sym("snapshot_block"),
 			Sym("each_do_block"),
 			Sym("matrix_block"),
+			Sym("property_block"),
+			Sym("eventually_block"),
+			Sym("consistently_block"),
 			Sym("defaults_block"),
 			Sym("scenario_entry"),
 			Sym("scenario_field"),
@@ -475,10 +541,13 @@ func DanmujiGrammar() *Grammar {
 		AddConflict(g, "_statement", "snapshot_block")
 		AddConflict(g, "_statement", "each_do_block")
 		AddConflict(g, "_statement", "matrix_block")
+		AddConflict(g, "_statement", "property_block")
 		AddConflict(g, "_statement", "defaults_block")
 		AddConflict(g, "_statement", "scenario_entry")
 		AddConflict(g, "_statement", "scenario_field")
 		AddConflict(g, "_statement", "matrix_field")
+		AddConflict(g, "_statement", "eventually_block")
+		AddConflict(g, "_statement", "consistently_block")
 
 		g.EnableLRSplitting = true
 	})

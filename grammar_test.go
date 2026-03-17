@@ -169,12 +169,38 @@ func TestDanmujiExpect(t *testing.T) {
 func f() {
 	expect x == 1
 	expect err != nil
+	expect user to_have_role "admin"
+	expect order to_be_paid
 }
 `
 	sexp := parseDanmuji(t, input)
 	t.Logf("SExpr: %s", sexp)
 	if !strings.Contains(sexp, "expect_statement") {
 		t.Error("expected expect_statement node")
+	}
+	if strings.Contains(sexp, "ERROR") {
+		t.Errorf("unexpected ERROR: %s", sexp)
+	}
+}
+
+func TestDanmujiEventuallyAndConsistently(t *testing.T) {
+	input := `package main
+func f() {
+	eventually "job completes" within 5s {
+		expect jobDone == true
+	}
+	consistently "no duplicates" for 2s {
+		reject hasDuplicates
+	}
+}
+`
+	sexp := parseDanmuji(t, input)
+	t.Logf("SExpr: %s", sexp)
+	if !strings.Contains(sexp, "eventually_block") {
+		t.Error("expected eventually_block node")
+	}
+	if !strings.Contains(sexp, "consistently_block") {
+		t.Error("expected consistently_block node")
 	}
 	if strings.Contains(sexp, "ERROR") {
 		t.Errorf("unexpected ERROR: %s", sexp)
@@ -472,6 +498,24 @@ func f() {
 	t.Logf("SExpr: %s", sexp)
 	if !strings.Contains(sexp, "each_do_block") {
 		t.Error("expected each_do_block")
+	}
+	if strings.Contains(sexp, "ERROR") {
+		t.Errorf("unexpected ERROR: %s", sexp)
+	}
+}
+
+func TestDanmujiProperty(t *testing.T) {
+	input := `package main
+func f() {
+	property "addition commutes" for all (a int, b int) up to 500 {
+		expect a + b == b + a
+	}
+}
+`
+	sexp := parseDanmuji(t, input)
+	t.Logf("SExpr: %s", sexp)
+	if !strings.Contains(sexp, "property_block") {
+		t.Error("expected property_block")
 	}
 	if strings.Contains(sexp, "ERROR") {
 		t.Errorf("unexpected ERROR: %s", sexp)

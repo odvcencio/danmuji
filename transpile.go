@@ -2,7 +2,12 @@ package danmuji
 
 import (
 	"fmt"
+	"go/ast"
+	"go/format"
+	"go/parser"
+	"go/token"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -72,10 +77,20 @@ type dmjTranspiler struct {
 	neededImports map[string]bool
 	// Whether we are inside an exec block (for special identifier translation).
 	inExecBlock bool
+	// Whether we are emitting an eventually/consistently body where expect/reject
+	// should be rendered as boolean conditions.
+	inPollingBlock bool
+	// Whether we are emitting a property block where expect/reject should be
+	// rendered as boolean conditions.
+	inPropertyBlock bool
+	// Execution context for richer assertion messages.
+	contextStack []string
 	// Whether the Clock interface/fakeClock struct has been collected for package-level emission.
 	fakeClockTypeCollected bool
 	// Package-level type definitions for fake clock (emitted before test function).
 	fakeClockTypeDecl string
+	// One-time package-level helpers for polling assertions.
+	pollingHelpersEmitted bool
 }
 
 // addImport records a package path that should be injected into the import block.
@@ -88,6 +103,38 @@ func (t *dmjTranspiler) addImport(pkg string) {
 
 func (t *dmjTranspiler) text(n *gotreesitter.Node) string {
 	return string(t.src[n.StartByte():n.EndByte()])
+}
+
+func (t *dmjTranspiler) lineOf(n *gotreesitter.Node) int {
+	return strings.Count(string(t.src[:n.StartByte()]), "\n") + 1
+}
+
+func (t *dmjTranspiler) assertContextString() string {
+	if len(t.contextStack) == 0 {
+		return ""
+	}
+	return strings.Join(t.contextStack, " > ")
+}
+
+func (t *dmjTranspiler) pushContext(context string) {
+	t.contextStack = append(t.contextStack, context)
+}
+
+func (t *dmjTranspiler) popContext() {
+	if len(t.contextStack) == 0 {
+		return
+	}
+	t.contextStack = t.contextStack[:len(t.contextStack)-1]
+}
+
+func (t *dmjTranspiler) expectFailureContext(prefix, rawText string, n *gotreesitter.Node) string {
+	line := t.lineOf(n)
+	context := t.assertContextString()
+	trimmed := strings.TrimSpace(rawText)
+	if context == "" {
+		return strconv.Quote(fmt.Sprintf("danmuji:%d: %s (%s)", line, prefix, trimmed))
+	}
+	return strconv.Quote(fmt.Sprintf("danmuji:%d: %s | %s (%s)", line, context, prefix, trimmed))
 }
 
 func (t *dmjTranspiler) nodeType(n *gotreesitter.Node) string {
@@ -181,9 +228,15 @@ func (c *fakeClock) SetLocation(loc *time.Location) {
 	c.loc = loc
 }
 
-`
+		`
 		t.mockDecls = append(t.mockDecls, t.fakeClockTypeDecl)
 		// Don't return — continue recursion to find nested mocks
+	}
+	if (nt == "eventually_block" || nt == "consistently_block" || nt == "property_block") && !t.pollingHelpersEmitted {
+		t.pollingHelpersEmitted = true
+		t.addImport("reflect")
+		t.addImport("strings")
+		t.mockDecls = append(t.mockDecls, pollingAssertionHelpers)
 	}
 	for i := 0; i < int(n.ChildCount()); i++ {
 		t.collectTopLevel(n.Child(i))
@@ -205,8 +258,14 @@ func (t *dmjTranspiler) emit(n *gotreesitter.Node) string {
 	case "then_block":
 		return t.emitBDDBlock(n, "then")
 	case "expect_statement":
+		if t.inExecBlock {
+			return t.emitExecExpect(n)
+		}
 		return t.emitExpect(n)
 	case "reject_statement":
+		if t.inExecBlock {
+			return t.emitExecReject(n)
+		}
 		return t.emitReject(n)
 	case "mock_declaration":
 		// Already collected at package level — emit a blank (whitespace preserved
@@ -257,6 +316,12 @@ func (t *dmjTranspiler) emit(n *gotreesitter.Node) string {
 		return t.emitSpy(n)
 	case "snapshot_block":
 		return t.emitSnapshot(n)
+	case "eventually_block":
+		return t.emitEventually(n)
+	case "consistently_block":
+		return t.emitConsistently(n)
+	case "property_block":
+		return t.emitProperty(n)
 	case "each_do_block":
 		return t.emitEachDo(n)
 	case "matrix_block":
@@ -365,21 +430,13 @@ func (t *dmjTranspiler) emitTestBlock(n *gotreesitter.Node) string {
 
 	// Extract tags
 	var tags []string
-	for i := 0; i < int(n.NamedChildCount()); i++ {
-		c := n.NamedChild(i)
-		if t.nodeType(c) == "tag_list" {
-			for j := 0; j < int(c.NamedChildCount()); j++ {
-				tc := c.NamedChild(j)
-				if t.nodeType(tc) == "tag" {
-					tags = append(tags, t.text(tc))
-				}
+	if tagsNode := t.childByField(n, "tags"); tagsNode != nil {
+		for i := 0; i < int(tagsNode.NamedChildCount()); i++ {
+			tc := tagsNode.NamedChild(i)
+			if t.nodeType(tc) == "tag" {
+				tags = append(tags, strings.TrimSpace(t.text(tc)))
 			}
 		}
-	}
-
-	// Emit tags as comments
-	for _, tag := range tags {
-		fmt.Fprintf(&b, "// Tag: %s\n", tag)
 	}
 
 	// Build constraint for category
@@ -399,15 +456,45 @@ func (t *dmjTranspiler) emitTestBlock(n *gotreesitter.Node) string {
 	// Function signature
 	fmt.Fprintf(&b, "func Test%s(%s *testing.T) ", name, t.testVar)
 
-	// Emit body block
+	// Emit body block with inline directives from tags.
 	for i := 0; i < int(n.NamedChildCount()); i++ {
 		c := n.NamedChild(i)
 		if t.nodeType(c) == "block" {
-			b.WriteString(t.emitTestBody(c))
+			typeTagLines := t.emitTagDirectives(tags, t.testVar)
+			b.WriteString("{\n")
+			if len(typeTagLines) > 0 {
+				b.WriteString(typeTagLines)
+			}
+			b.WriteString(t.emitBlockInner(c, "\t"))
+			b.WriteString("}")
 			break
 		}
 	}
 	b.WriteString("\n")
+
+	return b.String()
+}
+
+func (t *dmjTranspiler) emitTagDirectives(tags []string, testVar string) string {
+	var b strings.Builder
+	seen := make(map[string]bool)
+	for _, tag := range tags {
+		label := strings.TrimSpace(strings.TrimPrefix(tag, "@"))
+		if seen[label] {
+			continue
+		}
+		seen[label] = true
+
+		switch label {
+		case "skip":
+			fmt.Fprintf(&b, "\t%s.Skip(\"skipping @skip\")\n", testVar)
+		case "slow":
+			t.addImport("testing")
+			fmt.Fprintf(&b, "\tif testing.Short() {\n\t\t%s.Skip(\"skipping @slow in short mode\")\n\t}\n", testVar)
+		case "parallel":
+			fmt.Fprintf(&b, "\t%s.Parallel()\n", testVar)
+		}
+	}
 
 	return b.String()
 }
@@ -566,9 +653,14 @@ func (t *dmjTranspiler) emitBlockInner(blockNode *gotreesitter.Node, indent stri
 func (t *dmjTranspiler) emitBDDBlock(n *gotreesitter.Node, keyword string) string {
 	desc := t.childByField(n, "description")
 	descText := `"` + keyword + `"`
+	label := keyword
 	if desc != nil {
 		descText = t.text(desc)
+		label = strings.Trim(descText, "\"'`")
 	}
+	t.pushContext(fmt.Sprintf("%s %s", keyword, label))
+
+	defer t.popContext()
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s.Run(%s, func(%s *testing.T) ", t.testVar, descText, t.testVar)
@@ -596,31 +688,44 @@ func (t *dmjTranspiler) emitBDDBlock(n *gotreesitter.Node, keyword string) strin
 // ---------------------------------------------------------------------------
 
 func (t *dmjTranspiler) emitExpect(n *gotreesitter.Node) string {
+	if t.inPollingBlock || t.inPropertyBlock {
+		return t.emitExpectCondition(n)
+	}
+	return t.emitExpectAssertion(n)
+}
+
+func (t *dmjTranspiler) emitExpectCondition(n *gotreesitter.Node) string {
 	actual := t.childByField(n, "actual")
 	expected := t.childByField(n, "expected")
+	matcher := t.childByField(n, "matcher")
 
 	if actual == nil {
-		return t.text(n)
+		return "false"
 	}
-
-	// Check for matchers in the raw text of the node
 	nodeText := t.text(n)
 
-	if strings.Contains(nodeText, "is_nil") {
-		t.addImport("github.com/stretchr/testify/assert")
+	if matcher != nil {
 		actualText := t.emit(actual)
-		return fmt.Sprintf("assert.Nil(%s, %s)", t.testVar, actualText)
+		matcherText := strings.TrimSpace(t.emit(matcher))
+		if expected != nil {
+			expectedText := t.emit(expected)
+			return fmt.Sprintf("%s(%s, %s)", matcherText, actualText, expectedText)
+		}
+		return fmt.Sprintf("%s(%s)", matcherText, actualText)
+	}
+
+	if strings.Contains(nodeText, "is_nil") {
+		actualText := t.emit(actual)
+		return fmt.Sprintf("%s == nil", actualText)
 	}
 	if strings.Contains(nodeText, "not_nil") {
-		t.addImport("github.com/stretchr/testify/assert")
 		actualText := t.emit(actual)
-		return fmt.Sprintf("assert.NotNil(%s, %s)", t.testVar, actualText)
+		return fmt.Sprintf("%s != nil", actualText)
 	}
 	if strings.Contains(nodeText, "contains") && expected != nil {
-		t.addImport("github.com/stretchr/testify/assert")
 		actualText := t.emit(actual)
 		expectedText := t.emit(expected)
-		return fmt.Sprintf("assert.Contains(%s, %s, %s)", t.testVar, actualText, expectedText)
+		return fmt.Sprintf("danmujiContains(%s, %s)", actualText, expectedText)
 	}
 
 	// If the grammar's explicit expected field is populated, use it directly.
@@ -630,24 +735,19 @@ func (t *dmjTranspiler) emitExpect(n *gotreesitter.Node) string {
 		if strings.Contains(nodeText, "!=") {
 			// Special case: x != nil
 			if expectedText == "nil" {
-				t.addImport("github.com/stretchr/testify/assert")
-				return fmt.Sprintf("assert.NotNil(%s, %s)", t.testVar, actualText)
+				return fmt.Sprintf("%s != nil", actualText)
 			}
-			t.addImport("github.com/stretchr/testify/assert")
-			return fmt.Sprintf("assert.NotEqual(%s, %s, %s)", t.testVar, expectedText, actualText)
+			return fmt.Sprintf("!danmujiDeepEqual(%s, %s)", expectedText, actualText)
 		}
 		// Special case: err == nil → require.NoError
 		if expectedText == "nil" && strings.HasSuffix(actualText, "err") {
-			t.addImport("github.com/stretchr/testify/require")
-			return fmt.Sprintf("require.NoError(%s, %s)", t.testVar, actualText)
+			return fmt.Sprintf("%s == nil", actualText)
 		}
 		// Special case: x == nil
 		if expectedText == "nil" {
-			t.addImport("github.com/stretchr/testify/assert")
-			return fmt.Sprintf("assert.Nil(%s, %s)", t.testVar, actualText)
+			return fmt.Sprintf("%s == nil", actualText)
 		}
-		t.addImport("github.com/stretchr/testify/assert")
-		return fmt.Sprintf("assert.Equal(%s, %s, %s)", t.testVar, expectedText, actualText)
+		return fmt.Sprintf("danmujiDeepEqual(%s, %s)", expectedText, actualText)
 	}
 
 	// If actual is a binary_expression (e.g. Go absorbed "x == 5" into one node),
@@ -663,42 +763,141 @@ func (t *dmjTranspiler) emitExpect(n *gotreesitter.Node) string {
 		case "==":
 			// Special case: err == nil → require.NoError
 			if rT == "nil" && strings.HasSuffix(lT, "err") {
-				t.addImport("github.com/stretchr/testify/require")
-				return fmt.Sprintf("require.NoError(%s, %s)", t.testVar, lT)
+				return fmt.Sprintf("%s == nil", lT)
 			}
 			// Special case: x == nil
 			if rT == "nil" {
-				t.addImport("github.com/stretchr/testify/assert")
-				return fmt.Sprintf("assert.Nil(%s, %s)", t.testVar, lT)
+				return fmt.Sprintf("%s == nil", lT)
 			}
-			t.addImport("github.com/stretchr/testify/assert")
-			return fmt.Sprintf("assert.Equal(%s, %s, %s)", t.testVar, rT, lT)
+			return fmt.Sprintf("danmujiDeepEqual(%s, %s)", rT, lT)
 		case "!=":
 			if rT == "nil" {
-				t.addImport("github.com/stretchr/testify/assert")
-				return fmt.Sprintf("assert.NotNil(%s, %s)", t.testVar, lT)
+				return fmt.Sprintf("%s != nil", lT)
 			}
-			t.addImport("github.com/stretchr/testify/assert")
-			return fmt.Sprintf("assert.NotEqual(%s, %s, %s)", t.testVar, rT, lT)
+			return fmt.Sprintf("!danmujiDeepEqual(%s, %s)", rT, lT)
 		case "<":
-			t.addImport("github.com/stretchr/testify/assert")
-			return fmt.Sprintf("assert.Less(%s, %s, %s)", t.testVar, lT, rT)
+			return fmt.Sprintf("%s < %s", lT, rT)
 		case ">":
-			t.addImport("github.com/stretchr/testify/assert")
-			return fmt.Sprintf("assert.Greater(%s, %s, %s)", t.testVar, lT, rT)
+			return fmt.Sprintf("%s > %s", lT, rT)
 		case "<=":
-			t.addImport("github.com/stretchr/testify/assert")
-			return fmt.Sprintf("assert.LessOrEqual(%s, %s, %s)", t.testVar, lT, rT)
+			return fmt.Sprintf("%s <= %s", lT, rT)
 		case ">=":
-			t.addImport("github.com/stretchr/testify/assert")
-			return fmt.Sprintf("assert.GreaterOrEqual(%s, %s, %s)", t.testVar, lT, rT)
+			return fmt.Sprintf("%s >= %s", lT, rT)
 		}
 	}
 
 	// Bare expect (truthiness check)
+	actualText := t.emit(actual)
+	return actualText
+}
+
+func (t *dmjTranspiler) emitExpectAssertion(n *gotreesitter.Node) string {
+	actual := t.childByField(n, "actual")
+	expected := t.childByField(n, "expected")
+	matcher := t.childByField(n, "matcher")
+
+	if actual == nil {
+		return t.text(n)
+	}
+
+	nodeText := t.text(n)
+	msg := t.expectFailureContext("expect", strings.TrimSpace(nodeText), n)
+
+	if matcher != nil {
+		actualText := t.emit(actual)
+		matcherText := strings.TrimSpace(t.emit(matcher))
+		t.addImport("github.com/stretchr/testify/assert")
+		if expected != nil {
+			expectedText := t.emit(expected)
+			return fmt.Sprintf("assert.True(%s, %s(%s, %s), %s)", t.testVar, matcherText, actualText, expectedText, msg)
+		}
+		return fmt.Sprintf("assert.True(%s, %s(%s), %s)", t.testVar, matcherText, actualText, msg)
+	}
+
+	if strings.Contains(nodeText, "is_nil") {
+		t.addImport("github.com/stretchr/testify/assert")
+		actualText := t.emit(actual)
+		return fmt.Sprintf("assert.Nil(%s, %s, %s)", t.testVar, actualText, msg)
+	}
+	if strings.Contains(nodeText, "not_nil") {
+		t.addImport("github.com/stretchr/testify/assert")
+		actualText := t.emit(actual)
+		return fmt.Sprintf("assert.NotNil(%s, %s, %s)", t.testVar, actualText, msg)
+	}
+	if strings.Contains(nodeText, "contains") && expected != nil {
+		t.addImport("github.com/stretchr/testify/assert")
+		actualText := t.emit(actual)
+		expectedText := t.emit(expected)
+		return fmt.Sprintf("assert.Contains(%s, %s, %s, %s)", t.testVar, actualText, expectedText, msg)
+	}
+
+	if expected != nil {
+		actualText := t.emit(actual)
+		expectedText := t.emit(expected)
+		if strings.Contains(nodeText, "!=") {
+			if expectedText == "nil" {
+				t.addImport("github.com/stretchr/testify/assert")
+				return fmt.Sprintf("assert.NotNil(%s, %s, %s)", t.testVar, actualText, msg)
+			}
+			t.addImport("github.com/stretchr/testify/assert")
+			return fmt.Sprintf("assert.NotEqual(%s, %s, %s, %s)", t.testVar, expectedText, actualText, msg)
+		}
+		if expectedText == "nil" && strings.HasSuffix(actualText, "err") {
+			t.addImport("github.com/stretchr/testify/require")
+			return fmt.Sprintf("require.NoError(%s, %s, %s)", t.testVar, actualText, msg)
+		}
+		if expectedText == "nil" {
+			t.addImport("github.com/stretchr/testify/assert")
+			return fmt.Sprintf("assert.Nil(%s, %s, %s)", t.testVar, actualText, msg)
+		}
+		t.addImport("github.com/stretchr/testify/assert")
+		return fmt.Sprintf("assert.Equal(%s, %s, %s, %s)", t.testVar, expectedText, actualText, msg)
+	}
+
+	if t.nodeType(actual) == "binary_expression" && actual.ChildCount() >= 3 {
+		left := actual.Child(0)
+		op := actual.Child(1)
+		right := actual.Child(2)
+		lT := t.emit(left)
+		opT := t.text(op)
+		rT := t.emit(right)
+		switch opT {
+		case "==":
+			if rT == "nil" && strings.HasSuffix(lT, "err") {
+				t.addImport("github.com/stretchr/testify/require")
+				return fmt.Sprintf("require.NoError(%s, %s, %s)", t.testVar, lT, msg)
+			}
+			if rT == "nil" {
+				t.addImport("github.com/stretchr/testify/assert")
+				return fmt.Sprintf("assert.Nil(%s, %s, %s)", t.testVar, lT, msg)
+			}
+			t.addImport("github.com/stretchr/testify/assert")
+			return fmt.Sprintf("assert.Equal(%s, %s, %s, %s)", t.testVar, rT, lT, msg)
+		case "!=":
+			if rT == "nil" {
+				t.addImport("github.com/stretchr/testify/assert")
+				return fmt.Sprintf("assert.NotNil(%s, %s, %s)", t.testVar, lT, msg)
+			}
+			t.addImport("github.com/stretchr/testify/assert")
+			return fmt.Sprintf("assert.NotEqual(%s, %s, %s, %s)", t.testVar, rT, lT, msg)
+		case "<":
+			t.addImport("github.com/stretchr/testify/assert")
+			return fmt.Sprintf("assert.Less(%s, %s, %s, %s)", t.testVar, lT, rT, msg)
+		case ">":
+			t.addImport("github.com/stretchr/testify/assert")
+			return fmt.Sprintf("assert.Greater(%s, %s, %s, %s)", t.testVar, lT, rT, msg)
+		case "<=":
+			t.addImport("github.com/stretchr/testify/assert")
+			return fmt.Sprintf("assert.LessOrEqual(%s, %s, %s, %s)", t.testVar, lT, rT, msg)
+		case ">=":
+			t.addImport("github.com/stretchr/testify/assert")
+			return fmt.Sprintf("assert.GreaterOrEqual(%s, %s, %s, %s)", t.testVar, lT, rT, msg)
+		}
+	}
+
 	t.addImport("github.com/stretchr/testify/assert")
 	actualText := t.emit(actual)
-	return fmt.Sprintf("assert.True(%s, %s)", t.testVar, actualText)
+	return fmt.Sprintf("assert.True(%s, %s, %s)", t.testVar, actualText, msg)
 }
 
 // ---------------------------------------------------------------------------
@@ -706,13 +905,195 @@ func (t *dmjTranspiler) emitExpect(n *gotreesitter.Node) string {
 // ---------------------------------------------------------------------------
 
 func (t *dmjTranspiler) emitReject(n *gotreesitter.Node) string {
+	if t.inPollingBlock || t.inPropertyBlock {
+		return fmt.Sprintf("!(%s)", t.emitExpectCondition(n))
+	}
+
 	actual := t.childByField(n, "actual")
 	if actual == nil {
 		return t.text(n)
 	}
+	msg := t.expectFailureContext("reject", strings.TrimSpace(t.text(n)), n)
 	t.addImport("github.com/stretchr/testify/assert")
 	actualText := t.emit(actual)
-	return fmt.Sprintf("assert.False(%s, %s)", t.testVar, actualText)
+	return fmt.Sprintf("assert.False(%s, %s, %s)", t.testVar, actualText, msg)
+}
+
+// ---------------------------------------------------------------------------
+// eventually / consistently
+// ---------------------------------------------------------------------------
+
+func (t *dmjTranspiler) emitEventually(n *gotreesitter.Node) string {
+	return t.emitPolling(n, "eventually")
+}
+
+func (t *dmjTranspiler) emitConsistently(n *gotreesitter.Node) string {
+	return t.emitPolling(n, "consistently")
+}
+
+func (t *dmjTranspiler) emitPolling(n *gotreesitter.Node, mode string) string {
+	nameNode := t.childByField(n, "name")
+	name := "assertion window"
+	if nameNode != nil {
+		name = strings.Trim(t.text(nameNode), "\"'`")
+	}
+	durationNode := t.childByField(n, "duration")
+	timeout := t.pollingDuration(durationNode, mode)
+	bodyNode := t.childByField(n, "body")
+	if bodyNode == nil {
+		return t.text(n)
+	}
+
+	t.addImport("time")
+
+	var b strings.Builder
+	line := t.lineOf(n)
+	fmt.Fprintf(&b, "{\n")
+	fmt.Fprintf(&b, "\tsatisfied := false\n")
+	fmt.Fprintf(&b, "\tdeadline := time.Now().Add(%s)\n", timeout)
+	if mode == "eventually" {
+		fmt.Fprintf(&b, "\tfor time.Now().Before(deadline) {\n")
+	} else {
+		fmt.Fprintf(&b, "\tfor {\n")
+	}
+	fmt.Fprintf(&b, "\t\tsucceeded := true\n")
+	oldInPolling := t.inPollingBlock
+	t.inPollingBlock = true
+	t.emitPollingBody(&b, bodyNode, "\t")
+	t.inPollingBlock = oldInPolling
+	if mode == "eventually" {
+		fmt.Fprintf(&b, "\t\tif succeeded {\n")
+		fmt.Fprintf(&b, "\t\t\tsatisfied = true\n")
+		fmt.Fprintf(&b, "\t\t\tbreak\n")
+		fmt.Fprintf(&b, "\t\t}\n")
+		fmt.Fprintf(&b, "\t\ttime.Sleep(10 * time.Millisecond)\n")
+		fmt.Fprintf(&b, "\t}\n")
+	} else {
+		fmt.Fprintf(&b, "\t\tif !succeeded {\n")
+		fmt.Fprintf(&b, "\t\t\tbreak\n")
+		fmt.Fprintf(&b, "\t\t}\n")
+		fmt.Fprintf(&b, "\t\tif time.Now().After(deadline) {\n")
+		fmt.Fprintf(&b, "\t\t\tsatisfied = true\n")
+		fmt.Fprintf(&b, "\t\t\tbreak\n")
+		fmt.Fprintf(&b, "\t\t}\n")
+		fmt.Fprintf(&b, "\t\ttime.Sleep(10 * time.Millisecond)\n")
+		fmt.Fprintf(&b, "\t}\n")
+	}
+	fmt.Fprintf(&b, "\tif !satisfied {\n")
+	fmt.Fprintf(&b, "\t\t%[1]s.Errorf(\"danmuji:%[2]d %[3]s check %[4]s failed after %[5]s\")\n", t.testVar, line, mode, name, timeout)
+	fmt.Fprintf(&b, "\t}\n")
+	fmt.Fprintf(&b, "}\n")
+	return b.String()
+}
+
+// ---------------------------------------------------------------------------
+// property_block → testing/quick.Check for invariant-style specs
+// ---------------------------------------------------------------------------
+
+func (t *dmjTranspiler) emitProperty(n *gotreesitter.Node) string {
+	nameNode := t.childByField(n, "name")
+	name := "property"
+	if nameNode != nil {
+		name = strings.Trim(t.text(nameNode), "\"'`")
+	}
+
+	paramsNode := t.childByField(n, "params")
+	params := "()"
+	if paramsNode != nil {
+		params = strings.TrimSpace(t.text(paramsNode))
+	}
+
+	maxCountNode := t.childByField(n, "max_count")
+	maxCount := "100"
+	if maxCountNode != nil {
+		maxCount = normalizeIntExpression(strings.TrimSpace(t.text(maxCountNode)), 100)
+	}
+
+	bodyNode := t.childByField(n, "body")
+	if bodyNode == nil {
+		return t.text(n)
+	}
+
+	t.addImport("testing/quick")
+
+	line := t.lineOf(n)
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "if err := quick.Check(func%s bool {\n", params)
+	oldInProperty := t.inPropertyBlock
+	t.inPropertyBlock = true
+	t.emitPropertyBody(&b, bodyNode, "\t")
+	t.inPropertyBlock = oldInProperty
+
+	fmt.Fprintf(&b, "\treturn true\n")
+	fmt.Fprintf(&b, "}, &quick.Config{MaxCount: %s}); err != nil {\n", maxCount)
+	if len(name) > 0 {
+		fmt.Fprintf(&b, "\t\t%[1]s.Fatalf(\"danmuji:%[2]d property %%s failed: %%v\", %[3]q, err)\n", t.testVar, line, name)
+	} else {
+		fmt.Fprintf(&b, "\t\t%[1]s.Fatalf(\"danmuji:%[2]d property failed: %%v\", err)\n", t.testVar, line)
+	}
+	fmt.Fprintf(&b, "}\n")
+
+	return b.String()
+}
+
+func (t *dmjTranspiler) emitPropertyBody(b *strings.Builder, n *gotreesitter.Node, indent string) {
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		c := n.NamedChild(i)
+		if t.nodeType(c) == "statement_list" {
+			for j := 0; j < int(c.NamedChildCount()); j++ {
+				stmt := c.NamedChild(j)
+				switch t.nodeType(stmt) {
+				case "expect_statement", "reject_statement":
+					b.WriteString(indent)
+					fmt.Fprintf(b, "if !(%s) {\n", t.emit(stmt))
+					b.WriteString(indent + "\t")
+					b.WriteString("return false\n")
+					b.WriteString(indent)
+					b.WriteString("}\n")
+				default:
+					t.appendIndented(b, t.emit(stmt), indent)
+				}
+			}
+			b.WriteString(indent + "return true\n")
+			return
+		}
+	}
+	b.WriteString(indent + "return true\n")
+}
+
+func (t *dmjTranspiler) emitPollingBody(b *strings.Builder, n *gotreesitter.Node, indent string) {
+	// Emit all statements in a block, converting expect/reject into bool checks.
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		c := n.NamedChild(i)
+		if t.nodeType(c) == "statement_list" {
+			for j := 0; j < int(c.NamedChildCount()); j++ {
+				stmt := c.NamedChild(j)
+				switch t.nodeType(stmt) {
+				case "expect_statement", "reject_statement":
+					b.WriteString(indent)
+					fmt.Fprintf(b, "if !(%s) {\n", t.emit(stmt))
+					b.WriteString(indent + "\t")
+					b.WriteString("succeeded = false\n")
+					b.WriteString(indent)
+					b.WriteString("}\n")
+				default:
+					t.appendIndented(b, t.emit(stmt), indent)
+				}
+			}
+			return
+		}
+	}
+}
+
+func (t *dmjTranspiler) pollingDuration(durationNode *gotreesitter.Node, mode string) string {
+	if durationNode == nil {
+		if mode == "eventually" {
+			return "5 * time.Second"
+		}
+		return "2 * time.Second"
+	}
+	return normalizeDurationExpression(strings.TrimSpace(t.text(durationNode)), "1 * time.Second")
 }
 
 // ---------------------------------------------------------------------------
@@ -864,77 +1245,76 @@ func (t *dmjTranspiler) emitVerify(n *gotreesitter.Node) string {
 // ---------------------------------------------------------------------------
 
 func (t *dmjTranspiler) emitNeedsBlock(n *gotreesitter.Node) string {
+	t.addImport("context")
+	t.addImport("github.com/docker/go-connections/nat")
 	t.addImport("github.com/stretchr/testify/require")
+	t.addImport("github.com/testcontainers/testcontainers-go")
+	t.addImport("github.com/testcontainers/testcontainers-go/wait")
 
 	serviceNode := t.childByField(n, "service")
 	nameNode := t.childByField(n, "name")
 	if serviceNode == nil || nameNode == nil {
 		return t.text(n)
 	}
-	serviceType := t.text(serviceNode)
-	varName := t.text(nameNode)
+	serviceType := strings.TrimSpace(t.text(serviceNode))
+	varName := strings.TrimSpace(t.text(nameNode))
 
-	tv := t.testVar
-	var b strings.Builder
+	serviceImage := ""
+	servicePort := ""
+	waitForPort := true
+
 	switch serviceType {
 	case "postgres":
-		fmt.Fprintf(&b, "%sContainer, err := postgres.Run(ctx, \"postgres:15\",\n"+
-			"\tpostgres.WithDatabase(\"test\"),\n"+
-			"\ttestcontainers.WithWaitStrategy(wait.ForListeningPort(\"5432/tcp\")),\n"+
-			")\n"+
-			"require.NoError(%s, err)\n"+
-			"%s.Cleanup(func() { %sContainer.Terminate(ctx) })\n"+
-			"%sURL, err := %sContainer.ConnectionString(ctx)\n"+
-			"require.NoError(%s, err)", varName, tv, tv, varName, varName, varName, tv)
+		serviceImage = "postgres:15"
+		servicePort = "5432/tcp"
 	case "redis":
-		fmt.Fprintf(&b, "%sContainer, err := redis.Run(ctx, \"redis:7\")\n"+
-			"require.NoError(%s, err)\n"+
-			"%s.Cleanup(func() { %sContainer.Terminate(ctx) })\n"+
-			"%sURL, err := %sContainer.ConnectionString(ctx)\n"+
-			"require.NoError(%s, err)", varName, tv, tv, varName, varName, varName, tv)
+		serviceImage = "redis:7"
+		servicePort = "6379/tcp"
 	case "mysql":
-		fmt.Fprintf(&b, "%sContainer, err := mysql.Run(ctx, \"mysql:8\")\n"+
-			"require.NoError(%s, err)\n"+
-			"%s.Cleanup(func() { %sContainer.Terminate(ctx) })\n"+
-			"%sURL, err := %sContainer.ConnectionString(ctx)\n"+
-			"require.NoError(%s, err)", varName, tv, tv, varName, varName, varName, tv)
+		serviceImage = "mysql:8"
+		servicePort = "3306/tcp"
 	case "kafka":
-		fmt.Fprintf(&b, "%sContainer, err := kafka.Run(ctx, \"confluentinc/confluent-local:7.5.0\")\n"+
-			"require.NoError(%s, err)\n"+
-			"%s.Cleanup(func() { %sContainer.Terminate(ctx) })\n"+
-			"%sBrokers, err := %sContainer.Brokers(ctx)\n"+
-			"require.NoError(%s, err)", varName, tv, tv, varName, varName, varName, tv)
+		serviceImage = "confluentinc/confluent-local:7.5.0"
+		servicePort = "9092/tcp"
 	case "mongo":
-		fmt.Fprintf(&b, "%sContainer, err := mongodb.Run(ctx, \"mongo:7\")\n"+
-			"require.NoError(%s, err)\n"+
-			"%s.Cleanup(func() { %sContainer.Terminate(ctx) })\n"+
-			"%sURI := %sContainer.GetConnectionString()", varName, tv, tv, varName, varName, varName)
+		serviceImage = "mongo:7"
+		servicePort = "27017/tcp"
 	case "rabbitmq":
-		fmt.Fprintf(&b, "%sContainer, err := rabbitmq.Run(ctx, \"rabbitmq:3-management\")\n"+
-			"require.NoError(%s, err)\n"+
-			"%s.Cleanup(func() { %sContainer.Terminate(ctx) })\n"+
-			"%sURL, err := %sContainer.AmqpURL(ctx)\n"+
-			"require.NoError(%s, err)", varName, tv, tv, varName, varName, varName, tv)
+		serviceImage = "rabbitmq:3-management"
+		servicePort = "5672/tcp"
 	case "nats":
-		fmt.Fprintf(&b, "%sContainer, err := nats.Run(ctx, \"nats:2\")\n"+
-			"require.NoError(%s, err)\n"+
-			"%s.Cleanup(func() { %sContainer.Terminate(ctx) })\n"+
-			"%sURL, err := %sContainer.ConnectionString(ctx)\n"+
-			"require.NoError(%s, err)", varName, tv, tv, varName, varName, varName, tv)
+		serviceImage = "nats:2"
+		servicePort = "4222/tcp"
 	case "container":
-		fmt.Fprintf(&b, "%sReq := testcontainers.ContainerRequest{\n"+
-			"\tImage:        \"alpine:latest\",\n"+
-			"\tExposedPorts: []string{},\n"+
-			"}\n"+
-			"%sContainer, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{\n"+
-			"\tContainerRequest: %sReq,\n"+
-			"\tStarted:          true,\n"+
-			"})\n"+
-			"require.NoError(%s, err)\n"+
-			"%s.Cleanup(func() { %sContainer.Terminate(ctx) })", varName, varName, varName, tv, tv, varName)
+		serviceImage = "alpine:latest"
+		waitForPort = false
 	default:
 		return fmt.Sprintf("// unsupported needs service type: %s", serviceType)
 	}
+
+	tv := t.testVar
+	var b strings.Builder
+	fmt.Fprintf(&b, "{\n")
+	fmt.Fprintf(&b, "\tctx := context.Background()\n")
+	fmt.Fprintf(&b, "\t%sReq := testcontainers.ContainerRequest{\n", varName)
+	fmt.Fprintf(&b, "\t\tImage:  %q,\n", serviceImage)
+	fmt.Fprintf(&b, "\t\tExposedPorts: []string{},\n")
+	if waitForPort {
+		fmt.Fprintf(&b, "\t\tWaitingFor:   wait.ForListeningPort(nat.Port(%q)),\n", servicePort)
+	}
+	fmt.Fprintf(&b, "\t}\n")
+	fmt.Fprintf(&b, "\t%sContainer, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{\n", varName)
+	fmt.Fprintf(&b, "\t\tContainerRequest: %sReq,\n", varName)
+	fmt.Fprintf(&b, "\t\tStarted:        true,\n")
+	fmt.Fprintf(&b, "\t})\n")
+	fmt.Fprintf(&b, "\trequire.NoError(%s, err)\n", tv)
+	fmt.Fprintf(&b, "\t%s.Cleanup(func() { _ = %sContainer.Terminate(ctx) })\n", tv, varName)
+	if waitForPort {
+		fmt.Fprintf(&b, "\t%sEndpoint, err := %sContainer.Endpoint(ctx, nat.Port(%q))\n", varName, varName, servicePort)
+		fmt.Fprintf(&b, "\trequire.NoError(%s, err)\n", tv)
+		fmt.Fprintf(&b, "\t_ = %sEndpoint\n", varName)
+	}
+	fmt.Fprintf(&b, "}\n")
 
 	return b.String()
 }
@@ -962,6 +1342,8 @@ func (t *dmjTranspiler) emitLoad(n *gotreesitter.Node) string {
 
 	rate := "10"
 	duration := "5"
+	rampup := "0"
+	concurrency := "1"
 	method := "GET"
 	url := `"http://localhost"`
 	var thenBlocks []*gotreesitter.Node
@@ -971,15 +1353,23 @@ func (t *dmjTranspiler) emitLoad(n *gotreesitter.Node) string {
 		case "load_config":
 			configText := t.text(child)
 			// Extract the value (everything after the keyword)
-			if strings.HasPrefix(configText, "rate") {
-				val := strings.TrimSpace(strings.TrimPrefix(configText, "rate"))
+			key, val := t.parseLoadConfig(configText)
+			switch key {
+			case "rate":
 				if val != "" {
 					rate = val
 				}
-			} else if strings.HasPrefix(configText, "duration") {
-				val := strings.TrimSpace(strings.TrimPrefix(configText, "duration"))
+			case "duration":
 				if val != "" {
 					duration = val
+				}
+			case "rampup":
+				if val != "" {
+					rampup = val
+				}
+			case "concurrency":
+				if val != "" {
+					concurrency = val
 				}
 			}
 		case "target_block":
@@ -1003,15 +1393,17 @@ func (t *dmjTranspiler) emitLoad(n *gotreesitter.Node) string {
 	fmt.Fprintf(&b, "func TestLoad%s(t *testing.T) {\n", name)
 
 	// Vegeta setup
-	fmt.Fprintf(&b, "\trate := vegeta.Rate{Freq: %s, Per: time.Second}\n", rate)
-	fmt.Fprintf(&b, "\tduration := %s * time.Second\n", duration)
+	fmt.Fprintf(&b, "\trate := vegeta.Rate{Freq: %s, Per: time.Second}\n", normalizeRateExpression(rate))
+	fmt.Fprintf(&b, "\tduration := %s\n", normalizeDurationExpression(duration, "5 * time.Second"))
+	fmt.Fprintf(&b, "\trampup := %s\n", normalizeDurationExpression(rampup, "0"))
+	fmt.Fprintf(&b, "\tattackDuration := duration + rampup\n")
+	fmt.Fprintf(&b, "\tattacker := vegeta.NewAttacker(vegeta.Workers(%s), vegeta.MaxWorkers(%s))\n", normalizeConcurrencyExpression(concurrency), normalizeConcurrencyExpression(concurrency))
+	fmt.Fprintf(&b, "\tvar metrics vegeta.Metrics\n")
 	fmt.Fprintf(&b, "\ttargeter := vegeta.NewStaticTargeter(vegeta.Target{\n")
 	fmt.Fprintf(&b, "\t\tMethod: %q,\n", method)
 	fmt.Fprintf(&b, "\t\tURL:    %s,\n", url)
 	fmt.Fprintf(&b, "\t})\n")
-	fmt.Fprintf(&b, "\tattacker := vegeta.NewAttacker()\n")
-	fmt.Fprintf(&b, "\tvar metrics vegeta.Metrics\n")
-	fmt.Fprintf(&b, "\tfor res := range attacker.Attack(targeter, rate, duration, %q) {\n", name)
+	fmt.Fprintf(&b, "\tfor res := range attacker.Attack(targeter, rate, attackDuration, %q) {\n", name)
 	fmt.Fprintf(&b, "\t\tmetrics.Add(res)\n")
 	fmt.Fprintf(&b, "\t}\n")
 	fmt.Fprintf(&b, "\tmetrics.Close()\n")
@@ -1028,6 +1420,102 @@ func (t *dmjTranspiler) emitLoad(n *gotreesitter.Node) string {
 	return b.String()
 }
 
+func (t *dmjTranspiler) parseLoadConfig(text string) (string, string) {
+	parts := strings.Fields(text)
+	if len(parts) == 0 {
+		return "", ""
+	}
+	if len(parts) == 1 {
+		return parts[0], ""
+	}
+	return parts[0], strings.Join(parts[1:], " ")
+}
+
+func normalizeRateExpression(raw string) string {
+	return normalizeIntExpression(raw, 10)
+}
+
+func normalizeDurationExpression(raw string, fallback string) string {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return fallback
+	}
+	if matchDurationUnit.MatchString(v) {
+		return v
+	}
+	if matchInt.MatchString(v) {
+		return matchInt.ReplaceAllString(v, "$1 * time.Second")
+	}
+	if strings.Contains(v, "time.") || strings.Contains(v, "*") || strings.Contains(v, "/") || matchIdentifier.MatchString(v) {
+		return v
+	}
+	return fallback
+}
+
+func normalizeConcurrencyExpression(raw string) string {
+	return normalizeIntExpression(raw, 1)
+}
+
+func normalizeIntExpression(raw string, fallback int) string {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return strconv.Itoa(fallback)
+	}
+	if matchInt.MatchString(v) {
+		return matchInt.FindStringSubmatch(v)[1]
+	}
+	if matchIdentifier.MatchString(v) {
+		return v
+	}
+	return strconv.Itoa(fallback)
+}
+
+var (
+	matchInt          = regexp.MustCompile(`^([0-9]+)$`)
+	matchIdentifier   = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	matchDurationUnit = regexp.MustCompile(`^([0-9]+(?:\.[0-9]+)?)\s*(ns|us|µs|ms|s|m|h)$`)
+)
+
+var pollingAssertionHelpers = `
+func danmujiDeepEqual(expected, actual interface{}) bool {
+	return reflect.DeepEqual(expected, actual)
+}
+
+func danmujiContains(actual, expected interface{}) (found bool) {
+	if actual == nil || expected == nil {
+		return false
+	}
+	defer func() {
+		if recover() != nil {
+			found = false
+		}
+	}()
+
+	if s, ok := actual.(string); ok {
+		needle, ok := expected.(string)
+		if !ok {
+			return false
+		}
+		return strings.Contains(s, needle)
+	}
+
+	rv := reflect.ValueOf(actual)
+	switch rv.Kind() {
+	case reflect.Array, reflect.Slice:
+		for i := 0; i < rv.Len(); i++ {
+			if danmujiDeepEqual(rv.Index(i).Interface(), expected) {
+				return true
+			}
+		}
+	case reflect.Map:
+		if rv.MapIndex(reflect.ValueOf(expected)).IsValid() {
+			return true
+		}
+	}
+	return false
+}
+`
+
 // ---------------------------------------------------------------------------
 // injectImports adds all collected import paths into the existing import block
 // ---------------------------------------------------------------------------
@@ -1037,57 +1525,67 @@ func (t *dmjTranspiler) injectImports(code string) string {
 		return code
 	}
 
-	// Build sorted list of import paths for deterministic output,
-	// filtering out packages that are already imported in the source.
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "", code, parser.ParseComments)
+	if err != nil {
+		return code
+	}
+
+	// Find existing imports to avoid duplicates.
+	existing := map[string]bool{}
+	for _, decl := range file.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.IMPORT {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			is := spec.(*ast.ImportSpec)
+			if is.Path != nil {
+				existing[strings.Trim(is.Path.Value, "\"")] = true
+			}
+		}
+	}
+
 	var imports []string
 	for pkg := range t.neededImports {
-		quoted := fmt.Sprintf("%q", pkg)
-		if strings.Contains(code, quoted) {
-			continue // already imported
+		if existing[pkg] {
+			continue
 		}
-		imports = append(imports, quoted)
+		imports = append(imports, pkg)
 	}
 	if len(imports) == 0 {
 		return code
 	}
-	// Sort for deterministic output
-	sortImports(imports)
+	sort.Strings(imports)
 
-	importBlock := "\n\t" + strings.Join(imports, "\n\t")
-
-	// Try to find an existing import block and append inside it.
-	// Look for the closing paren of an import(...) block.
-	if idx := strings.Index(code, "import ("); idx >= 0 {
-		// Find the matching closing paren
-		closeIdx := strings.Index(code[idx:], ")")
-		if closeIdx >= 0 {
-			insertAt := idx + closeIdx
-			return code[:insertAt] + importBlock + "\n" + code[insertAt:]
+	var importDecl *ast.GenDecl
+	for _, decl := range file.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.IMPORT {
+			continue
 		}
+		importDecl = gd
+		break
 	}
 
-	// If there's a single import "..." line, convert to block form
-	if idx := strings.Index(code, "import \""); idx >= 0 {
-		endIdx := strings.Index(code[idx:], "\n")
-		if endIdx >= 0 {
-			origImport := code[idx : idx+endIdx]
-			// Extract the import path from: import "path"
-			path := strings.TrimPrefix(origImport, "import ")
-			newBlock := "import (\n\t" + path + importBlock + "\n)"
-			return code[:idx] + newBlock + code[idx+endIdx:]
+	if importDecl == nil {
+		importDecl = &ast.GenDecl{
+			Tok:   token.IMPORT,
+			Specs: []ast.Spec{},
 		}
+		file.Decls = append([]ast.Decl{importDecl}, file.Decls...)
 	}
 
-	return code
-}
-
-// sortImports sorts import strings lexicographically.
-func sortImports(imports []string) {
-	for i := 1; i < len(imports); i++ {
-		for j := i; j > 0 && imports[j] < imports[j-1]; j-- {
-			imports[j], imports[j-1] = imports[j-1], imports[j]
-		}
+	for _, path := range imports {
+		importDecl.Specs = append(importDecl.Specs, &ast.ImportSpec{Path: &ast.BasicLit{Kind: token.STRING, Value: strconv.Quote(path)}})
 	}
+
+	var buf strings.Builder
+	if err := format.Node(&buf, fset, file); err != nil {
+		return code
+	}
+
+	return buf.String()
 }
 
 // ---------------------------------------------------------------------------
@@ -1110,58 +1608,125 @@ func (t *dmjTranspiler) emitExec(n *gotreesitter.Node) string {
 		return t.text(n)
 	}
 
-	// Collect run_command nodes and other statements from the body
-	type runCmd struct {
-		command string
-	}
-	var runs []runCmd
-	var otherStatements []*gotreesitter.Node
-
-	t.walkChildren(bodyNode, func(child *gotreesitter.Node) {
-		switch t.nodeType(child) {
-		case "run_command":
-			cmdNode := t.childByField(child, "command")
-			if cmdNode != nil {
-				runs = append(runs, runCmd{command: t.text(cmdNode)})
-			}
-		case "expect_statement":
-			otherStatements = append(otherStatements, child)
+	// Find statement list so we can preserve exact child order.
+	var statements *gotreesitter.Node
+	for i := 0; i < int(bodyNode.NamedChildCount()); i++ {
+		c := bodyNode.NamedChild(i)
+		if t.nodeType(c) == "statement_list" {
+			statements = c
+			break
 		}
-	})
+	}
+	if statements == nil {
+		// Fallback: if grammar shape changes, preserve direct named children.
+		for i := 0; i < int(bodyNode.NamedChildCount()); i++ {
+			c := bodyNode.NamedChild(i)
+			if t.nodeType(c) == "run_command" || t.nodeType(c) == "expect_statement" || t.nodeType(c) == "reject_statement" {
+				statements = bodyNode
+				break
+			}
+		}
+	}
+	if statements == nil {
+		return t.text(n)
+	}
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s.Run(%q, func(%s *testing.T) {\n", t.testVar, name, t.testVar)
+	fmt.Fprintf(&b, "\tvar stdout, stderr bytes.Buffer\n")
+	fmt.Fprintf(&b, "\tvar exitCode int\n")
+	fmt.Fprintf(&b, "\tvar err error\n")
+	fmt.Fprintf(&b, "\t_ = exitCode\n")
+	fmt.Fprintf(&b, "\t_ = err\n")
 
-	// For each run command, emit the exec boilerplate
-	for _, r := range runs {
-		fmt.Fprintf(&b, "\tvar stdout, stderr bytes.Buffer\n")
-		fmt.Fprintf(&b, "\tcmd := exec.Command(\"sh\", \"-c\", %s)\n", r.command)
-		fmt.Fprintf(&b, "\tcmd.Stdout = &stdout\n")
-		fmt.Fprintf(&b, "\tcmd.Stderr = &stderr\n")
-		fmt.Fprintf(&b, "\terr := cmd.Run()\n")
-		fmt.Fprintf(&b, "\texitCode := 0\n")
-		fmt.Fprintf(&b, "\tif err != nil {\n")
-		fmt.Fprintf(&b, "\t\tif exitErr, ok := err.(*exec.ExitError); ok {\n")
-		fmt.Fprintf(&b, "\t\t\texitCode = exitErr.ExitCode()\n")
-		fmt.Fprintf(&b, "\t\t} else {\n")
-		fmt.Fprintf(&b, "\t\t\texitCode = -1\n")
-		fmt.Fprintf(&b, "\t\t}\n")
-		fmt.Fprintf(&b, "\t}\n")
-		fmt.Fprintf(&b, "\t_ = exitCode // used by expect assertions\n")
-	}
-
-	// Emit expect statements with exec identifier translation
 	oldInExec := t.inExecBlock
 	t.inExecBlock = true
-	for _, stmt := range otherStatements {
-		b.WriteString("\t")
-		b.WriteString(t.emitExecExpect(stmt))
-		b.WriteString("\n")
+	defer func() { t.inExecBlock = oldInExec }()
+
+	// Preserve statement order and allow all inner statements (run commands, asserts, setup code).
+	for i := 0; i < int(statements.NamedChildCount()); i++ {
+		stmt := statements.NamedChild(i)
+		nt := t.nodeType(stmt)
+		switch nt {
+		case "run_command":
+			t.appendIndented(&b, t.emitExecRunCommand(stmt), "\t")
+		case "expect_statement", "reject_statement":
+			t.appendIndented(&b, t.emit(stmt), "\t")
+		default:
+			t.appendIndented(&b, t.emit(stmt), "\t")
+		}
 	}
-	t.inExecBlock = oldInExec
 
 	fmt.Fprintf(&b, "})")
 	return b.String()
+}
+
+func (t *dmjTranspiler) appendIndented(b *strings.Builder, code, indent string) {
+	if code == "" {
+		return
+	}
+	lines := strings.Split(code, "\n")
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
+		if line == "" {
+			continue
+		}
+		b.WriteString(indent)
+		b.WriteString(line)
+		if i < len(lines)-1 || line != "" {
+			b.WriteByte('\n')
+		}
+	}
+}
+
+func (t *dmjTranspiler) emitExecRunCommand(n *gotreesitter.Node) string {
+	cmdNode := t.childByField(n, "command")
+	if cmdNode == nil {
+		return ""
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "stdout.Reset()\n")
+	fmt.Fprintf(&b, "stderr.Reset()\n")
+	fmt.Fprintf(&b, "cmd := exec.Command(\"sh\", \"-c\", %s)\n", t.text(cmdNode))
+	fmt.Fprintf(&b, "cmd.Stdout = &stdout\n")
+	fmt.Fprintf(&b, "cmd.Stderr = &stderr\n")
+	fmt.Fprintf(&b, "exitCode = 0\n")
+	fmt.Fprintf(&b, "err = cmd.Run()\n")
+	fmt.Fprintf(&b, "if err != nil {\n")
+	fmt.Fprintf(&b, "\tif exitErr, ok := err.(*exec.ExitError); ok {\n")
+	fmt.Fprintf(&b, "\t\texitCode = exitErr.ExitCode()\n")
+	fmt.Fprintf(&b, "\t} else {\n")
+	fmt.Fprintf(&b, "\t\texitCode = -1\n")
+	fmt.Fprintf(&b, "\t}\n")
+	fmt.Fprintf(&b, "}\n")
+
+	return b.String()
+}
+
+func (t *dmjTranspiler) emitExecReject(n *gotreesitter.Node) string {
+	if t.inPollingBlock {
+		return fmt.Sprintf("!(%s)", t.emitExecExpectCondition(n))
+	}
+
+	actual := t.childByField(n, "actual")
+	if actual == nil {
+		return t.text(n)
+	}
+	actualText := strings.TrimSpace(t.emit(actual))
+	translated := t.translateExecIdent(actualText)
+
+	t.addImport("github.com/stretchr/testify/assert")
+	if actualText == "stdout" {
+		return fmt.Sprintf("assert.False(%s, %s == \"\")", t.testVar, translated)
+	}
+	if actualText == "stderr" {
+		return fmt.Sprintf("assert.False(%s, %s == \"\")", t.testVar, translated)
+	}
+	if actualText == "exit_code" {
+		return fmt.Sprintf("assert.NotZero(%s, %s)", t.testVar, translated)
+	}
+	return fmt.Sprintf("assert.False(%s, %s)", t.testVar, translated)
 }
 
 // walkChildren calls fn for each named child (recursing into statement_list/block).
@@ -1183,6 +1748,10 @@ func (t *dmjTranspiler) walkChildren(n *gotreesitter.Node, fn func(*gotreesitter
 // emitExecExpect translates expect statements inside exec blocks,
 // replacing exec-specific identifiers with their Go equivalents.
 func (t *dmjTranspiler) emitExecExpect(n *gotreesitter.Node) string {
+	if t.inPollingBlock {
+		return t.emitExecExpectCondition(n)
+	}
+
 	nodeText := t.text(n)
 
 	// Handle "expect stdout contains X"
@@ -1236,6 +1805,64 @@ func (t *dmjTranspiler) emitExecExpect(n *gotreesitter.Node) string {
 	return t.emitExpect(n)
 }
 
+func (t *dmjTranspiler) emitExecExpectCondition(n *gotreesitter.Node) string {
+	nodeText := t.text(n)
+	// Handle "expect stdout contains X"
+	if strings.Contains(nodeText, "stdout") && strings.Contains(nodeText, "contains") {
+		expected := t.childByField(n, "expected")
+		if expected != nil {
+			return fmt.Sprintf("danmujiContains(stdout.String(), %s)", t.emit(expected))
+		}
+	}
+
+	// Handle "expect stderr contains X"
+	if strings.Contains(nodeText, "stderr") && strings.Contains(nodeText, "contains") {
+		expected := t.childByField(n, "expected")
+		if expected != nil {
+			return fmt.Sprintf("danmujiContains(stderr.String(), %s)", t.emit(expected))
+		}
+	}
+
+	// Handle exit_code comparisons.
+	actual := t.childByField(n, "actual")
+	if actual != nil {
+		actualText := t.text(actual)
+		if t.nodeType(actual) == "binary_expression" && actual.ChildCount() >= 3 {
+			left := actual.Child(0)
+			op := actual.Child(1)
+			right := actual.Child(2)
+			leftText := t.translateExecIdent(t.emit(left))
+			rightText := t.emit(right)
+			opText := t.text(op)
+			switch opText {
+			case "==":
+				return fmt.Sprintf("%s == %s", leftText, rightText)
+			case "!=":
+				return fmt.Sprintf("%s != %s", leftText, rightText)
+			case "<":
+				return fmt.Sprintf("%s < %s", leftText, rightText)
+			case ">":
+				return fmt.Sprintf("%s > %s", leftText, rightText)
+			case "<=":
+				return fmt.Sprintf("%s <= %s", leftText, rightText)
+			case ">=":
+				return fmt.Sprintf("%s >= %s", leftText, rightText)
+			}
+		}
+		if strings.Contains(actualText, "exit_code") {
+			return fmt.Sprintf("%s != 0", t.translateExecIdent(actualText))
+		}
+		if strings.Contains(actualText, "stdout") {
+			return fmt.Sprintf("%s != \"\"", t.translateExecIdent(actualText))
+		}
+		if strings.Contains(actualText, "stderr") {
+			return fmt.Sprintf("%s != \"\"", t.translateExecIdent(actualText))
+		}
+	}
+
+	return "false"
+}
+
 // translateExecIdent maps exec-specific identifiers to Go variable names.
 func (t *dmjTranspiler) translateExecIdent(ident string) string {
 	switch strings.TrimSpace(ident) {
@@ -1255,7 +1882,7 @@ func (t *dmjTranspiler) translateExecIdent(ident string) string {
 // ---------------------------------------------------------------------------
 
 func (t *dmjTranspiler) emitProfile(n *gotreesitter.Node) string {
-	// Extract profile_type from children
+	// Extract profile_type from children.
 	profileType := ""
 	for i := 0; i < int(n.ChildCount()); i++ {
 		c := n.Child(i)
@@ -1264,13 +1891,52 @@ func (t *dmjTranspiler) emitProfile(n *gotreesitter.Node) string {
 			break
 		}
 	}
+	dir := t.parseProfileDirective(t.childByField(n, "directive"))
+	tv := t.testVar
 
 	var b strings.Builder
+	emitProfileOutput := func(prefix, lookup string) {
+		pathVar := prefix + "ProfilePath"
+		fileVar := prefix + "ProfileFile"
+		errVar := prefix + "ProfileErr"
+		b.WriteString(pathVar + " := \"\"\n")
+		b.WriteString("var " + fileVar + " *os.File\n")
+		b.WriteString("var " + errVar + " error\n")
+		if dir.mode == "save" {
+			b.WriteString(pathVar + " = " + dir.path + "\n")
+			b.WriteString(fileVar + ", " + errVar + " = os.Create(" + pathVar + ")\n")
+		} else {
+			b.WriteString(fileVar + ", " + errVar + " = os.CreateTemp(\"\", \"" + prefix + "_profile_*.pprof\")\n")
+			b.WriteString("if " + errVar + " == nil {\n")
+			b.WriteString("\t" + pathVar + " = " + fileVar + ".Name()\n")
+			b.WriteString("}\n")
+		}
+		b.WriteString("if " + errVar + " != nil {\n")
+		b.WriteString("\t" + tv + ".Fatalf(\"creating " + prefix + " profile failed: %v\", " + errVar + ")\n")
+		b.WriteString("}\n")
+		b.WriteString(tv + ".Logf(\"" + prefix + " profile written to %s\", " + pathVar + ")\n")
+		if dir.mode == "show" {
+			b.WriteString(tv + ".Logf(\"show top %d requested for " + prefix + " profile (not executed automatically)\", " + strconv.Itoa(dir.top) + ")\n")
+		}
+		if lookup != "" {
+			b.WriteString("defer func() {\n")
+			b.WriteString("\t_ = pprof.Lookup(\"" + lookup + "\").WriteTo(" + fileVar + ", 1)\n")
+			b.WriteString("\t_ = " + fileVar + ".Close()\n")
+			b.WriteString("}()\n")
+		}
+	}
+
 	switch profileType {
 	case "routines":
 		t.addImport("runtime")
 		t.addImport("time")
 		b.WriteString("_goroutinesBefore := runtime.NumGoroutine()\n")
+		if dir.mode == "show" {
+			b.WriteString(tv + ".Logf(\"show top %d requested for routines profile (not executed automatically)\", " + strconv.Itoa(dir.top) + ")\n")
+		}
+		if dir.mode == "save" {
+			b.WriteString("// save path for routines is not currently file-backed\n")
+		}
 		b.WriteString("defer func() {\n")
 		b.WriteString("\truntime.GC()\n")
 		b.WriteString("\ttime.Sleep(100 * time.Millisecond)\n")
@@ -1281,28 +1947,48 @@ func (t *dmjTranspiler) emitProfile(n *gotreesitter.Node) string {
 	case "cpu":
 		t.addImport("runtime/pprof")
 		t.addImport("os")
-		b.WriteString("_cpuProfFile, _cpuProfErr := os.CreateTemp(\"\", \"cpu_profile_*.prof\")\n")
-		b.WriteString("if _cpuProfErr == nil {\n")
-		b.WriteString("\tpprof.StartCPUProfile(_cpuProfFile)\n")
-		b.WriteString("\tdefer func() {\n")
-		b.WriteString("\t\tpprof.StopCPUProfile()\n")
-		b.WriteString("\t\t_cpuProfFile.Close()\n")
-		b.WriteString("\t}()\n")
+		b.WriteString("_cpuProfilePath := \"\"\n")
+		b.WriteString("var _cpuProfFile *os.File\n")
+		b.WriteString("var _cpuProfErr error\n")
+		if dir.mode == "save" {
+			b.WriteString("_cpuProfilePath = " + dir.path + "\n")
+			b.WriteString("_cpuProfFile, _cpuProfErr = os.Create(_cpuProfilePath)\n")
+		} else {
+			b.WriteString("_cpuProfFile, _cpuProfErr = os.CreateTemp(\"\", \"cpu_profile_*.pprof\")\n")
+			b.WriteString("if _cpuProfErr == nil {\n")
+			b.WriteString("\t_cpuProfilePath = _cpuProfFile.Name()\n")
+			b.WriteString("}\n")
+		}
+		b.WriteString("if _cpuProfErr != nil {\n")
+		b.WriteString("\t" + tv + ".Fatalf(\"creating cpu profile failed: %v\", _cpuProfErr)\n")
 		b.WriteString("}\n")
+		b.WriteString(tv + ".Logf(\"cpu profile written to %s\", _cpuProfilePath)\n")
+		if dir.mode == "show" {
+			b.WriteString(tv + ".Logf(\"show top %d requested for cpu profile (not executed automatically)\", " + strconv.Itoa(dir.top) + ")\n")
+		}
+		b.WriteString("pprof.StartCPUProfile(_cpuProfFile)\n")
+		b.WriteString("defer func() {\n")
+		b.WriteString("\tpprof.StopCPUProfile()\n")
+		b.WriteString("\t_ = _cpuProfFile.Close()\n")
+		b.WriteString("}()\n")
 	case "mem":
 		t.addImport("runtime")
 		t.addImport("runtime/pprof")
 		t.addImport("os")
+		emitProfileOutput("mem", "")
 		b.WriteString("defer func() {\n")
 		b.WriteString("\truntime.GC()\n")
-		b.WriteString("\t_memProfFile, _memProfErr := os.CreateTemp(\"\", \"mem_profile_*.prof\")\n")
-		b.WriteString("\tif _memProfErr == nil {\n")
-		b.WriteString("\t\tpprof.WriteHeapProfile(_memProfFile)\n")
-		b.WriteString("\t\t_memProfFile.Close()\n")
-		b.WriteString("\t}\n")
+		b.WriteString("\t_ = pprof.WriteHeapProfile(memProfileFile)\n")
+		b.WriteString("\t_ = memProfileFile.Close()\n")
+		if dir.mode == "show" {
+			b.WriteString("\t" + tv + ".Logf(\"show top %d requested for mem profile (not executed automatically)\", " + strconv.Itoa(dir.top) + ")\n")
+		}
 		b.WriteString("}()\n")
 	case "allocs":
 		t.addImport("runtime")
+		t.addImport("runtime/pprof")
+		t.addImport("os")
+		emitProfileOutput("allocs", "")
 		b.WriteString("var _memStatsBefore runtime.MemStats\n")
 		b.WriteString("runtime.ReadMemStats(&_memStatsBefore)\n")
 		b.WriteString("defer func() {\n")
@@ -1310,19 +1996,66 @@ func (t *dmjTranspiler) emitProfile(n *gotreesitter.Node) string {
 		b.WriteString("\truntime.ReadMemStats(&_memStatsAfter)\n")
 		b.WriteString("\t_allocsDelta := _memStatsAfter.TotalAlloc - _memStatsBefore.TotalAlloc\n")
 		b.WriteString("\t_ = _allocsDelta // available for assertions\n")
+		b.WriteString("\tif allocsProfileFile != nil {\n")
+		b.WriteString("\t\t_ = pprof.Lookup(\"allocs\").WriteTo(allocsProfileFile, 1)\n")
+		b.WriteString("\t\t_ = allocsProfileFile.Close()\n")
+		b.WriteString("\t}\n")
 		b.WriteString("}()\n")
 	case "blockprofile":
 		t.addImport("runtime")
+		t.addImport("runtime/pprof")
+		t.addImport("os")
+		emitProfileOutput("block", "block")
 		b.WriteString("runtime.SetBlockProfileRate(1)\n")
 		b.WriteString("defer runtime.SetBlockProfileRate(0)\n")
 	case "mutexprofile":
 		t.addImport("runtime")
+		t.addImport("runtime/pprof")
+		t.addImport("os")
+		emitProfileOutput("mutex", "mutex")
 		b.WriteString("runtime.SetMutexProfileFraction(1)\n")
 		b.WriteString("defer runtime.SetMutexProfileFraction(0)\n")
 	default:
 		b.WriteString(fmt.Sprintf("// unsupported profile type: %s\n", profileType))
 	}
 	return b.String()
+}
+
+type profileDirective struct {
+	mode string // save or show
+	path string
+	top  int
+}
+
+func (t *dmjTranspiler) parseProfileDirective(n *gotreesitter.Node) profileDirective {
+	if n == nil {
+		return profileDirective{}
+	}
+	text := strings.TrimSpace(t.text(n))
+	if text == "" {
+		return profileDirective{}
+	}
+	lower := strings.ToLower(text)
+	if strings.HasPrefix(lower, "save ") {
+		return profileDirective{
+			mode: "save",
+			path: strings.TrimSpace(text[len("save"):]),
+		}
+	}
+	if strings.HasPrefix(lower, "show top") {
+		parts := strings.Fields(lower)
+		top := 10
+		if len(parts) >= 3 {
+			if parsed, err := strconv.Atoi(parts[2]); err == nil {
+				top = parsed
+			}
+		}
+		return profileDirective{
+			mode: "show",
+			top:  top,
+		}
+	}
+	return profileDirective{}
 }
 
 // ---------------------------------------------------------------------------

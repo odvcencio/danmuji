@@ -2,7 +2,7 @@
 
 A BDD testing language for Go. Write expressive test specs in `.dmj` files, compile them to standard `go test` code. No runtime library, no reflection, no magic.
 
-```
+```dmj
 package cart_test
 
 import "testing"
@@ -72,7 +72,7 @@ Each `.dmj` file produces a `_danmuji_test.go` file in the same directory. Put `
 
 ### Test categories
 
-```
+```dmj
 unit "fast logic" { ... }           // go test ./...
 integration "database" { ... }      // go test -tags=integration ./...
 e2e "full flow" { ... }             // go test -tags=e2e ./...
@@ -82,7 +82,7 @@ e2e "full flow" { ... }             // go test -tags=e2e ./...
 
 ### Given / When / Then
 
-```
+```dmj
 unit "UserService.Create" {
     given "valid input" {
         svc := NewUserService(repo)
@@ -105,7 +105,7 @@ Each block becomes a `t.Run` subtest. Nest them as deep as you want.
 
 ### Assertions
 
-```
+```dmj
 expect x == 1                  // assert.Equal(t, 1, x)
 expect x != 0                  // assert.NotEqual(t, 0, x)
 expect err == nil              // require.NoError(t, err)
@@ -116,9 +116,42 @@ reject ok                      // assert.False(t, ok)
 
 Backed by [testify](https://github.com/stretchr/testify). `expect err == nil` uses `require` (stops the test on failure). Everything else uses `assert` (logs and continues).
 
+Domain-shaped matchers can be defined as plain Go functions:
+
+```go
+func hasRole(user string, role string) bool {
+	return user == role
+}
+```
+
+```dmj
+unit "auth" {
+	then "is admin" {
+		expect "admin" hasRole "admin"
+	}
+}
+```
+
+### Eventual and Consistent Assertions
+
+```dmj
+unit "retries" {
+	then "waits for background work" {
+		eventually "job has finished" within 5 * time.Second {
+			expect jobDone
+		}
+		consistently "job sends once" for 2 * time.Second {
+			reject duplicateSend
+		}
+	}
+}
+```
+
+These are compiled into polling loops in generated Go so you can express temporal behavior without writing custom helper goroutine scaffolding.
+
 ### Mocks
 
-```
+```dmj
 mock UserRepo {
     FindByID(id int) -> User = User{Name: "stub"}
     Save(u User) -> error = nil
@@ -138,7 +171,7 @@ Generates a struct with call counters and canned return values. No code generati
 
 ### Fakes
 
-```
+```dmj
 fake InMemoryStore {
     Get(key string) -> string {
         return "value"
@@ -150,7 +183,7 @@ Like mocks, but with real method bodies. Use when you need working behavior, not
 
 ### Spies
 
-```
+```dmj
 spy EventBus {
     Publish(topic string, data interface{})
     Subscribe(topic string) -> chan interface{}
@@ -161,7 +194,7 @@ Wraps a real implementation. Records all calls and arguments, then delegates to 
 
 ### Lifecycle hooks
 
-```
+```dmj
 unit "database tests" {
     before each {
         db := setupTestDB()
@@ -177,7 +210,7 @@ unit "database tests" {
 
 ### Tags
 
-```
+```dmj
 @slow
 @smoke
 integration "heavy test" { ... }
@@ -187,7 +220,7 @@ integration "heavy test" { ... }
 
 ### Scenario-driven tests
 
-```
+```dmj
 unit "AuthMiddleware" {
     each "request scenario" {
         defaults { method: "GET", token: "valid", expect_status: 200 }
@@ -213,7 +246,7 @@ Each entry inherits from `defaults` and only specifies what changes. Generates a
 
 ### Matrix tests
 
-```
+```dmj
 unit "API compatibility" {
     matrix "method x auth" {
         method: { "GET", "POST", "PUT", "DELETE" }
@@ -229,9 +262,21 @@ unit "API compatibility" {
 
 Cartesian product of all dimensions. Each combination runs as a subtest.
 
+### Property-based specs
+
+```dmj
+unit "integer rules" {
+	property "addition commutative" for all (a int, b int) up to 500 {
+		expect a + b == b + a
+	}
+}
+```
+
+This compiles into `testing/quick.Check` with a predicate-style function, so the body is evaluated over generated values instead of a fixed example table. The optional `up to N` clause overrides the default sample count.
+
 ### Containers (testcontainers-go)
 
-```
+```dmj
 integration "database round-trip" {
     needs postgres "db" {}
     needs redis "cache" {}
@@ -246,7 +291,7 @@ Supported services: `postgres`, `redis`, `mysql`, `kafka`, `mongo`, `rabbitmq`, 
 
 ### Benchmarks
 
-```
+```dmj
 benchmark "JSON marshal" {
     setup {
         data := makeLargeStruct()
@@ -262,7 +307,7 @@ Generates `func BenchmarkJSONMarshal(b *testing.B)` with `b.ResetTimer()`, `b.N`
 
 For concurrent benchmarks:
 
-```
+```dmj
 benchmark "concurrent reads" {
     setup {
         cache := NewCache()
@@ -277,7 +322,7 @@ Generates `b.RunParallel`.
 
 ### Load testing (vegeta)
 
-```
+```dmj
 load "checkout endpoint" {
     rate 50
     duration 30
@@ -293,7 +338,7 @@ Generates [vegeta](https://github.com/tsenart/vegeta) attack code with rate limi
 
 ### Profiling
 
-```
+```dmj
 unit "memory check" {
     profile mem {}
     // ... test code
@@ -309,7 +354,7 @@ Captures `runtime/pprof` profiles inline with your tests. Supports: `cpu`, `mem`
 
 ### Goroutine leak detection
 
-```
+```dmj
 unit "connection pool" {
     no_leaks
 
@@ -325,7 +370,7 @@ One keyword. Captures goroutine count before and after, fails if any leaked.
 
 ### Fake clock with timezone support
 
-```
+```dmj
 unit "scheduler" {
     fake_clock at "2026-03-17T09:00:00Z" in "America/New_York"
 
@@ -344,7 +389,7 @@ Generates a `Clock` interface and `fakeClock` struct with `Advance`, `Set`, and 
 
 ### Shell commands
 
-```
+```dmj
 unit "migrations" {
     exec "run migrations" {
         run "migrate -database $DB_URL up"
@@ -357,7 +402,7 @@ Runs shell commands with assertable `exit_code`, `stdout`, and `stderr`.
 
 ### Snapshot testing
 
-```
+```dmj
 unit "API response" {
     given "a valid user" {
         user := User{Name: "Alice", Email: "alice@test.com"}
@@ -384,7 +429,7 @@ These are dependencies of your test code, not of danmuji itself. Add them to you
 
 ## File convention
 
-```
+```dmj
 myservice/
   user.go                  # implementation
   user_test.go             # existing Go tests (keep these)

@@ -220,8 +220,8 @@ integration "with database" {
 	t.Logf("Transpiled Go:\n%s", goCode)
 
 	// Structural checks
-	if !strings.Contains(goCode, "postgres.Run") {
-		t.Error("expected postgres.Run in generated code")
+	if !strings.Contains(goCode, "GenericContainer") {
+		t.Error("expected testcontainers.GenericContainer in generated code")
 	}
 	if !strings.Contains(goCode, "require.NoError") {
 		t.Error("expected require.NoError in generated code")
@@ -254,6 +254,33 @@ unit "shell commands" {
 
 	if !strings.Contains(goCode, "exec.Command") {
 		t.Error("expected exec.Command in output")
+	}
+}
+
+func TestTranspileDanmujiDomainMatcher(t *testing.T) {
+	source := []byte(`package matcher_test
+
+import "testing"
+
+func isAdmin(role string) bool { return role == "admin" }
+
+unit "auth" {
+	then "admin role check" {
+		expect "admin" isAdmin
+	}
+}
+`)
+	goCode, err := TranspileDanmuji(source)
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if !strings.Contains(goCode, "assert.True") {
+		t.Error("expected assert.True in output")
+	}
+	if !strings.Contains(goCode, "isAdmin(") {
+		t.Error("expected matcher function call in output")
 	}
 }
 
@@ -889,8 +916,85 @@ unit "combinations" {
 		t.Error("expected Scenario struct")
 	}
 	// 2 methods x 2 auth = 4 entries
-	if strings.Count(goCode, "\"GET\"") + strings.Count(goCode, "\"POST\"") < 4 {
+	if strings.Count(goCode, "\"GET\"")+strings.Count(goCode, "\"POST\"") < 4 {
 		t.Error("expected 4 cartesian product entries")
+	}
+}
+
+func TestTranspileDanmujiProperty(t *testing.T) {
+	source := []byte(`package property_test
+
+import "testing"
+
+unit "integer invariants" {
+	property "sum commutative" for all (a int, b int) up to 200 {
+		expect a + b == b + a
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source)
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if !strings.Contains(goCode, "quick.Check") {
+		t.Error("expected quick.Check call in generated code")
+	}
+	if !strings.Contains(goCode, "testing/quick") {
+		t.Error("expected quick import path in generated code")
+	}
+	if !strings.Contains(goCode, "func(a int, b int) bool") {
+		t.Error("expected property function signature in generated code")
+	}
+
+	tmpDir := t.TempDir()
+	os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module testmod\n\ngo 1.21\n"), 0644)
+	os.WriteFile(filepath.Join(tmpDir, "property_test.go"), []byte(goCode), 0644)
+
+	// Quick is from the standard library.
+	runCmd := exec.Command("go", "test", "-v", "./...")
+	runCmd.Dir = tmpDir
+	out, err := runCmd.CombinedOutput()
+	t.Logf("go test output:\n%s", string(out))
+	if err != nil {
+		t.Fatalf("go test failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "PASS") {
+		t.Error("expected PASS in go test output")
+	}
+}
+
+func TestTranspileDanmujiPropertyFailing(t *testing.T) {
+	source := []byte(`package property_test
+
+import "testing"
+
+unit "invalid invariants" {
+	property "always non-negative" for all (x int) {
+		expect x >= 0
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source)
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	tmpDir := t.TempDir()
+	os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module testmod\n\ngo 1.21\n"), 0644)
+	os.WriteFile(filepath.Join(tmpDir, "property_test.go"), []byte(goCode), 0644)
+
+	// This property should fail; expect tests to fail and report the property failure.
+	runCmd := exec.Command("go", "test", "-v", "./...")
+	runCmd.Dir = tmpDir
+	out, _ := runCmd.CombinedOutput()
+	t.Logf("go test output:\n%s", string(out))
+	if !strings.Contains(string(out), "FAIL") {
+		t.Error("expected FAIL in output for false property")
 	}
 }
 
