@@ -11,6 +11,7 @@
 "blockprofile" @keyword
 "called" @keyword
 "concurrency" @keyword
+"consistently" @keyword
 "container" @keyword
 "contains" @keyword
 "cpu" @keyword
@@ -20,6 +21,7 @@
 "duration" @keyword
 "e2e" @keyword
 "each" @keyword
+"eventually" @keyword
 "exec" @keyword
 "expect" @keyword
 "fake" @keyword
@@ -48,6 +50,7 @@
 "post" @keyword
 "postgres" @keyword
 "profile" @keyword
+"property" @keyword
 "put" @keyword
 "rabbitmq" @keyword
 "rampup" @keyword
@@ -67,11 +70,14 @@
 "target" @keyword
 "then" @keyword
 "times" @keyword
+"to" @keyword
 "top" @keyword
 "unit" @keyword
+"up" @keyword
 "verify" @keyword
 "when" @keyword
 "with" @keyword
+"within" @keyword
 
 ;; Operators
 "->" @operator
@@ -146,3 +152,11 @@
 ;; matrix_block
 (matrix_block name: (_) @string)
 
+;; property_block
+(property_block name: (_) @string)
+
+;; eventually_block
+(eventually_block name: (_) @string)
+
+;; consistently_block
+(consistently_block name: (_) @string)
