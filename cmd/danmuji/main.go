@@ -34,8 +34,13 @@ func main() {
 	case "test":
 		code := runTest(os.Args[2:])
 		os.Exit(code)
+	case "init":
+		if err := initProject(); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown command: %s\nUsage: danmuji <build|test> <path>\n", os.Args[1])
+		fmt.Fprintf(os.Stderr, "Unknown command: %s\nUsage: danmuji <build|test|init> <path>\n", os.Args[1])
 		os.Exit(1)
 	}
 }
@@ -219,4 +224,24 @@ func cleanup(files []string) {
 			fmt.Fprintf(os.Stderr, "warning: failed to clean up %s: %v\n", f, err)
 		}
 	}
+}
+
+// initProject adds testify to the current module.
+func initProject() error {
+	get := exec.Command("go", "get", "github.com/stretchr/testify@latest")
+	get.Stdout = os.Stdout
+	get.Stderr = os.Stderr
+	if err := get.Run(); err != nil {
+		return fmt.Errorf("go get testify: %w", err)
+	}
+
+	tidy := exec.Command("go", "mod", "tidy")
+	tidy.Stdout = os.Stdout
+	tidy.Stderr = os.Stderr
+	if err := tidy.Run(); err != nil {
+		return fmt.Errorf("go mod tidy: %w", err)
+	}
+
+	fmt.Println("danmuji: testify added. You're ready to write .dmj files.")
+	return nil
 }
