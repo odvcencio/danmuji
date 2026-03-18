@@ -8,6 +8,58 @@ import (
 	"testing"
 )
 
+// setupTestModule creates a temp directory with a go.mod that includes testify,
+// and runs `go mod tidy` to populate go.sum. A placeholder Go file is used
+// to satisfy tidy's import scanning, then removed.
+func setupTestModule(t *testing.T) string {
+	t.Helper()
+	tmpDir := t.TempDir()
+
+	goMod := `module testpkg
+
+go 1.24.0
+
+require github.com/stretchr/testify v1.9.0
+`
+	if err := os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte(goMod), 0644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+
+	// Write a placeholder .go file that imports testify so go mod tidy keeps it
+	placeholder := `package testpkg_test
+
+import _ "github.com/stretchr/testify/assert"
+`
+	placeholderPath := filepath.Join(tmpDir, "placeholder_test.go")
+	if err := os.WriteFile(placeholderPath, []byte(placeholder), 0644); err != nil {
+		t.Fatalf("write placeholder: %v", err)
+	}
+
+	cmd := exec.Command("go", "mod", "tidy")
+	cmd.Dir = tmpDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go mod tidy: %v\n%s", err, out)
+	}
+
+	// Remove the placeholder; danmuji test will generate the real .go files
+	os.Remove(placeholderPath)
+
+	return tmpDir
+}
+
+// buildCLI compiles the danmuji CLI binary and returns the path to it.
+func buildCLI(t *testing.T) string {
+	t.Helper()
+	cliBin := filepath.Join(t.TempDir(), "danmuji")
+	cmd := exec.Command("go", "build", "-o", cliBin, "./cmd/danmuji")
+	cmd.Dir = "/home/draco/work/danmuji"
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("build CLI: %v\n%s", err, out)
+	}
+	return cliBin
+}
+
 func TestDanmujiCLIBuild(t *testing.T) {
 	// Create a temp dir with a .dmj file
 	tmpDir := t.TempDir()
@@ -25,18 +77,11 @@ unit "hello" {
 		t.Fatalf("write dmj file: %v", err)
 	}
 
-	// Build the CLI
-	cliBin := filepath.Join(t.TempDir(), "danmuji")
-	cmd := exec.Command("go", "build", "-o", cliBin, "./cmd/danmuji")
-	cmd.Dir = "/home/draco/work/danmuji"
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("build CLI: %v\n%s", err, out)
-	}
+	cliBin := buildCLI(t)
 
 	// Run danmuji build on the temp dir
-	cmd = exec.Command(cliBin, "build", tmpDir)
-	out, err = cmd.CombinedOutput()
+	cmd := exec.Command(cliBin, "build", tmpDir)
+	out, err := cmd.CombinedOutput()
 	t.Logf("danmuji build output:\n%s", string(out))
 	if err != nil {
 		t.Fatalf("danmuji build: %v\n%s", err, out)
@@ -81,18 +126,11 @@ unit "single" {
 		t.Fatalf("write dmj file: %v", err)
 	}
 
-	// Build the CLI
-	cliBin := filepath.Join(t.TempDir(), "danmuji")
-	cmd := exec.Command("go", "build", "-o", cliBin, "./cmd/danmuji")
-	cmd.Dir = "/home/draco/work/danmuji"
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("build CLI: %v\n%s", err, out)
-	}
+	cliBin := buildCLI(t)
 
 	// Run danmuji build on a single file
-	cmd = exec.Command(cliBin, "build", dmjPath)
-	out, err = cmd.CombinedOutput()
+	cmd := exec.Command(cliBin, "build", dmjPath)
+	out, err := cmd.CombinedOutput()
 	t.Logf("danmuji build output:\n%s", string(out))
 	if err != nil {
 		t.Fatalf("danmuji build: %v\n%s", err, out)
@@ -114,22 +152,126 @@ unit "single" {
 }
 
 func TestDanmujiCLINoArgs(t *testing.T) {
-	// Build the CLI
-	cliBin := filepath.Join(t.TempDir(), "danmuji")
-	cmd := exec.Command("go", "build", "-o", cliBin, "./cmd/danmuji")
-	cmd.Dir = "/home/draco/work/danmuji"
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("build CLI: %v\n%s", err, out)
-	}
+	cliBin := buildCLI(t)
 
 	// Run with no args -- should fail with usage
-	cmd = exec.Command(cliBin)
-	out, err = cmd.CombinedOutput()
+	cmd := exec.Command(cliBin)
+	out, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Fatal("expected non-zero exit with no args")
 	}
 	if !strings.Contains(string(out), "Usage:") {
 		t.Error("expected usage message in stderr")
+	}
+}
+
+func TestTestCommand(t *testing.T) {
+	tmpDir := setupTestModule(t)
+
+	dmjSource := `package testpkg_test
+
+import "testing"
+
+unit "addition" {
+	then "one plus one" {
+		expect 1+1 == 2
+	}
+}
+`
+	dmjPath := filepath.Join(tmpDir, "math.dmj")
+	if err := os.WriteFile(dmjPath, []byte(dmjSource), 0644); err != nil {
+		t.Fatalf("write dmj file: %v", err)
+	}
+
+	cliBin := buildCLI(t)
+
+	// Run danmuji test on the temp dir
+	cmd := exec.Command(cliBin, "test", tmpDir)
+	out, err := cmd.CombinedOutput()
+	t.Logf("danmuji test output:\n%s", string(out))
+	if err != nil {
+		t.Fatalf("danmuji test failed: %v\n%s", err, out)
+	}
+
+	// Verify generated file was cleaned up
+	generatedFile := filepath.Join(tmpDir, "math_danmuji_test.go")
+	if _, err := os.Stat(generatedFile); !os.IsNotExist(err) {
+		t.Errorf("expected generated file %s to be cleaned up, but it still exists", generatedFile)
+	}
+}
+
+func TestTestCommandSingleFile(t *testing.T) {
+	tmpDir := setupTestModule(t)
+
+	dmjSource := `package testpkg_test
+
+import "testing"
+
+unit "multiply two" {
+	then "three times four" {
+		expect 3*4 == 12
+	}
+}
+`
+	dmjPath := filepath.Join(tmpDir, "multiply.dmj")
+	if err := os.WriteFile(dmjPath, []byte(dmjSource), 0644); err != nil {
+		t.Fatalf("write dmj file: %v", err)
+	}
+
+	cliBin := buildCLI(t)
+
+	// Run danmuji test on a single file
+	cmd := exec.Command(cliBin, "test", dmjPath)
+	out, err := cmd.CombinedOutput()
+	t.Logf("danmuji test output:\n%s", string(out))
+	if err != nil {
+		t.Fatalf("danmuji test failed: %v\n%s", err, out)
+	}
+
+	// Verify generated file was cleaned up
+	generatedFile := filepath.Join(tmpDir, "multiply_danmuji_test.go")
+	if _, err := os.Stat(generatedFile); !os.IsNotExist(err) {
+		t.Errorf("expected generated file to be cleaned up, but it still exists")
+	}
+}
+
+func TestBuildDebugFlag(t *testing.T) {
+	// Create a temp dir with a .dmj file
+	tmpDir := t.TempDir()
+	dmjSource := `package debug_test
+
+import "testing"
+
+unit "debug" {
+	then "works" {
+		expect 1 == 1
+	}
+}
+`
+	dmjPath := filepath.Join(tmpDir, "debug.dmj")
+	if err := os.WriteFile(dmjPath, []byte(dmjSource), 0644); err != nil {
+		t.Fatalf("write dmj file: %v", err)
+	}
+
+	cliBin := buildCLI(t)
+
+	// Run danmuji build --debug on a single file
+	cmd := exec.Command(cliBin, "build", "--debug", dmjPath)
+	out, err := cmd.CombinedOutput()
+	t.Logf("danmuji build --debug output:\n%s", string(out))
+	if err != nil {
+		t.Fatalf("danmuji build --debug: %v\n%s", err, out)
+	}
+
+	// Check output file exists
+	outputFile := filepath.Join(tmpDir, "debug_danmuji_test.go")
+	content, err := os.ReadFile(outputFile)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+
+	// In debug mode, //line directives should be omitted
+	if strings.Contains(string(content), "//line") {
+		t.Error("expected no //line directives in debug mode output")
 	}
 }
