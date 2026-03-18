@@ -29,8 +29,14 @@ func getDanmujiLanguage() (*gotreesitter.Language, error) {
 	return danmujiLangCached, danmujiLangErr
 }
 
+// TranspileOptions controls optional transpiler behavior.
+type TranspileOptions struct {
+	SourceFile string
+	Debug      bool
+}
+
 // TranspileDanmuji parses a .dmj source file and emits valid Go test code.
-func TranspileDanmuji(source []byte) (string, error) {
+func TranspileDanmuji(source []byte, opts TranspileOptions) (string, error) {
 	lang, err := getDanmujiLanguage()
 	if err != nil {
 		return "", fmt.Errorf("generate danmuji language: %w", err)
@@ -47,7 +53,13 @@ func TranspileDanmuji(source []byte) (string, error) {
 		return "", fmt.Errorf("parse errors:\n%s", root.SExpr(lang))
 	}
 
-	tr := &dmjTranspiler{src: source, lang: lang, testVar: "t"}
+	tr := &dmjTranspiler{
+		src:                source,
+		lang:               lang,
+		testVar:            "t",
+		sourceFile:         opts.SourceFile,
+		emitLineDirectives: opts.SourceFile != "" && !opts.Debug,
+	}
 	// First pass: collect package-level declarations (mocks)
 	tr.collectTopLevel(root)
 	// Second pass: emit the code
@@ -55,6 +67,12 @@ func TranspileDanmuji(source []byte) (string, error) {
 
 	// Inject all collected imports
 	output = tr.injectImports(output)
+
+	// Replace DMJLINE placeholders with real //line directives (must happen
+	// after injectImports so go/format doesn't reposition them).
+	if tr.emitLineDirectives {
+		output = resolveLineDirectives(output)
+	}
 
 	return output, nil
 }
@@ -67,6 +85,10 @@ type dmjTranspiler struct {
 	src     []byte
 	lang    *gotreesitter.Language
 	testVar string // "t" for tests, "b" for benchmarks
+	// Source file path for //line directives.
+	sourceFile string
+	// Whether to emit //line directives (true when sourceFile != "" && !Debug).
+	emitLineDirectives bool
 	// Package-level mock declarations collected during first pass.
 	// These are emitted before the test function that contained them.
 	mockDecls []string
@@ -107,6 +129,24 @@ func (t *dmjTranspiler) text(n *gotreesitter.Node) string {
 
 func (t *dmjTranspiler) lineOf(n *gotreesitter.Node) int {
 	return strings.Count(string(t.src[:n.StartByte()]), "\n") + 1
+}
+
+// lineDirective returns a placeholder marker for a //line directive. The actual
+// //line directive is substituted after import injection (which uses go/format
+// and would misplace //line comments). The placeholder is a valid Go comment so
+// go/format preserves it verbatim.
+func (t *dmjTranspiler) lineDirective(n *gotreesitter.Node) string {
+	if !t.emitLineDirectives {
+		return ""
+	}
+	return fmt.Sprintf("/*DMJLINE %s:%d*/\n", t.sourceFile, t.lineOf(n))
+}
+
+// resolveLineDirectives replaces all DMJLINE placeholder markers with real
+// //line directives. Called after injectImports so go/format cannot reposition them.
+func resolveLineDirectives(code string) string {
+	re := regexp.MustCompile(`/\*DMJLINE ([^*]+)\*/`)
+	return re.ReplaceAllString(code, "//line $1")
 }
 
 func (t *dmjTranspiler) assertContextString() string {
@@ -462,6 +502,7 @@ func (t *dmjTranspiler) emitTestBlock(n *gotreesitter.Node) string {
 		if t.nodeType(c) == "block" {
 			typeTagLines := t.emitTagDirectives(tags, t.testVar)
 			b.WriteString("{\n")
+			b.WriteString(t.lineDirective(n))
 			if len(typeTagLines) > 0 {
 				b.WriteString(typeTagLines)
 			}
@@ -556,6 +597,7 @@ func (t *dmjTranspiler) emitBenchmark(n *gotreesitter.Node) string {
 
 	// Function signature
 	fmt.Fprintf(&b, "func Benchmark%s(b *testing.B) {\n", name)
+	b.WriteString(t.lineDirective(n))
 
 	// Emit setup code
 	for _, sb := range setupBlocks {
@@ -663,6 +705,7 @@ func (t *dmjTranspiler) emitBDDBlock(n *gotreesitter.Node, keyword string) strin
 	defer t.popContext()
 
 	var b strings.Builder
+	b.WriteString(t.lineDirective(n))
 	fmt.Fprintf(&b, "%s.Run(%s, func(%s *testing.T) ", t.testVar, descText, t.testVar)
 
 	// Find and emit the block
@@ -800,6 +843,7 @@ func (t *dmjTranspiler) emitExpectAssertion(n *gotreesitter.Node) string {
 		return t.text(n)
 	}
 
+	ld := t.lineDirective(n)
 	nodeText := t.text(n)
 	msg := t.expectFailureContext("expect", strings.TrimSpace(nodeText), n)
 
@@ -809,26 +853,26 @@ func (t *dmjTranspiler) emitExpectAssertion(n *gotreesitter.Node) string {
 		t.addImport("github.com/stretchr/testify/assert")
 		if expected != nil {
 			expectedText := t.emit(expected)
-			return fmt.Sprintf("assert.True(%s, %s(%s, %s), %s)", t.testVar, matcherText, actualText, expectedText, msg)
+			return ld + fmt.Sprintf("assert.True(%s, %s(%s, %s), %s)", t.testVar, matcherText, actualText, expectedText, msg)
 		}
-		return fmt.Sprintf("assert.True(%s, %s(%s), %s)", t.testVar, matcherText, actualText, msg)
+		return ld + fmt.Sprintf("assert.True(%s, %s(%s), %s)", t.testVar, matcherText, actualText, msg)
 	}
 
 	if strings.Contains(nodeText, "is_nil") {
 		t.addImport("github.com/stretchr/testify/assert")
 		actualText := t.emit(actual)
-		return fmt.Sprintf("assert.Nil(%s, %s, %s)", t.testVar, actualText, msg)
+		return ld + fmt.Sprintf("assert.Nil(%s, %s, %s)", t.testVar, actualText, msg)
 	}
 	if strings.Contains(nodeText, "not_nil") {
 		t.addImport("github.com/stretchr/testify/assert")
 		actualText := t.emit(actual)
-		return fmt.Sprintf("assert.NotNil(%s, %s, %s)", t.testVar, actualText, msg)
+		return ld + fmt.Sprintf("assert.NotNil(%s, %s, %s)", t.testVar, actualText, msg)
 	}
 	if strings.Contains(nodeText, "contains") && expected != nil {
 		t.addImport("github.com/stretchr/testify/assert")
 		actualText := t.emit(actual)
 		expectedText := t.emit(expected)
-		return fmt.Sprintf("assert.Contains(%s, %s, %s, %s)", t.testVar, actualText, expectedText, msg)
+		return ld + fmt.Sprintf("assert.Contains(%s, %s, %s, %s)", t.testVar, actualText, expectedText, msg)
 	}
 
 	if expected != nil {
@@ -837,21 +881,21 @@ func (t *dmjTranspiler) emitExpectAssertion(n *gotreesitter.Node) string {
 		if strings.Contains(nodeText, "!=") {
 			if expectedText == "nil" {
 				t.addImport("github.com/stretchr/testify/assert")
-				return fmt.Sprintf("assert.NotNil(%s, %s, %s)", t.testVar, actualText, msg)
+				return ld + fmt.Sprintf("assert.NotNil(%s, %s, %s)", t.testVar, actualText, msg)
 			}
 			t.addImport("github.com/stretchr/testify/assert")
-			return fmt.Sprintf("assert.NotEqual(%s, %s, %s, %s)", t.testVar, expectedText, actualText, msg)
+			return ld + fmt.Sprintf("assert.NotEqual(%s, %s, %s, %s)", t.testVar, expectedText, actualText, msg)
 		}
 		if expectedText == "nil" && strings.HasSuffix(actualText, "err") {
 			t.addImport("github.com/stretchr/testify/require")
-			return fmt.Sprintf("require.NoError(%s, %s, %s)", t.testVar, actualText, msg)
+			return ld + fmt.Sprintf("require.NoError(%s, %s, %s)", t.testVar, actualText, msg)
 		}
 		if expectedText == "nil" {
 			t.addImport("github.com/stretchr/testify/assert")
-			return fmt.Sprintf("assert.Nil(%s, %s, %s)", t.testVar, actualText, msg)
+			return ld + fmt.Sprintf("assert.Nil(%s, %s, %s)", t.testVar, actualText, msg)
 		}
 		t.addImport("github.com/stretchr/testify/assert")
-		return fmt.Sprintf("assert.Equal(%s, %s, %s, %s)", t.testVar, expectedText, actualText, msg)
+		return ld + fmt.Sprintf("assert.Equal(%s, %s, %s, %s)", t.testVar, expectedText, actualText, msg)
 	}
 
 	if t.nodeType(actual) == "binary_expression" && actual.ChildCount() >= 3 {
@@ -865,39 +909,39 @@ func (t *dmjTranspiler) emitExpectAssertion(n *gotreesitter.Node) string {
 		case "==":
 			if rT == "nil" && strings.HasSuffix(lT, "err") {
 				t.addImport("github.com/stretchr/testify/require")
-				return fmt.Sprintf("require.NoError(%s, %s, %s)", t.testVar, lT, msg)
+				return ld + fmt.Sprintf("require.NoError(%s, %s, %s)", t.testVar, lT, msg)
 			}
 			if rT == "nil" {
 				t.addImport("github.com/stretchr/testify/assert")
-				return fmt.Sprintf("assert.Nil(%s, %s, %s)", t.testVar, lT, msg)
+				return ld + fmt.Sprintf("assert.Nil(%s, %s, %s)", t.testVar, lT, msg)
 			}
 			t.addImport("github.com/stretchr/testify/assert")
-			return fmt.Sprintf("assert.Equal(%s, %s, %s, %s)", t.testVar, rT, lT, msg)
+			return ld + fmt.Sprintf("assert.Equal(%s, %s, %s, %s)", t.testVar, rT, lT, msg)
 		case "!=":
 			if rT == "nil" {
 				t.addImport("github.com/stretchr/testify/assert")
-				return fmt.Sprintf("assert.NotNil(%s, %s, %s)", t.testVar, lT, msg)
+				return ld + fmt.Sprintf("assert.NotNil(%s, %s, %s)", t.testVar, lT, msg)
 			}
 			t.addImport("github.com/stretchr/testify/assert")
-			return fmt.Sprintf("assert.NotEqual(%s, %s, %s, %s)", t.testVar, rT, lT, msg)
+			return ld + fmt.Sprintf("assert.NotEqual(%s, %s, %s, %s)", t.testVar, rT, lT, msg)
 		case "<":
 			t.addImport("github.com/stretchr/testify/assert")
-			return fmt.Sprintf("assert.Less(%s, %s, %s, %s)", t.testVar, lT, rT, msg)
+			return ld + fmt.Sprintf("assert.Less(%s, %s, %s, %s)", t.testVar, lT, rT, msg)
 		case ">":
 			t.addImport("github.com/stretchr/testify/assert")
-			return fmt.Sprintf("assert.Greater(%s, %s, %s, %s)", t.testVar, lT, rT, msg)
+			return ld + fmt.Sprintf("assert.Greater(%s, %s, %s, %s)", t.testVar, lT, rT, msg)
 		case "<=":
 			t.addImport("github.com/stretchr/testify/assert")
-			return fmt.Sprintf("assert.LessOrEqual(%s, %s, %s, %s)", t.testVar, lT, rT, msg)
+			return ld + fmt.Sprintf("assert.LessOrEqual(%s, %s, %s, %s)", t.testVar, lT, rT, msg)
 		case ">=":
 			t.addImport("github.com/stretchr/testify/assert")
-			return fmt.Sprintf("assert.GreaterOrEqual(%s, %s, %s, %s)", t.testVar, lT, rT, msg)
+			return ld + fmt.Sprintf("assert.GreaterOrEqual(%s, %s, %s, %s)", t.testVar, lT, rT, msg)
 		}
 	}
 
 	t.addImport("github.com/stretchr/testify/assert")
 	actualText := t.emit(actual)
-	return fmt.Sprintf("assert.True(%s, %s, %s)", t.testVar, actualText, msg)
+	return ld + fmt.Sprintf("assert.True(%s, %s, %s)", t.testVar, actualText, msg)
 }
 
 // ---------------------------------------------------------------------------
@@ -916,7 +960,7 @@ func (t *dmjTranspiler) emitReject(n *gotreesitter.Node) string {
 	msg := t.expectFailureContext("reject", strings.TrimSpace(t.text(n)), n)
 	t.addImport("github.com/stretchr/testify/assert")
 	actualText := t.emit(actual)
-	return fmt.Sprintf("assert.False(%s, %s, %s)", t.testVar, actualText, msg)
+	return t.lineDirective(n) + fmt.Sprintf("assert.False(%s, %s, %s)", t.testVar, actualText, msg)
 }
 
 // ---------------------------------------------------------------------------
@@ -1391,6 +1435,7 @@ func (t *dmjTranspiler) emitLoad(n *gotreesitter.Node) string {
 
 	// Function signature
 	fmt.Fprintf(&b, "func TestLoad%s(t *testing.T) {\n", name)
+	b.WriteString(t.lineDirective(n))
 
 	// Vegeta setup
 	fmt.Fprintf(&b, "\trate := vegeta.Rate{Freq: %s, Per: time.Second}\n", normalizeRateExpression(rate))
@@ -1632,6 +1677,7 @@ func (t *dmjTranspiler) emitExec(n *gotreesitter.Node) string {
 	}
 
 	var b strings.Builder
+	b.WriteString(t.lineDirective(n))
 	fmt.Fprintf(&b, "%s.Run(%q, func(%s *testing.T) {\n", t.testVar, name, t.testVar)
 	fmt.Fprintf(&b, "\tvar stdout, stderr bytes.Buffer\n")
 	fmt.Fprintf(&b, "\tvar exitCode int\n")

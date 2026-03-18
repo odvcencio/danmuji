@@ -27,7 +27,7 @@ unit "arithmetic" {
 }
 `)
 
-	goCode, err := TranspileDanmuji(source)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
 	if err != nil {
 		t.Fatalf("transpile: %v", err)
 	}
@@ -66,7 +66,7 @@ unit "basic" {
 }
 `)
 
-	goCode, err := TranspileDanmuji(source)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
 	if err != nil {
 		t.Fatalf("transpile: %v", err)
 	}
@@ -117,7 +117,7 @@ unit "failing" {
 }
 `)
 
-	goCode, err := TranspileDanmuji(source)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
 	if err != nil {
 		t.Fatalf("transpile: %v", err)
 	}
@@ -167,7 +167,7 @@ unit "with mock" {
 }
 `)
 
-	goCode, err := TranspileDanmuji(source)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
 	if err != nil {
 		t.Fatalf("transpile: %v", err)
 	}
@@ -213,7 +213,7 @@ integration "with database" {
 }
 `)
 
-	goCode, err := TranspileDanmuji(source)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
 	if err != nil {
 		t.Fatalf("transpile: %v", err)
 	}
@@ -246,7 +246,7 @@ unit "shell commands" {
 	}
 }
 `)
-	goCode, err := TranspileDanmuji(source)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
 	if err != nil {
 		t.Fatalf("transpile: %v", err)
 	}
@@ -270,7 +270,7 @@ unit "auth" {
 	}
 }
 `)
-	goCode, err := TranspileDanmuji(source)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
 	if err != nil {
 		t.Fatalf("transpile: %v", err)
 	}
@@ -298,7 +298,7 @@ load "api throughput" {
 	}
 }
 `)
-	goCode, err := TranspileDanmuji(source)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
 	if err != nil {
 		t.Fatalf("transpile: %v", err)
 	}
@@ -328,7 +328,7 @@ unit "echo" {
 	}
 }
 `)
-	goCode, err := TranspileDanmuji(source)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
 	if err != nil {
 		t.Fatalf("transpile: %v", err)
 	}
@@ -364,7 +364,7 @@ func TestTranspileDanmujiBenchmark(t *testing.T) {
 		t.Fatalf("read: %v", err)
 	}
 
-	goCode, err := TranspileDanmuji(source)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
 	if err != nil {
 		t.Fatalf("transpile: %v", err)
 	}
@@ -396,7 +396,7 @@ benchmark "addition" {
 	}
 }
 `)
-	goCode, err := TranspileDanmuji(source)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
 	if err != nil {
 		t.Fatalf("transpile: %v", err)
 	}
@@ -430,7 +430,7 @@ unit "goroutine check" {
 	}
 }
 `)
-	goCode, err := TranspileDanmuji(source)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
 	if err != nil {
 		t.Fatalf("transpile: %v", err)
 	}
@@ -464,7 +464,7 @@ unit "with fake" {
 	}
 }
 `)
-	goCode, err := TranspileDanmuji(source)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
 	if err != nil {
 		t.Fatalf("transpile: %v", err)
 	}
@@ -493,7 +493,7 @@ unit "table driven" {
 	}
 }
 `)
-	goCode, err := TranspileDanmuji(source)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
 	if err != nil {
 		t.Fatalf("transpile: %v", err)
 	}
@@ -519,7 +519,7 @@ unit "no leaks" {
 	}
 }
 `)
-	goCode, err := TranspileDanmuji(source)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
 	if err != nil {
 		t.Fatalf("transpile: %v", err)
 	}
@@ -545,7 +545,7 @@ unit "scheduler" {
 	}
 }
 `)
-	goCode, err := TranspileDanmuji(source)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
 	if err != nil {
 		t.Fatalf("transpile: %v", err)
 	}
@@ -585,7 +585,7 @@ unit "time travel" {
 	}
 }
 `)
-	goCode, err := TranspileDanmuji(source)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
 	if err != nil {
 		t.Fatalf("transpile: %v", err)
 	}
@@ -625,7 +625,7 @@ func TestTranspileDanmujiFullStack(t *testing.T) {
 		t.Fatalf("read: %v", err)
 	}
 
-	goCode, err := TranspileDanmuji(source)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
 	if err != nil {
 		t.Fatalf("transpile: %v", err)
 	}
@@ -704,7 +704,7 @@ unit "API output" {
 }
 `)
 
-	goCode, err := TranspileDanmuji(source)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
 	if err != nil {
 		t.Fatalf("transpile: %v", err)
 	}
@@ -755,7 +755,7 @@ unit "with spy" {
 }
 `)
 
-	goCode, err := TranspileDanmuji(source)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
 	if err != nil {
 		t.Fatalf("transpile: %v", err)
 	}
@@ -795,7 +795,7 @@ unit "spy placeholder" {
 }
 `)
 
-	goCode, err := TranspileDanmuji(source)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
 	if err != nil {
 		t.Fatalf("transpile: %v", err)
 	}
@@ -826,7 +826,7 @@ unit "addition" {
 }
 `)
 
-	goCode, err := TranspileDanmuji(source)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
 	if err != nil {
 		t.Fatalf("transpile: %v", err)
 	}
@@ -875,7 +875,7 @@ unit "scenarios" {
     }
 }
 `)
-	goCode, err := TranspileDanmuji(source)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
 	if err != nil {
 		t.Fatalf("transpile: %v", err)
 	}
@@ -906,7 +906,7 @@ unit "combinations" {
     }
 }
 `)
-	goCode, err := TranspileDanmuji(source)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
 	if err != nil {
 		t.Fatalf("transpile: %v", err)
 	}
@@ -933,7 +933,7 @@ unit "integer invariants" {
 }
 `)
 
-	goCode, err := TranspileDanmuji(source)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
 	if err != nil {
 		t.Fatalf("transpile: %v", err)
 	}
@@ -978,7 +978,7 @@ unit "invalid invariants" {
 }
 `)
 
-	goCode, err := TranspileDanmuji(source)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
 	if err != nil {
 		t.Fatalf("transpile: %v", err)
 	}
@@ -1014,7 +1014,7 @@ unit "math scenarios" {
     }
 }
 `)
-	goCode, err := TranspileDanmuji(source)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
 	if err != nil {
 		t.Fatalf("transpile: %v", err)
 	}
@@ -1037,5 +1037,74 @@ unit "math scenarios" {
 	t.Logf("go test output:\n%s", string(out))
 	if err != nil {
 		t.Fatalf("go test failed: %v\n%s", err, out)
+	}
+}
+
+func TestTranspileDanmujiLineDirectives(t *testing.T) {
+	source := []byte(`package myservice_test
+
+import "testing"
+
+unit "arithmetic" {
+	then "adds" {
+		expect 1 + 1 == 2
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source, TranspileOptions{SourceFile: "/tmp/test.dmj"})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if !strings.Contains(goCode, "//line /tmp/test.dmj:") {
+		t.Error("expected //line /tmp/test.dmj: directive in output when SourceFile is set")
+	}
+}
+
+func TestTranspileDanmujiDebugOmitsLineDirectives(t *testing.T) {
+	source := []byte(`package myservice_test
+
+import "testing"
+
+unit "arithmetic" {
+	then "adds" {
+		expect 1 + 1 == 2
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source, TranspileOptions{SourceFile: "/tmp/test.dmj", Debug: true})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if strings.Contains(goCode, "//line") {
+		t.Error("expected no //line directives when Debug is true")
+	}
+}
+
+func TestTranspileDanmujiEmptySourceFileOmitsDirectives(t *testing.T) {
+	source := []byte(`package myservice_test
+
+import "testing"
+
+unit "arithmetic" {
+	then "adds" {
+		expect 1 + 1 == 2
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if strings.Contains(goCode, "//line") {
+		t.Error("expected no //line directives when SourceFile is empty")
 	}
 }

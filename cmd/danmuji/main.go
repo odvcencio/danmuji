@@ -73,7 +73,8 @@ func buildFile(path string) error {
 		return fmt.Errorf("read %s: %w", path, err)
 	}
 
-	goCode, err := danmuji.TranspileDanmuji(source)
+	absPath, _ := filepath.Abs(path)
+	goCode, err := danmuji.TranspileDanmuji(source, danmuji.TranspileOptions{SourceFile: absPath})
 	if err != nil {
 		return fmt.Errorf("transpile %s: %w", path, err)
 	}
