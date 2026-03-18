@@ -462,6 +462,67 @@ func DanmujiGrammar() *Grammar {
 		))
 
 		// ---------------------------------------------------------------
+		// Process blocks: opaque-box testing
+		// ---------------------------------------------------------------
+		g.Define("process_block", Seq(
+			Str("process"),
+			Optional(Str("run")),
+			Field("path", Sym("_string_literal")),
+			Field("body", Sym("block")),
+		))
+
+		g.Define("process_args", Seq(
+			Str("args"),
+			Field("value", Sym("_string_literal")),
+		))
+
+		g.Define("process_env", PrecDynamic(20, Seq(
+			Str("env"),
+			Str("{"),
+			CommaSep1(Sym("scenario_field")),
+			Str("}"),
+		)))
+
+		g.Define("ready_mode", Choice(
+			Str("http"),
+			Str("tcp"),
+			Str("stdout"),
+			Str("delay"),
+		))
+
+		g.Define("ready_clause", Seq(
+			Str("ready"),
+			Field("mode", Sym("ready_mode")),
+			Field("target", Choice(
+				Sym("_expression"),
+				Sym("duration_literal"),
+			)),
+		))
+
+		// ---------------------------------------------------------------
+		// Stop block: shutdown observation
+		// ---------------------------------------------------------------
+		g.Define("stop_block", Seq(
+			Str("stop"),
+			Field("body", Sym("block")),
+		))
+
+		g.Define("signal_name", Pat(`SIG[A-Z0-9]+`))
+
+		g.Define("signal_directive", Seq(
+			Str("signal"),
+			Field("name", Sym("signal_name")),
+		))
+
+		g.Define("timeout_directive", Seq(
+			Str("timeout"),
+			Field("duration", Choice(
+				Sym("duration_literal"),
+				Sym("_expression"),
+			)),
+		))
+
+		// ---------------------------------------------------------------
 		// Wire into Go: extend _top_level_declaration and _statement
 		// ---------------------------------------------------------------
 		AppendChoice(g, "_top_level_declaration",
@@ -507,6 +568,13 @@ func DanmujiGrammar() *Grammar {
 			Sym("scenario_entry"),
 			Sym("scenario_field"),
 			Sym("matrix_field"),
+			Sym("process_block"),
+			Sym("process_args"),
+			Sym("process_env"),
+			Sym("ready_clause"),
+			Sym("stop_block"),
+			Sym("signal_directive"),
+			Sym("timeout_directive"),
 		)
 
 		// ---------------------------------------------------------------
@@ -548,6 +616,13 @@ func DanmujiGrammar() *Grammar {
 		AddConflict(g, "_statement", "matrix_field")
 		AddConflict(g, "_statement", "eventually_block")
 		AddConflict(g, "_statement", "consistently_block")
+		AddConflict(g, "_statement", "process_block")
+		AddConflict(g, "_statement", "process_args")
+		AddConflict(g, "_statement", "process_env")
+		AddConflict(g, "_statement", "ready_clause")
+		AddConflict(g, "_statement", "stop_block")
+		AddConflict(g, "_statement", "signal_directive")
+		AddConflict(g, "_statement", "timeout_directive")
 
 		g.EnableLRSplitting = true
 	})

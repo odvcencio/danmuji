@@ -1,6 +1,7 @@
 package danmuji
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -576,6 +577,143 @@ func f() {
 	t.Logf("SExpr: %s", sexp)
 	if !strings.Contains(sexp, "spy_declaration") {
 		t.Error("expected spy_declaration node")
+	}
+	if strings.Contains(sexp, "ERROR") {
+		t.Errorf("unexpected ERROR: %s", sexp)
+	}
+}
+
+func TestDanmujiProcessBlock(t *testing.T) {
+	input := `package main
+func f() {
+	process "./cmd/server" {
+		args "--port=9090"
+		env { DB_URL: "postgres://localhost/test", LOG_LEVEL: "debug" }
+		ready http "http://localhost:9090/health"
+	}
+}
+`
+	sexp := parseDanmuji(t, input)
+	t.Logf("SExpr: %s", sexp)
+	if !strings.Contains(sexp, "process_block") {
+		t.Error("expected process_block node")
+	}
+	if !strings.Contains(sexp, "process_args") {
+		t.Error("expected process_args node")
+	}
+	if !strings.Contains(sexp, "process_env") {
+		t.Error("expected process_env node")
+	}
+	if !strings.Contains(sexp, "ready_clause") {
+		t.Error("expected ready_clause node")
+	}
+	if strings.Contains(sexp, "ERROR") {
+		t.Errorf("unexpected ERROR: %s", sexp)
+	}
+}
+
+func TestDanmujiProcessRun(t *testing.T) {
+	input := `package main
+func f() {
+	process run "./bin/server" {
+		args "--port=9090"
+	}
+}
+`
+	sexp := parseDanmuji(t, input)
+	t.Logf("SExpr: %s", sexp)
+	if !strings.Contains(sexp, "process_block") {
+		t.Error("expected process_block node")
+	}
+	if strings.Contains(sexp, "ERROR") {
+		t.Errorf("unexpected ERROR: %s", sexp)
+	}
+}
+
+func TestDanmujiStopBlock(t *testing.T) {
+	input := `package main
+func f() {
+	stop {
+		signal SIGTERM
+		timeout 30s
+		expect exit_code == 0
+	}
+}
+`
+	sexp := parseDanmuji(t, input)
+	t.Logf("SExpr: %s", sexp)
+	if !strings.Contains(sexp, "stop_block") {
+		t.Error("expected stop_block node")
+	}
+	if !strings.Contains(sexp, "signal_directive") {
+		t.Error("expected signal_directive node")
+	}
+	if !strings.Contains(sexp, "timeout_directive") {
+		t.Error("expected timeout_directive node")
+	}
+	if strings.Contains(sexp, "ERROR") {
+		t.Errorf("unexpected ERROR: %s", sexp)
+	}
+}
+
+func TestDanmujiReadyModes(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+	}{
+		{"http", `ready http "http://localhost:9090/health"`},
+		{"tcp", `ready tcp "localhost:9090"`},
+		{"stdout", `ready stdout "listening on"`},
+		{"delay", `ready delay 5s`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			input := fmt.Sprintf("package main\nfunc f() {\n\t%s\n}\n", tc.input)
+			sexp := parseDanmuji(t, input)
+			t.Logf("SExpr: %s", sexp)
+			if !strings.Contains(sexp, "ready_clause") {
+				t.Error("expected ready_clause node")
+			}
+			if !strings.Contains(sexp, "ready_mode") {
+				t.Error("expected ready_mode node")
+			}
+			if strings.Contains(sexp, "ERROR") {
+				t.Errorf("unexpected ERROR: %s", sexp)
+			}
+		})
+	}
+}
+
+func TestDanmujiSignalNames(t *testing.T) {
+	signals := []string{"SIGTERM", "SIGINT", "SIGKILL", "SIGUSR1", "SIGHUP"}
+	for _, sig := range signals {
+		t.Run(sig, func(t *testing.T) {
+			input := fmt.Sprintf("package main\nfunc f() {\n\tsignal %s\n}\n", sig)
+			sexp := parseDanmuji(t, input)
+			t.Logf("SExpr: %s", sexp)
+			if !strings.Contains(sexp, "signal_directive") {
+				t.Error("expected signal_directive node")
+			}
+			if strings.Contains(sexp, "ERROR") {
+				t.Errorf("unexpected ERROR: %s", sexp)
+			}
+		})
+	}
+}
+
+func TestDanmujiStopBareAssertions(t *testing.T) {
+	input := `package main
+func f() {
+	stop {
+		expect exit_code == 0
+		expect stderr contains "done"
+	}
+}
+`
+	sexp := parseDanmuji(t, input)
+	t.Logf("SExpr: %s", sexp)
+	if !strings.Contains(sexp, "stop_block") {
+		t.Error("expected stop_block node")
 	}
 	if strings.Contains(sexp, "ERROR") {
 		t.Errorf("unexpected ERROR: %s", sexp)
