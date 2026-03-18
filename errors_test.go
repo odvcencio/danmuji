@@ -249,3 +249,149 @@ unit "test2" {
 	t.Logf("Found %d error(s)", len(errors))
 	// Should report errors from both blocks (up to 1 per top-level block)
 }
+
+// ---------------------------------------------------------------------------
+// describeExpected / matchExpansions / describeStep tests
+// ---------------------------------------------------------------------------
+
+func TestDescribeExpected(t *testing.T) {
+	g := DanmujiGrammar()
+	expectations := buildExpectationMap(g)
+	lang := getDanmujiLang(t)
+
+	// "given" without string — should suggest string.
+	// Tree-sitter's error recovery for this grammar typically collapses
+	// the root into an ERROR node with flattened children. The root ERROR
+	// contains keyword tokens (e.g. "given") as children. describeExpected
+	// handles both recognized parents (from the expectations map) and ERROR
+	// parents (by scanning keyword prefixes against expansions).
+	source := []byte("package main\n\nunit \"test\" {\n\tgiven {\n\t}\n}\n")
+	parser := gotreesitter.NewParser(lang)
+	tree, _ := parser.Parse(source)
+	root := tree.RootNode()
+	if !root.HasError() {
+		t.Skip("no error")
+	}
+	t.Logf("SExpr: %s", root.SExpr(lang))
+	errors := findErrors(root, lang)
+	if len(errors) == 0 {
+		t.Fatal("expected error node")
+	}
+	errNode := errors[0]
+	t.Logf("Error node type: %s, IsError: %v, IsMissing: %v", errNode.Type(lang), errNode.IsError(), errNode.IsMissing())
+
+	// The error node may be the root (no parent) or may have a parent.
+	// When it has a parent, call describeExpected.
+	parent := errNode.Parent()
+	if parent == nil {
+		// Root-level ERROR — describeExpected works with nested errors.
+		// Find a child ERROR node inside the root that has the root as parent.
+		for i := 0; i < errNode.ChildCount(); i++ {
+			child := errNode.Child(i)
+			if child.IsError() {
+				parent = errNode
+				errNode = child
+				break
+			}
+		}
+		if parent == nil {
+			t.Skip("no nested error node found")
+		}
+	}
+
+	t.Logf("Parent type: %s", parent.Type(lang))
+	msg := describeExpected(parent, errNode, lang, expectations)
+	t.Logf("Parent: %s, Message: %s", parent.Type(lang), msg)
+	if msg == "" {
+		t.Error("expected non-empty message")
+	}
+}
+
+func TestMatchExpansionsSimple(t *testing.T) {
+	expansions := []LinearExpansion{
+		{Steps: []ExpectedStep{
+			{Keyword: "given"},
+			{Type: "_string_literal", Field: "description"},
+			{Type: "block"},
+		}},
+	}
+	// Prefix: just "given" parsed — should suggest string next
+	next := matchExpansions([]string{"given"}, expansions)
+	if len(next) == 0 {
+		t.Fatal("expected next steps")
+	}
+	found := false
+	for _, s := range next {
+		if s.Type == "_string_literal" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected _string_literal in next steps")
+	}
+}
+
+func TestDescribeStepKeyword(t *testing.T) {
+	s := describeStep(ExpectedStep{Keyword: "given"})
+	if s != `"given"` {
+		t.Errorf("expected quoted keyword, got %q", s)
+	}
+}
+
+func TestDescribeStepString(t *testing.T) {
+	s := describeStep(ExpectedStep{Type: "_string_literal"})
+	if s != "string" {
+		t.Errorf("expected 'string', got %q", s)
+	}
+}
+
+func TestDescribeStepBlock(t *testing.T) {
+	s := describeStep(ExpectedStep{Type: "block"})
+	if s != "{" {
+		t.Errorf("expected '{', got %q", s)
+	}
+}
+
+func TestDescribeStepExpression(t *testing.T) {
+	s := describeStep(ExpectedStep{Type: "_expression"})
+	if s != "expression" {
+		t.Errorf("expected 'expression', got %q", s)
+	}
+}
+
+func TestDescribeStepParameterList(t *testing.T) {
+	s := describeStep(ExpectedStep{Type: "parameter_list"})
+	if s != "parameter list" {
+		t.Errorf("expected 'parameter list', got %q", s)
+	}
+}
+
+func TestMatchExpansionsOptionalSkip(t *testing.T) {
+	expansions := []LinearExpansion{
+		{Steps: []ExpectedStep{
+			{Keyword: "test", Optional: true},
+			{Keyword: "given"},
+			{Type: "_string_literal"},
+		}},
+	}
+	// Empty prefix — should suggest "test" (optional) or "given"
+	next := matchExpansions([]string{}, expansions)
+	if len(next) == 0 {
+		t.Fatal("expected next steps")
+	}
+	t.Logf("Next steps: %+v", next)
+}
+
+func TestMatchExpansionsNoMatch(t *testing.T) {
+	expansions := []LinearExpansion{
+		{Steps: []ExpectedStep{
+			{Keyword: "given"},
+			{Type: "_string_literal"},
+		}},
+	}
+	// Prefix doesn't match — "when" is not "given"
+	next := matchExpansions([]string{"when"}, expansions)
+	if len(next) != 0 {
+		t.Errorf("expected no matches, got %+v", next)
+	}
+}

@@ -363,3 +363,203 @@ func findTopLevelBlock(n *gotreesitter.Node, lang *gotreesitter.Language) *gotre
 	}
 	return nil
 }
+
+// ---------------------------------------------------------------------------
+// Prefix matching and Layer 1 message generation
+// ---------------------------------------------------------------------------
+
+// describeExpected generates a human-readable message describing what was
+// expected at the position of errNode within parent. It looks up the parent's
+// grammar production, collects the types of children parsed before the error,
+// and uses matchExpansions to determine what should come next.
+//
+// When the parent is an ERROR node (common with tree-sitter's error recovery),
+// the function scans the parent's children for keyword tokens that partially
+// match known productions, and suggests what should come next.
+func describeExpected(parent, errNode *gotreesitter.Node, lang *gotreesitter.Language, expectations map[string]*ProductionExpectations) string {
+	parentType := parent.Type(lang)
+
+	// Find the error node's index among siblings by comparing start/end bytes.
+	errStart := errNode.StartByte()
+	errEnd := errNode.EndByte()
+	errIdx := -1
+	childCount := parent.ChildCount()
+	for i := 0; i < childCount; i++ {
+		child := parent.Child(i)
+		if child.StartByte() == errStart && child.EndByte() == errEnd {
+			errIdx = i
+			break
+		}
+	}
+	if errIdx < 0 {
+		return fmt.Sprintf("unexpected token in %s", parentType)
+	}
+
+	// Collect node types of successfully-parsed children before the error.
+	var prefix []string
+	for i := 0; i < errIdx; i++ {
+		child := parent.Child(i)
+		prefix = append(prefix, child.Type(lang))
+	}
+
+	// If the parent is a recognized production, match against its expansions.
+	if pe, ok := expectations[parentType]; ok {
+		next := matchExpansions(prefix, pe.Expansions)
+		if len(next) > 0 {
+			return formatExpectedMessage(next, parentType)
+		}
+		return fmt.Sprintf("unexpected token in %s", parentType)
+	}
+
+	// Parent is an ERROR or unrecognized node. Scan backward from the error
+	// position to find keyword tokens that start a known production, then
+	// use the prefix from that keyword onward.
+	if msg := describeExpectedFromKeywords(prefix, expectations, parentType); msg != "" {
+		return msg
+	}
+
+	return fmt.Sprintf("unexpected token in %s", parentType)
+}
+
+// describeExpectedFromKeywords tries to match the tail of a prefix of parsed
+// children against known productions. It scans backward for a keyword that
+// starts a known expansion and suggests what should come next.
+func describeExpectedFromKeywords(prefix []string, expectations map[string]*ProductionExpectations, parentType string) string {
+	// Scan backward through the prefix for keywords that start known productions.
+	for i := len(prefix) - 1; i >= 0; i-- {
+		candidate := prefix[i]
+		// Try each production to see if candidate matches its first step.
+		for _, pe := range expectations {
+			subPrefix := prefix[i:]
+			next := matchExpansions(subPrefix, pe.Expansions)
+			if len(next) > 0 {
+				return formatExpectedMessage(next, parentType)
+			}
+		}
+		_ = candidate
+	}
+	return ""
+}
+
+// formatExpectedMessage formats a list of expected next steps into a
+// human-readable message like "expected X", "expected X or Y", or
+// "expected X, Y, or Z".
+func formatExpectedMessage(next []ExpectedStep, parentType string) string {
+	// Deduplicate expected descriptions.
+	seen := make(map[string]bool)
+	var descriptions []string
+	for _, step := range next {
+		desc := describeStep(step)
+		if !seen[desc] {
+			seen[desc] = true
+			descriptions = append(descriptions, desc)
+		}
+	}
+	if len(descriptions) == 0 {
+		return fmt.Sprintf("unexpected token in %s", parentType)
+	}
+
+	switch len(descriptions) {
+	case 1:
+		return fmt.Sprintf("expected %s", descriptions[0])
+	case 2:
+		return fmt.Sprintf("expected %s or %s", descriptions[0], descriptions[1])
+	default:
+		return fmt.Sprintf("expected %s, or %s",
+			strings.Join(descriptions[:len(descriptions)-1], ", "),
+			descriptions[len(descriptions)-1])
+	}
+}
+
+// matchExpansions tries to advance each expansion through the given prefix
+// of parsed child types. For each expansion that fully consumes the prefix,
+// it collects the next expected step. Optional steps that don't match are
+// skipped during prefix consumption.
+func matchExpansions(prefix []string, expansions []LinearExpansion) []ExpectedStep {
+	var result []ExpectedStep
+
+	for _, exp := range expansions {
+		next := matchSingleExpansion(prefix, exp.Steps, 0, 0)
+		result = append(result, next...)
+	}
+
+	return result
+}
+
+// matchSingleExpansion recursively matches prefix[pi:] against steps[si:]
+// and collects the next expected step(s) after the prefix is consumed.
+func matchSingleExpansion(prefix []string, steps []ExpectedStep, pi, si int) []ExpectedStep {
+	// Prefix fully consumed — collect the next step(s).
+	if pi >= len(prefix) {
+		// Find the next non-consumed step.
+		for si < len(steps) {
+			step := steps[si]
+			return []ExpectedStep{step}
+		}
+		// All steps consumed too — no next step.
+		return nil
+	}
+
+	// Steps exhausted but prefix not consumed — mismatch.
+	if si >= len(steps) {
+		return nil
+	}
+
+	step := steps[si]
+	nodeType := prefix[pi]
+
+	if stepMatches(step, nodeType) {
+		// This step matches the current prefix element — advance both.
+		return matchSingleExpansion(prefix, steps, pi+1, si+1)
+	}
+
+	// Step doesn't match. If optional, skip it and try the next step.
+	if step.Optional {
+		return matchSingleExpansion(prefix, steps, pi, si+1)
+	}
+
+	// Non-optional step doesn't match — this expansion doesn't apply.
+	return nil
+}
+
+// stepMatches checks if a step matches a parsed node type.
+// If the step has a Keyword, it matches against the keyword.
+// Otherwise it matches step.Type against nodeType.
+func stepMatches(step ExpectedStep, nodeType string) bool {
+	if step.Keyword != "" {
+		return step.Keyword == nodeType
+	}
+	return step.Type == nodeType
+}
+
+// describeStep returns a human-readable description of an expected step.
+func describeStep(step ExpectedStep) string {
+	if step.Keyword != "" {
+		return fmt.Sprintf("%q", step.Keyword)
+	}
+
+	switch step.Type {
+	case "_string_literal":
+		return "string"
+	case "block":
+		return "{"
+	case "identifier":
+		return "identifier"
+	case "_expression":
+		return "expression"
+	case "parameter_list":
+		return "parameter list"
+	}
+
+	// Types with underscore prefix are typically hidden rules — strip prefix.
+	if strings.HasPrefix(step.Type, "_") {
+		return strings.TrimPrefix(step.Type, "_")
+	}
+
+	// Use field name as fallback if available.
+	if step.Field != "" {
+		return step.Field
+	}
+
+	return step.Type
+}
