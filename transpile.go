@@ -394,7 +394,7 @@ func (t *dmjTranspiler) emit(n *gotreesitter.Node) string {
 	case "process_block":
 		return t.emitProcess(n)
 	case "stop_block":
-		return "" // handled by Task 5
+		return t.emitStop(n)
 	case "process_args":
 		return "" // handled by emitProcess
 	case "process_env":
@@ -3175,6 +3175,86 @@ func durationLiteralToGo(raw string) string {
 	}
 
 	return raw
+}
+
+// ---------------------------------------------------------------------------
+// stop_block → explicit shutdown observation
+// ---------------------------------------------------------------------------
+
+func (t *dmjTranspiler) emitStop(n *gotreesitter.Node) string {
+	t.addImport("syscall")
+	t.addImport("time")
+	t.addImport("bytes")
+	t.addImport("os/exec")
+
+	bodyNode := t.childByField(n, "body")
+	if bodyNode == nil {
+		return t.text(n)
+	}
+
+	// Defaults.
+	signalName := "SIGTERM"
+	timeoutExpr := "10 * time.Second"
+
+	// Collect directives and assertion statements.
+	var assertionNodes []*gotreesitter.Node
+	t.walkChildren(bodyNode, func(child *gotreesitter.Node) {
+		switch t.nodeType(child) {
+		case "signal_directive":
+			nameNode := t.childByField(child, "name")
+			if nameNode != nil {
+				signalName = t.text(nameNode)
+			}
+		case "timeout_directive":
+			durNode := t.childByField(child, "duration")
+			if durNode != nil {
+				if t.nodeType(durNode) == "duration_literal" {
+					timeoutExpr = durationLiteralToGo(t.text(durNode))
+				} else {
+					timeoutExpr = t.text(durNode)
+				}
+			}
+		case "expect_statement", "reject_statement":
+			assertionNodes = append(assertionNodes, child)
+		}
+	})
+
+	tv := t.testVar
+	var b strings.Builder
+	b.WriteString(t.lineDirective(n))
+	fmt.Fprintf(&b, "%s.Cleanup(func() {\n", tv)
+	fmt.Fprintf(&b, "\t_ = proc.Process.Signal(syscall.%s)\n", signalName)
+	fmt.Fprintf(&b, "\tvar exitCode int\n")
+	fmt.Fprintf(&b, "\tdone := make(chan error, 1)\n")
+	fmt.Fprintf(&b, "\tgo func() { done <- proc.Wait() }()\n")
+	fmt.Fprintf(&b, "\tselect {\n")
+	fmt.Fprintf(&b, "\tcase err := <-done:\n")
+	fmt.Fprintf(&b, "\t\tif exitErr, ok := err.(*exec.ExitError); ok {\n")
+	fmt.Fprintf(&b, "\t\t\texitCode = exitErr.ExitCode()\n")
+	fmt.Fprintf(&b, "\t\t}\n")
+	fmt.Fprintf(&b, "\tcase <-time.After(%s):\n", timeoutExpr)
+	fmt.Fprintf(&b, "\t\t_ = proc.Process.Kill()\n")
+	fmt.Fprintf(&b, "\t\t<-done\n")
+	fmt.Fprintf(&b, "\t\texitCode = -1\n")
+	fmt.Fprintf(&b, "\t}\n")
+	fmt.Fprintf(&b, "\tvar stdout, stderr bytes.Buffer\n")
+	fmt.Fprintf(&b, "\tstdout.WriteString(procStdout.String())\n")
+	fmt.Fprintf(&b, "\tstderr.WriteString(procStderr.String())\n")
+	fmt.Fprintf(&b, "\t_ = exitCode\n")
+
+	// Emit assertion statements in exec mode.
+	oldInExec := t.inExecBlock
+	t.inExecBlock = true
+	for _, an := range assertionNodes {
+		code := t.emit(an)
+		if code != "" {
+			t.appendIndented(&b, code, "\t")
+		}
+	}
+	t.inExecBlock = oldInExec
+
+	fmt.Fprintf(&b, "})\n")
+	return b.String()
 }
 
 // isExpressionNode returns true if the node type is an expression-like node.

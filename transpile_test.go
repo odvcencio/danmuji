@@ -1244,3 +1244,93 @@ e2e "ready mode" {
 		})
 	}
 }
+
+func TestTranspileDanmujiStopBlock(t *testing.T) {
+	source := []byte(`package server_test
+
+import "testing"
+
+e2e "server shutdown" {
+	process run "./bin/server" {
+		ready http "http://localhost:8080/health"
+	}
+	stop {
+		signal SIGTERM
+		timeout 30s
+		expect exit_code == 0
+		expect stderr contains "shutdown complete"
+	}
+}
+`)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if !strings.Contains(goCode, "syscall.SIGTERM") {
+		t.Error("expected syscall.SIGTERM in output")
+	}
+	if !strings.Contains(goCode, "30 * time.Second") {
+		t.Error("expected 30 * time.Second in output")
+	}
+	if !strings.Contains(goCode, "exitCode") {
+		t.Error("expected exitCode variable in output")
+	}
+	if !strings.Contains(goCode, "shutdown complete") {
+		t.Error("expected 'shutdown complete' in output")
+	}
+	// Exactly 1 t.Cleanup (from stop block, not implicit).
+	count := strings.Count(goCode, "t.Cleanup(")
+	if count != 1 {
+		t.Errorf("expected exactly 1 t.Cleanup, got %d", count)
+	}
+}
+
+func TestTranspileDanmujiStopBlockSIGINT(t *testing.T) {
+	source := []byte(`package server_test
+
+import "testing"
+
+e2e "server sigint" {
+	process run "./bin/server" {
+	}
+	stop {
+		signal SIGINT
+	}
+}
+`)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if !strings.Contains(goCode, "syscall.SIGINT") {
+		t.Error("expected syscall.SIGINT in output")
+	}
+}
+
+func TestTranspileDanmujiImplicitCleanup(t *testing.T) {
+	source := []byte(`package server_test
+
+import "testing"
+
+e2e "server implicit" {
+	process run "./bin/server" {
+	}
+}
+`)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if !strings.Contains(goCode, "t.Cleanup") {
+		t.Error("expected t.Cleanup for implicit cleanup")
+	}
+	if !strings.Contains(goCode, "syscall.SIGTERM") {
+		t.Error("expected syscall.SIGTERM in implicit cleanup")
+	}
+}
