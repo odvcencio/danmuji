@@ -30,6 +30,167 @@ type ExpectedStep struct {
 	Optional bool
 }
 
+// ---------------------------------------------------------------------------
+// Grammar introspection: buildExpectationMap + expandRule
+// ---------------------------------------------------------------------------
+
+// buildExpectationMap walks all rules in the grammar and enumerates the valid
+// linear expansions for each production. This powers Layer 1 error messages
+// ("expected X after Y").
+func buildExpectationMap(g *Grammar) map[string]*ProductionExpectations {
+	m := make(map[string]*ProductionExpectations, len(g.Rules))
+	for name, rule := range g.Rules {
+		exps := expandRule(rule, "")
+		m[name] = &ProductionExpectations{
+			NodeType:   name,
+			Expansions: exps,
+		}
+	}
+	return m
+}
+
+// expandRule recursively flattens a rule tree into all possible linear
+// sequences of expected children. fieldName propagates any enclosing
+// Field annotation.
+func expandRule(r *Rule, fieldName string) []LinearExpansion {
+	if r == nil {
+		return []LinearExpansion{{}}
+	}
+
+	kind := r.Kind
+
+	// Leaf nodes
+	if kind == RuleString {
+		step := ExpectedStep{Type: "string", Keyword: r.Value, Field: fieldName}
+		return []LinearExpansion{{Steps: []ExpectedStep{step}}}
+	}
+	if kind == RulePattern {
+		step := ExpectedStep{Type: "pattern", Field: fieldName}
+		return []LinearExpansion{{Steps: []ExpectedStep{step}}}
+	}
+	if kind == RuleSymbol {
+		step := ExpectedStep{Type: r.Value, Field: fieldName}
+		return []LinearExpansion{{Steps: []ExpectedStep{step}}}
+	}
+	if kind == RuleBlank {
+		return []LinearExpansion{{}} // one empty expansion
+	}
+	if kind == RuleToken || kind == RuleImmToken {
+		step := ExpectedStep{Type: "token", Field: fieldName}
+		return []LinearExpansion{{Steps: []ExpectedStep{step}}}
+	}
+
+	// Seq: cartesian product of all children's expansions
+	if kind == RuleSeq {
+		result := []LinearExpansion{{}} // start with one empty expansion
+		for _, child := range r.Children {
+			childExps := expandRule(child, "")
+			var next []LinearExpansion
+			for _, prefix := range result {
+				for _, suffix := range childExps {
+					combined := LinearExpansion{
+						Steps: make([]ExpectedStep, 0, len(prefix.Steps)+len(suffix.Steps)),
+					}
+					combined.Steps = append(combined.Steps, prefix.Steps...)
+					combined.Steps = append(combined.Steps, suffix.Steps...)
+					next = append(next, combined)
+					if len(next) >= 100 {
+						break
+					}
+				}
+				if len(next) >= 100 {
+					break
+				}
+			}
+			result = next
+			if len(result) >= 100 {
+				result = result[:100]
+				break
+			}
+		}
+		// Propagate field name to all steps if set at this level
+		if fieldName != "" {
+			for i := range result {
+				for j := range result[i].Steps {
+					if result[i].Steps[j].Field == "" {
+						result[i].Steps[j].Field = fieldName
+					}
+				}
+			}
+		}
+		return result
+	}
+
+	// Choice: union of all alternatives
+	if kind == RuleChoice {
+		var result []LinearExpansion
+		for _, child := range r.Children {
+			childExps := expandRule(child, fieldName)
+			result = append(result, childExps...)
+			if len(result) >= 100 {
+				result = result[:100]
+				break
+			}
+		}
+		return result
+	}
+
+	// Optional: expand child with all steps marked Optional, prepend empty expansion
+	if kind == RuleOptional {
+		childExps := expandRule(r.Children[0], fieldName)
+		result := make([]LinearExpansion, 0, 1+len(childExps))
+		result = append(result, LinearExpansion{}) // the skip case
+		for _, exp := range childExps {
+			marked := LinearExpansion{Steps: make([]ExpectedStep, len(exp.Steps))}
+			copy(marked.Steps, exp.Steps)
+			for k := range marked.Steps {
+				marked.Steps[k].Optional = true
+			}
+			result = append(result, marked)
+		}
+		return result
+	}
+
+	// Repeat: same as Optional for error reporting (0 or 1)
+	if kind == RuleRepeat {
+		childExps := expandRule(r.Children[0], fieldName)
+		result := make([]LinearExpansion, 0, 1+len(childExps))
+		result = append(result, LinearExpansion{}) // the skip case
+		for _, exp := range childExps {
+			marked := LinearExpansion{Steps: make([]ExpectedStep, len(exp.Steps))}
+			copy(marked.Steps, exp.Steps)
+			for k := range marked.Steps {
+				marked.Steps[k].Optional = true
+			}
+			result = append(result, marked)
+		}
+		return result
+	}
+
+	// Repeat1: at least one occurrence
+	if kind == RuleRepeat1 {
+		return expandRule(r.Children[0], fieldName)
+	}
+
+	// Field: expand child with the field name set
+	if kind == RuleField {
+		return expandRule(r.Children[0], r.Value)
+	}
+
+	// Prec wrappers: transparent — expand child
+	if kind == RulePrec || kind == RulePrecLeft || kind == RulePrecRight || kind == RulePrecDynamic {
+		return expandRule(r.Children[0], fieldName)
+	}
+
+	// Alias: expand child
+	if kind == RuleAlias {
+		return expandRule(r.Children[0], fieldName)
+	}
+
+	// Fallback: unknown kind — return one empty expansion
+	return []LinearExpansion{{}}
+}
+
 // FormatParseError is a placeholder — implemented in Task 6.
 func FormatParseError(source []byte, root *gotreesitter.Node, lang *gotreesitter.Language,
 	sourceFile string, expectations map[string]*ProductionExpectations) string {

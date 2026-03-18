@@ -124,6 +124,61 @@ func TestFormatErrorNoHint(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// buildExpectationMap tests
+// ---------------------------------------------------------------------------
+
+func TestBuildExpectationMap(t *testing.T) {
+	g := DanmujiGrammar()
+	m := buildExpectationMap(g)
+
+	// given_block: Seq("given", Field("description", Sym("_string_literal")), Sym("block"))
+	gb, ok := m["given_block"]
+	if !ok {
+		t.Fatal("expected given_block in expectation map")
+	}
+	if len(gb.Expansions) == 0 {
+		t.Fatal("expected at least one expansion for given_block")
+	}
+	exp := gb.Expansions[0]
+	if len(exp.Steps) < 3 {
+		t.Fatalf("expected at least 3 steps, got %d", len(exp.Steps))
+	}
+	if exp.Steps[0].Keyword != "given" {
+		t.Errorf("expected first step keyword 'given', got %q", exp.Steps[0].Keyword)
+	}
+	if exp.Steps[1].Field != "description" {
+		t.Errorf("expected second step field 'description', got %q", exp.Steps[1].Field)
+	}
+}
+
+func TestBuildExpectationMapExpect(t *testing.T) {
+	g := DanmujiGrammar()
+	m := buildExpectationMap(g)
+	es, ok := m["expect_statement"]
+	if !ok {
+		t.Fatal("expected expect_statement in map")
+	}
+	// expect_statement has Choice with multiple alternatives plus bare form
+	if len(es.Expansions) < 3 {
+		t.Errorf("expected at least 3 expansions, got %d", len(es.Expansions))
+	}
+	t.Logf("expect_statement: %d expansions", len(es.Expansions))
+}
+
+func TestBuildExpectationMapFakeClock(t *testing.T) {
+	g := DanmujiGrammar()
+	m := buildExpectationMap(g)
+	fc, ok := m["fake_clock_directive"]
+	if !ok {
+		t.Fatal("expected fake_clock_directive in map")
+	}
+	// Choice of 3 PrecDynamic alternatives
+	if len(fc.Expansions) < 3 {
+		t.Errorf("expected at least 3 expansions, got %d", len(fc.Expansions))
+	}
+}
+
+// ---------------------------------------------------------------------------
 // findErrors / findTopLevelBlock tests
 // ---------------------------------------------------------------------------
 
