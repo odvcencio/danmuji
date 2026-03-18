@@ -41,8 +41,17 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
+	case "fmt":
+		if len(os.Args) < 3 {
+			fmt.Fprintf(os.Stderr, "Usage: danmuji fmt <path>\n")
+			os.Exit(1)
+		}
+		if err := fmtDanmuji(os.Args[2]); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown command: %s\nUsage: danmuji <build|test|init> <path>\n", os.Args[1])
+		fmt.Fprintf(os.Stderr, "Unknown command: %s\nUsage: danmuji <build|test|init|fmt> <path>\n", os.Args[1])
 		os.Exit(1)
 	}
 }
@@ -338,5 +347,55 @@ func initProject() error {
 	}
 
 	fmt.Println("danmuji: testify added. You're ready to write .dmj files.")
+	return nil
+}
+
+// fmtDanmuji formats .dmj files with canonical indentation.
+func fmtDanmuji(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+
+	if info.IsDir() {
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return err
+		}
+		count := 0
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".dmj") {
+				continue
+			}
+			if err := fmtFile(filepath.Join(path, entry.Name())); err != nil {
+				return err
+			}
+			count++
+		}
+		fmt.Printf("danmuji fmt: formatted %d file(s)\n", count)
+		return nil
+	}
+	return fmtFile(path)
+}
+
+func fmtFile(path string) error {
+	source, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+
+	formatted, err := danmuji.FormatDanmuji(source)
+	if err != nil {
+		return fmt.Errorf("format %s: %w", path, err)
+	}
+
+	if formatted == string(source) {
+		return nil // already formatted
+	}
+
+	if err := os.WriteFile(path, []byte(formatted), 0644); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	fmt.Printf("  %s\n", filepath.Base(path))
 	return nil
 }
