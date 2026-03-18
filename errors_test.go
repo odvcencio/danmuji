@@ -430,3 +430,60 @@ func TestBuildPrefixSignature(t *testing.T) {
 	t.Logf("SExpr: %s", root.SExpr(lang))
 	// Just verify it doesn't panic — the exact output depends on tree structure
 }
+
+// ---------------------------------------------------------------------------
+// FormatParseError integration tests
+// ---------------------------------------------------------------------------
+
+func TestFormatParseErrorIntegration(t *testing.T) {
+	source := []byte("package main_test\n\nimport \"testing\"\n\nunit \"broken\" {\n\tgiven {\n\t\tx := 1\n\t}\n}\n")
+	g := DanmujiGrammar()
+	expectations := buildExpectationMap(g)
+	lang := getDanmujiLang(t)
+	parser := gotreesitter.NewParser(lang)
+	tree, _ := parser.Parse(source)
+	root := tree.RootNode()
+	if !root.HasError() {
+		t.Skip("no error")
+	}
+	result := FormatParseError(source, root, lang, "/tmp/test.dmj", expectations)
+	t.Logf("Error output:\n%s", result)
+	if !strings.Contains(result, "/tmp/test.dmj:") {
+		t.Error("expected filename in output")
+	}
+	// Should NOT contain raw s-expression
+	if strings.Contains(result, "(source_file") {
+		t.Error("got raw s-expression instead of formatted error")
+	}
+}
+
+func TestFormatParseErrorNoFile(t *testing.T) {
+	source := []byte("package main_test\n\nimport \"testing\"\n\nunit \"broken\" {\n\tgiven {\n\t}\n}\n")
+	g := DanmujiGrammar()
+	expectations := buildExpectationMap(g)
+	lang := getDanmujiLang(t)
+	parser := gotreesitter.NewParser(lang)
+	tree, _ := parser.Parse(source)
+	root := tree.RootNode()
+	if !root.HasError() {
+		t.Skip("no error")
+	}
+	result := FormatParseError(source, root, lang, "", expectations)
+	t.Logf("Error output:\n%s", result)
+	if strings.Contains(result, ".dmj") {
+		t.Error("expected no filename")
+	}
+}
+
+func TestTranspileDanmujiErrorFormat(t *testing.T) {
+	source := []byte("package main_test\n\nimport \"testing\"\n\nunit \"broken\" {\n\tgiven {\n\t}\n}\n")
+	_, err := TranspileDanmuji(source, TranspileOptions{SourceFile: "/tmp/test.dmj"})
+	if err == nil {
+		t.Skip("transpile succeeded")
+	}
+	errMsg := err.Error()
+	t.Logf("Error: %s", errMsg)
+	if strings.Contains(errMsg, "(source_file") {
+		t.Error("expected human-readable error, got s-expression")
+	}
+}

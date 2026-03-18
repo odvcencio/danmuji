@@ -338,10 +338,113 @@ func buildPrefixSignature(parent, errNode *gotreesitter.Node, lang *gotreesitter
 	return strings.Join(parts, ",")
 }
 
-// FormatParseError is a placeholder — implemented in Task 6.
+// FormatParseError walks the parse tree for ERROR/MISSING nodes and returns
+// a human-readable multi-error string. Each error is formatted with source
+// context, a caret underline, and (where possible) a hint showing correct
+// syntax.
 func FormatParseError(source []byte, root *gotreesitter.Node, lang *gotreesitter.Language,
 	sourceFile string, expectations map[string]*ProductionExpectations) string {
-	return "parse error (not yet implemented)"
+
+	errors := findErrors(root, lang)
+	if len(errors) == 0 {
+		return "unknown parse error"
+	}
+
+	var parts []string
+	for _, errNode := range errors {
+		parts = append(parts, formatSingleError(source, errNode, lang, sourceFile, expectations))
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+// formatSingleError formats one ERROR or MISSING node into a human-readable
+// diagnostic using three layers of message resolution:
+//   - Layer 2: hand-written overlay table keyed by parent type + prefix signature
+//   - Layer 1: grammar-derived expectation matching via describeExpected
+//   - Layer 3: keyword inference from the error node's text
+//
+// Falls back to a generic "unexpected token" message if all layers miss.
+func formatSingleError(source []byte, errNode *gotreesitter.Node, lang *gotreesitter.Language,
+	sourceFile string, expectations map[string]*ProductionExpectations) string {
+
+	// Position information (0-indexed).
+	startPt := errNode.StartPoint()
+	endPt := errNode.EndPoint()
+	row := int(startPt.Row)
+	col := int(startPt.Column)
+
+	// For multi-line errors, clamp the underline to the end of the first line.
+	endCol := int(endPt.Column)
+	if endPt.Row != startPt.Row {
+		// Clamp to end of the starting line.
+		lines := strings.Split(string(source), "\n")
+		if row < len(lines) {
+			endCol = len(lines[row])
+		}
+	}
+
+	var message, example string
+
+	parent := errNode.Parent()
+
+	// Layer 2: overlay lookup.
+	if parent != nil {
+		parentType := parent.Type(lang)
+		prefix := buildPrefixSignature(parent, errNode, lang)
+		key := parentType + "|" + prefix
+		if ov, ok := errorOverlays[key]; ok {
+			message = ov.Message
+			example = ov.Example
+		}
+	}
+
+	// Layer 1: grammar-derived expectations.
+	if message == "" && parent != nil {
+		if msg := describeExpected(parent, errNode, lang, expectations); msg != "" {
+			// Only use if it's more specific than the generic fallback.
+			if !strings.HasPrefix(msg, "unexpected token") {
+				message = msg
+			}
+		}
+	}
+
+	// Layer 3: keyword inference from error text.
+	if message == "" && errNode.IsError() {
+		text := errNode.Text(source)
+		prod := inferFromKeyword(text, keywordToProduction)
+		if prod != "" {
+			// Extract keyword from text.
+			kw := text
+			if idx := strings.IndexAny(text, " \t\n"); idx >= 0 {
+				kw = text[:idx]
+			}
+			// Check for an overlay keyed by "production|keyword".
+			key := prod + "|" + kw
+			if ov, ok := errorOverlays[key]; ok {
+				message = ov.Message
+				example = ov.Example
+			}
+		}
+	}
+
+	// Fallback: generic message with truncated error text.
+	if message == "" {
+		text := errNode.Text(source)
+		// Truncate to 30 characters.
+		if len(text) > 30 {
+			text = text[:30] + "..."
+		}
+		// Collapse whitespace for readability.
+		text = strings.Join(strings.Fields(text), " ")
+		if text != "" {
+			message = fmt.Sprintf("unexpected token %q", text)
+		} else {
+			message = "unexpected token"
+		}
+	}
+
+	srcCtx := formatSourceLine(source, row, col, endCol)
+	return formatError(sourceFile, row, col, message, srcCtx, example)
 }
 
 // ---------------------------------------------------------------------------

@@ -15,16 +15,21 @@ import (
 	gotreesitter "github.com/odvcencio/gotreesitter"
 )
 
-// Package-level cached language to avoid regenerating on every TranspileDanmuji call.
+// Package-level cached language and expectation map to avoid regenerating on every call.
 var (
-	danmujiLangOnce   sync.Once
-	danmujiLangCached *gotreesitter.Language
-	danmujiLangErr    error
+	danmujiLangOnce            sync.Once
+	danmujiLangCached          *gotreesitter.Language
+	danmujiLangErr             error
+	danmujiExpectationsCached  map[string]*ProductionExpectations
 )
 
 func getDanmujiLanguage() (*gotreesitter.Language, error) {
 	danmujiLangOnce.Do(func() {
-		danmujiLangCached, danmujiLangErr = GenerateLanguage(DanmujiGrammar())
+		g := DanmujiGrammar()
+		danmujiLangCached, danmujiLangErr = GenerateLanguage(g)
+		if danmujiLangErr == nil {
+			danmujiExpectationsCached = buildExpectationMap(g)
+		}
 	})
 	return danmujiLangCached, danmujiLangErr
 }
@@ -50,7 +55,7 @@ func TranspileDanmuji(source []byte, opts TranspileOptions) (string, error) {
 
 	root := tree.RootNode()
 	if root.HasError() {
-		return "", fmt.Errorf("parse errors:\n%s", root.SExpr(lang))
+		return "", fmt.Errorf("%s", FormatParseError(source, root, lang, opts.SourceFile, danmujiExpectationsCached))
 	}
 
 	tr := &dmjTranspiler{
