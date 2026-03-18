@@ -1108,3 +1108,139 @@ unit "arithmetic" {
 		t.Error("expected no //line directives when SourceFile is empty")
 	}
 }
+
+func TestTranspileDanmujiProcess(t *testing.T) {
+	source := []byte(`package server_test
+
+import "testing"
+
+e2e "server lifecycle" {
+	process "./cmd/server" {
+		args "--port 8080"
+		ready http "http://localhost:8080/health"
+	}
+}
+`)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if !strings.Contains(goCode, "go build") || !strings.Contains(goCode, `exec.Command("go", "build"`) {
+		t.Error("expected go build command in output")
+	}
+	if !strings.Contains(goCode, "proc.Start()") {
+		t.Error("expected proc.Start() in output")
+	}
+	if !strings.Contains(goCode, "http.Get") {
+		t.Error("expected http.Get for readiness polling")
+	}
+	if !strings.Contains(goCode, "require.True") {
+		t.Error("expected require.True for readiness assertion")
+	}
+	if !strings.Contains(goCode, "t.Cleanup") {
+		t.Error("expected t.Cleanup for implicit cleanup")
+	}
+	if !strings.Contains(goCode, "syncBuffer") {
+		t.Error("expected syncBuffer type in output")
+	}
+}
+
+func TestTranspileDanmujiProcessRun(t *testing.T) {
+	source := []byte(`package tool_test
+
+import "testing"
+
+e2e "run binary" {
+	process run "./bin/mytool" {
+		args "--verbose"
+	}
+}
+`)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if strings.Contains(goCode, "go build") || strings.Contains(goCode, `exec.Command("go", "build"`) {
+		t.Error("expected NO go build command in run mode")
+	}
+	if !strings.Contains(goCode, `exec.Command("./bin/mytool"`) {
+		t.Error("expected direct exec.Command with path")
+	}
+}
+
+func TestTranspileDanmujiProcessEnv(t *testing.T) {
+	source := []byte(`package env_test
+
+import "testing"
+
+e2e "env vars" {
+	process "./cmd/server" {
+		env { DB_URL: "postgres://localhost/test" }
+	}
+}
+`)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if !strings.Contains(goCode, "os.Environ()") {
+		t.Error("expected os.Environ() in output")
+	}
+	if !strings.Contains(goCode, "DB_URL=postgres://localhost/test") {
+		t.Error("expected env var DB_URL in output")
+	}
+}
+
+func TestTranspileDanmujiReadyModes(t *testing.T) {
+	tests := []struct {
+		name   string
+		ready  string
+		expect string
+	}{
+		{
+			name:   "tcp",
+			ready:  `ready tcp "localhost:5432"`,
+			expect: `net.Dial("tcp"`,
+		},
+		{
+			name:   "stdout",
+			ready:  `ready stdout "server started"`,
+			expect: "procStdout.String()",
+		},
+		{
+			name:   "delay",
+			ready:  `ready delay 5s`,
+			expect: "time.Sleep(5 * time.Second)",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			source := []byte(`package ready_test
+
+import "testing"
+
+e2e "ready mode" {
+	process "./cmd/server" {
+		` + tt.ready + `
+	}
+}
+`)
+			goCode, err := TranspileDanmuji(source, TranspileOptions{})
+			if err != nil {
+				t.Fatalf("transpile: %v", err)
+			}
+			t.Logf("Transpiled Go:\n%s", goCode)
+
+			if !strings.Contains(goCode, tt.expect) {
+				t.Errorf("expected %q in output", tt.expect)
+			}
+		})
+	}
+}
