@@ -1,5 +1,5 @@
 ;; Auto-generated highlight queries for grammar extension
-;; Extension: danmuji
+;; Extension: danmuji (extends go)
 
 ;; Keywords
 "after" @keyword
