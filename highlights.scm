@@ -159,3 +159,23 @@
 ;; consistently_block
 (consistently_block name: (_) @string)
 
+
+;; ─── Additional patterns for completeness ────────────────────────────────────
+
+;; Tags (@slow, @smoke, @parallel, etc.)
+(tag) @attribute
+
+;; Scenario-driven tests
+(each_do_block name: (_) @string)
+(each_do_block "do" @keyword)
+(each_do_block "each" @keyword)
+(scenario_field key: (identifier) @property)
+(defaults_block "defaults" @keyword)
+(matrix_block "matrix" @keyword)
+(matrix_field key: (identifier) @property)
+
+;; Lifecycle
+(lifecycle_hook "before" @keyword)
+(lifecycle_hook "after" @keyword)
+(lifecycle_hook "each" @keyword)
+(lifecycle_hook "all" @keyword)
