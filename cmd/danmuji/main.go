@@ -8,7 +8,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/odvcencio/danmuji"
 )
 
@@ -124,13 +126,14 @@ func buildDir(dir string, opts danmuji.TranspileOptions) error {
 	return nil
 }
 
-// runTest implements `danmuji test <path> [-- go-test-flags...]`.
+// runTest implements `danmuji test [--watch] <path> [-- go-test-flags...]`.
 // It transpiles .dmj files, runs `go test`, cleans up generated files, and
 // returns the exit code from `go test`.
 func runTest(args []string) int {
 	// Split args at "--" to separate danmuji args from go test flags.
 	var path string
 	var goTestFlags []string
+	watch := false
 	dashDash := -1
 	for i, arg := range args {
 		if arg == "--" {
@@ -142,11 +145,25 @@ func runTest(args []string) int {
 		goTestFlags = args[dashDash+1:]
 		args = args[:dashDash]
 	}
+	// Extract --watch flag
+	var filteredArgs []string
+	for _, arg := range args {
+		if arg == "--watch" {
+			watch = true
+		} else {
+			filteredArgs = append(filteredArgs, arg)
+		}
+	}
+	args = filteredArgs
 	if len(args) < 1 {
-		fmt.Fprintf(os.Stderr, "Usage: danmuji test <path> [-- go-test-flags...]\n")
+		fmt.Fprintf(os.Stderr, "Usage: danmuji test [--watch] <path> [-- go-test-flags...]\n")
 		return 1
 	}
 	path = args[0]
+
+	if watch {
+		return watchAndTest(path, goTestFlags)
+	}
 
 	// Discover .dmj files.
 	var dmjFiles []string
@@ -215,6 +232,84 @@ func runTest(args []string) int {
 	// Clean up generated files regardless of pass/fail.
 	cleanup(generated)
 	return exitCode
+}
+
+// watchAndTest watches for .dmj file changes and re-runs tests on each change.
+func watchAndTest(path string, goTestFlags []string) int {
+	// Resolve the watch directory.
+	info, err := os.Stat(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	watchDir := path
+	if !info.IsDir() {
+		watchDir = filepath.Dir(path)
+	}
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error creating watcher: %v\n", err)
+		return 1
+	}
+	defer watcher.Close()
+
+	if err := watcher.Add(watchDir); err != nil {
+		fmt.Fprintf(os.Stderr, "error watching %s: %v\n", watchDir, err)
+		return 1
+	}
+
+	fmt.Printf("danmuji: watching %s for changes (ctrl+c to stop)\n", watchDir)
+
+	// Run once immediately.
+	runTestOnce(path, goTestFlags)
+
+	// Debounce: wait for events to settle before re-running.
+	var debounce *time.Timer
+	for {
+		select {
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return 0
+			}
+			// Only trigger on .dmj file writes.
+			if !strings.HasSuffix(event.Name, ".dmj") {
+				continue
+			}
+			if event.Op&(fsnotify.Write|fsnotify.Create) == 0 {
+				continue
+			}
+			// Debounce: reset timer on each event, run after 200ms of quiet.
+			if debounce != nil {
+				debounce.Stop()
+			}
+			debounce = time.AfterFunc(200*time.Millisecond, func() {
+				fmt.Printf("\n--- %s changed ---\n\n", filepath.Base(event.Name))
+				runTestOnce(path, goTestFlags)
+			})
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return 0
+			}
+			fmt.Fprintf(os.Stderr, "watch error: %v\n", err)
+		}
+	}
+}
+
+// runTestOnce runs a single test cycle (transpile, go test, cleanup).
+func runTestOnce(path string, goTestFlags []string) {
+	// Build args for runTest (without --watch to avoid recursion).
+	args := []string{path}
+	if len(goTestFlags) > 0 {
+		args = append(args, "--")
+		args = append(args, goTestFlags...)
+	}
+	code := runTest(args)
+	if code == 0 {
+		fmt.Println("\n--- PASS ---")
+	} else {
+		fmt.Println("\n--- FAIL ---")
+	}
 }
 
 // cleanup removes the given list of generated files, logging any errors.
