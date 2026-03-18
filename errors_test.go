@@ -487,3 +487,98 @@ func TestTranspileDanmujiErrorFormat(t *testing.T) {
 		t.Error("expected human-readable error, got s-expression")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Comprehensive overlay tests (Task 7)
+// ---------------------------------------------------------------------------
+
+func TestErrorOverlays(t *testing.T) {
+	lang := getDanmujiLang(t)
+	g := DanmujiGrammar()
+	expectations := buildExpectationMap(g)
+
+	cases := []struct {
+		name     string
+		source   string
+		contains string // substring expected in error output (case-insensitive check)
+	}{
+		// BDD structure
+		{"given missing string", "package main\nfunc f() {\n\tgiven {\n\t}\n}", "given"},
+		{"when missing string", "package main\nfunc f() {\n\twhen {\n\t}\n}", "when"},
+		{"then missing string", "package main\nfunc f() {\n\tthen {\n\t}\n}", "then"},
+		// Test blocks
+		{"unit missing string", "package main\nunit {\n}", "unit"},
+		{"unit missing block", "package main\nunit \"test\"\n", "unit"},
+		// Assertions
+		{"expect bare", "package main\nfunc f() {\n\texpect\n}", "expect"},
+		{"reject bare", "package main\nfunc f() {\n\treject\n}", "reject"},
+		// Test doubles
+		{"mock missing name", "package main\nfunc f() {\n\tmock {\n\t}\n}", "mock"},
+		{"fake missing name", "package main\nfunc f() {\n\tfake {\n\t}\n}", "fake"},
+		{"spy missing name", "package main\nfunc f() {\n\tspy {\n\t}\n}", "spy"},
+		// Data-driven
+		{"each missing string", "package main\nfunc f() {\n\teach {\n\t}\n}", "each"},
+		{"matrix missing string", "package main\nfunc f() {\n\tmatrix {\n\t}\n}", "matrix"},
+		{"property missing string", "package main\nfunc f() {\n\tproperty {\n\t}\n}", "property"},
+		// Temporal
+		{"eventually missing string", "package main\nfunc f() {\n\teventually {\n\t}\n}", "eventually"},
+		{"consistently missing string", "package main\nfunc f() {\n\tconsistently {\n\t}\n}", "consistently"},
+		// Infrastructure
+		{"needs missing service", "package main\nfunc f() {\n\tneeds {\n\t}\n}", "needs"},
+		{"benchmark missing string", "package main\nbenchmark {\n}", "benchmark"},
+		{"exec missing string", "package main\nfunc f() {\n\texec {\n\t}\n}", "exec"},
+		{"snapshot missing string", "package main\nfunc f() {\n\tsnapshot {\n\t}\n}", "snapshot"},
+		// Process
+		{"process missing path", "package main\nfunc f() {\n\tprocess {\n\t}\n}", "process"},
+		{"stop missing block", "package main\nfunc f() {\n\tstop\n}", "stop"},
+		{"ready missing mode", "package main\nfunc f() {\n\tready\n}", "ready"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			parser := gotreesitter.NewParser(lang)
+			tree, err := parser.Parse([]byte(tc.source))
+			if err != nil {
+				t.Fatalf("parse failed: %v", err)
+			}
+			root := tree.RootNode()
+			if !root.HasError() {
+				t.Skip("no parse error — grammar accepts this input")
+			}
+			result := FormatParseError([]byte(tc.source), root, lang, "test.dmj", expectations)
+			t.Logf("Error:\n%s", result)
+
+			// Must contain the keyword/construct reference
+			if !strings.Contains(strings.ToLower(result), strings.ToLower(tc.contains)) {
+				t.Errorf("expected error to reference %q", tc.contains)
+			}
+			// Must NEVER contain raw s-expression
+			if strings.Contains(result, "(source_file") {
+				t.Error("error contains raw s-expression")
+			}
+			// Must contain source line rendering (| character)
+			if !strings.Contains(result, "|") {
+				t.Error("expected source line rendering with |")
+			}
+			// Must contain caret
+			if !strings.Contains(result, "^") {
+				t.Error("expected caret underline")
+			}
+			// Must contain file reference
+			if !strings.Contains(result, "test.dmj:") {
+				t.Error("expected filename in error")
+			}
+		})
+	}
+}
+
+func TestFormatParseErrorValidInput(t *testing.T) {
+	source := []byte("package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"hello\")\n}\n")
+	lang := getDanmujiLang(t)
+	parser := gotreesitter.NewParser(lang)
+	tree, _ := parser.Parse(source)
+	root := tree.RootNode()
+	if root.HasError() {
+		t.Error("expected no error for valid Go")
+	}
+}

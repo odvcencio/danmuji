@@ -317,6 +317,40 @@ func inferFromKeyword(text string, kwMap map[string]string) string {
 	return ""
 }
 
+// scanForKeyword scans all words in text for a danmuji keyword, trying the
+// first word first (via inferFromKeyword), then scanning subsequent words.
+// Returns the keyword and its production name, or ("", "") if none found.
+func scanForKeyword(text string, kwMap map[string]string) (string, string) {
+	// Try first word (preserves existing inferFromKeyword behavior).
+	if prod := inferFromKeyword(text, kwMap); prod != "" {
+		kw := text
+		if idx := strings.IndexAny(text, " \t\n"); idx >= 0 {
+			kw = text[:idx]
+		}
+		// Check compound keywords.
+		for _, ck := range []string{"no_leaks", "fake_clock"} {
+			if strings.HasPrefix(text, ck) {
+				rest := text[len(ck):]
+				if rest == "" || rest[0] == ' ' || rest[0] == '\t' || rest[0] == '\n' {
+					return ck, prod
+				}
+			}
+		}
+		return kw, prod
+	}
+
+	// Scan all words in the text for a keyword.
+	words := strings.Fields(text)
+	for _, w := range words {
+		// Strip braces/parens that may be attached to the word.
+		w = strings.TrimRight(w, "{(")
+		if prod, ok := kwMap[w]; ok {
+			return w, prod
+		}
+	}
+	return "", ""
+}
+
 // buildPrefixSignature walks the parent's children up to (but not including)
 // errNode and returns a comma-separated string of their Tree-sitter node types.
 // This signature is used as the suffix of overlay map keys.
@@ -411,18 +445,25 @@ func formatSingleError(source []byte, errNode *gotreesitter.Node, lang *gotreesi
 	// Layer 3: keyword inference from error text.
 	if message == "" && errNode.IsError() {
 		text := errNode.Text(source)
-		prod := inferFromKeyword(text, keywordToProduction)
+		kw, prod := scanForKeyword(text, keywordToProduction)
 		if prod != "" {
-			// Extract keyword from text.
-			kw := text
-			if idx := strings.IndexAny(text, " \t\n"); idx >= 0 {
-				kw = text[:idx]
-			}
 			// Check for an overlay keyed by "production|keyword".
 			key := prod + "|" + kw
 			if ov, ok := errorOverlays[key]; ok {
 				message = ov.Message
 				example = ov.Example
+			} else {
+				// Use the first expansion from expectations to build a message.
+				if pe, ok := expectations[prod]; ok && len(pe.Expansions) > 0 {
+					exp := pe.Expansions[0]
+					if len(exp.Steps) > 1 {
+						message = fmt.Sprintf("expected %s after %q", describeStep(exp.Steps[1]), kw)
+					} else {
+						message = fmt.Sprintf("incomplete %s statement", kw)
+					}
+				} else {
+					message = fmt.Sprintf("incomplete %s statement", kw)
+				}
 			}
 		}
 	}
