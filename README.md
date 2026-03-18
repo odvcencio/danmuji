@@ -70,6 +70,21 @@ go test -v ./mypackage/...
 
 Each `.dmj` file produces a `_danmuji_test.go` file in the same directory. Put `.dmj` files next to your Go code, just like `_test.go` files.
 
+### Run tests directly
+
+```bash
+# Transpile and run in one step (cleans up generated files after)
+danmuji test ./mypackage/
+
+# Forward flags to go test
+danmuji test ./mypackage/ -- -v -run TestAuth
+
+# Build without //line directives (for debugging generated code)
+danmuji build --debug ./mypackage/
+```
+
+When a test fails, errors reference your `.dmj` source file and line number directly.
+
 ## Features
 
 ### Test categories
@@ -461,6 +476,36 @@ unit "API response" {
 
 First run creates `testdata/snapshots/user_json.golden`. Subsequent runs compare against it. Update with `DANMUJI_UPDATE_SNAPSHOTS=1 go test ./...`.
 
+### Process testing (opaque box)
+
+```dmj
+e2e "API server" {
+    process "./cmd/server" {
+        args "--port=9090 --verbose"
+        env { DB_URL: "postgres://localhost/test", LOG_LEVEL: "debug" }
+        ready http "http://localhost:9090/health"
+    }
+
+    then "create user" {
+        resp := post("http://localhost:9090/users", body)
+        expect resp.StatusCode == 201
+    }
+
+    stop {
+        signal SIGTERM
+        timeout 30s
+        expect exit_code == 0
+        expect stderr contains "shutdown complete"
+    }
+}
+```
+
+Start a binary, wait for it to be healthy, run tests against it, then observe shutdown behavior. `process` compiles and runs a Go package by default. Use `process run "./bin/server"` to skip the build step for pre-built binaries.
+
+Readiness modes: `ready http "url"`, `ready tcp "host:port"`, `ready stdout "pattern"`, `ready delay 5s`.
+
+The `stop` block is optional. Without it, the process is killed with SIGTERM after tests complete. With it, you control the signal, timeout, and can assert on exit code, stdout, and stderr during shutdown.
+
 ## How it works
 
 Danmuji extends Go's grammar using [gotreesitter](https://github.com/odvcencio/gotreesitter)'s `grammargen` package. The extended grammar parses `.dmj` files into a concrete syntax tree, then a transpiler walks the tree and emits Go code. The grammar adds ~50 new productions on top of Go's base grammar, all defined in pure Go using gotreesitter's composable DSL.
@@ -486,7 +531,7 @@ Danmuji doesn't replace your existing tests. It layers on top.
 
 ## Status
 
-Working and tested. 92 tests pass across grammar parsing, transpiler output, highlight queries, and end-to-end compile-and-run tests that verify the generated Go code actually compiles and executes correctly.
+Working and tested. 123 tests pass across grammar parsing, transpiler output, highlight queries, and end-to-end compile-and-run tests that verify the generated Go code actually compiles and executes correctly.
 
 This is an early release. The grammar and transpiler are functional but the generated code patterns may evolve.
 

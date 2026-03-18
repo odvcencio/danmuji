@@ -5,6 +5,7 @@
 "after" @keyword
 "all" @keyword
 "allocs" @keyword
+"args" @keyword
 "at" @keyword
 "before" @keyword
 "benchmark" @keyword
@@ -16,11 +17,13 @@
 "contains" @keyword
 "cpu" @keyword
 "defaults" @keyword
+"delay" @keyword
 "delete" @keyword
 "do" @keyword
 "duration" @keyword
 "e2e" @keyword
 "each" @keyword
+"env" @keyword
 "eventually" @keyword
 "exec" @keyword
 "expect" @keyword
@@ -28,6 +31,7 @@
 "fake_clock" @keyword
 "get" @keyword
 "given" @keyword
+"http" @keyword
 "in" @keyword
 "integration" @keyword
 "is_nil" @keyword
@@ -49,12 +53,14 @@
 "patch" @keyword
 "post" @keyword
 "postgres" @keyword
+"process" @keyword
 "profile" @keyword
 "property" @keyword
 "put" @keyword
 "rabbitmq" @keyword
 "rampup" @keyword
 "rate" @keyword
+"ready" @keyword
 "redis" @keyword
 "reject" @keyword
 "report_allocs" @keyword
@@ -64,11 +70,16 @@
 "save" @keyword
 "setup" @keyword
 "show" @keyword
+"signal" @keyword
 "snapshot" @keyword
 "spy" @keyword
+"stdout" @keyword
+"stop" @keyword
 "table" @keyword
 "target" @keyword
+"tcp" @keyword
 "then" @keyword
+"timeout" @keyword
 "times" @keyword
 "to" @keyword
 "top" @keyword
@@ -152,6 +163,8 @@
 ;; matrix_block
 (matrix_block name: (_) @string)
 
+;; property_block
+(property_block name: (_) @string)
 
 ;; eventually_block
 (eventually_block name: (_) @string)
@@ -159,23 +172,6 @@
 ;; consistently_block
 (consistently_block name: (_) @string)
 
+;; process_block
 
-;; ─── Additional patterns for completeness ────────────────────────────────────
-
-;; Tags (@slow, @smoke, @parallel, etc.)
-(tag) @attribute
-
-;; Scenario-driven tests
-(each_do_block name: (_) @string)
-(each_do_block "do" @keyword)
-(each_do_block "each" @keyword)
-(scenario_field key: (identifier) @property)
-(defaults_block "defaults" @keyword)
-(matrix_block "matrix" @keyword)
-(matrix_field key: (identifier) @property)
-
-;; Lifecycle
-(lifecycle_hook "before" @keyword)
-(lifecycle_hook "after" @keyword)
-(lifecycle_hook "each" @keyword)
-(lifecycle_hook "all" @keyword)
+;; stop_block
