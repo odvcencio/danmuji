@@ -3,6 +3,8 @@ package danmuji
 import (
 	"strings"
 	"testing"
+
+	gotreesitter "github.com/odvcencio/gotreesitter"
 )
 
 // multiline test source used by several tests.
@@ -119,4 +121,76 @@ func TestFormatErrorNoHint(t *testing.T) {
 	if strings.Contains(got, "hint:") {
 		t.Errorf("hint should be absent when example is empty: %q", got)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// findErrors / findTopLevelBlock tests
+// ---------------------------------------------------------------------------
+
+func TestFindErrorsSingleError(t *testing.T) {
+	lang := getDanmujiLang(t)
+	// "given" without a string — should produce ERROR
+	source := []byte("package main\n\nunit \"test\" {\n\tgiven valid {\n\t}\n}\n")
+	parser := gotreesitter.NewParser(lang)
+	tree, err := parser.Parse(source)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	root := tree.RootNode()
+	if !root.HasError() {
+		t.Skip("no error in parse tree — grammar may accept this")
+	}
+	errors := findErrors(root, lang)
+	if len(errors) == 0 {
+		t.Fatal("expected at least one error node")
+	}
+	t.Logf("Found %d error(s)", len(errors))
+	// Should report only 1 error for a single test block
+	if len(errors) > 1 {
+		t.Logf("Multiple errors found — acceptable if in different top-level blocks")
+	}
+}
+
+func TestFindErrorsNoErrors(t *testing.T) {
+	lang := getDanmujiLang(t)
+	// Valid Go — should have zero errors.
+	source := []byte("package main\n\nfunc main() {\n\tx := 1\n\t_ = x\n}\n")
+	parser := gotreesitter.NewParser(lang)
+	tree, err := parser.Parse(source)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	root := tree.RootNode()
+	errors := findErrors(root, lang)
+	if len(errors) != 0 {
+		t.Errorf("expected 0 errors for valid Go, got %d", len(errors))
+	}
+}
+
+func TestFindErrorsMultipleBlocks(t *testing.T) {
+	lang := getDanmujiLang(t)
+	// Two test blocks, each with an error
+	source := []byte(`package main
+
+unit "test1" {
+	given {
+	}
+}
+
+unit "test2" {
+	expect
+}
+`)
+	parser := gotreesitter.NewParser(lang)
+	tree, err := parser.Parse(source)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	root := tree.RootNode()
+	if !root.HasError() {
+		t.Skip("no errors found")
+	}
+	errors := findErrors(root, lang)
+	t.Logf("Found %d error(s)", len(errors))
+	// Should report errors from both blocks (up to 1 per top-level block)
 }

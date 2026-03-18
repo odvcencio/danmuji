@@ -130,3 +130,75 @@ func formatError(sourceFile string, row, col int, message, sourceContext, exampl
 
 	return b.String()
 }
+
+// ---------------------------------------------------------------------------
+// Error discovery
+// ---------------------------------------------------------------------------
+
+// findErrors walks the tree and collects ERROR/MISSING nodes.
+// Returns at most one error per top-level block (direct child of source_file
+// that is a test_block, benchmark_block, or load_block).
+// For errors outside top-level blocks, returns the first error only.
+func findErrors(root *gotreesitter.Node, lang *gotreesitter.Language) []*gotreesitter.Node {
+	var errors []*gotreesitter.Node
+	seenTopLevel := make(map[uint32]bool) // start byte of top-level block -> already reported
+
+	gotreesitter.Walk(root, func(n *gotreesitter.Node, depth int) gotreesitter.WalkAction {
+		if !n.IsError() && !n.IsMissing() {
+			if n.HasError() {
+				return gotreesitter.WalkContinue
+			}
+			return gotreesitter.WalkSkipChildren
+		}
+
+		// Found an error node. Determine its top-level block.
+		topLevel := findTopLevelBlock(n, lang)
+		if topLevel != nil {
+			key := topLevel.StartByte()
+			if seenTopLevel[key] {
+				return gotreesitter.WalkSkipChildren
+			}
+			seenTopLevel[key] = true
+		} else {
+			// Error outside a top-level block — only report if first
+			if len(errors) > 0 {
+				// Check if we already have a non-top-level error
+				hasNonTopLevel := false
+				for _, e := range errors {
+					if findTopLevelBlock(e, lang) == nil {
+						hasNonTopLevel = true
+						break
+					}
+				}
+				if hasNonTopLevel {
+					return gotreesitter.WalkSkipChildren
+				}
+			}
+		}
+
+		errors = append(errors, n)
+		return gotreesitter.WalkSkipChildren
+	})
+
+	return errors
+}
+
+// findTopLevelBlock walks up from a node to find the enclosing test_block,
+// benchmark_block, or load_block that is a direct child of source_file.
+func findTopLevelBlock(n *gotreesitter.Node, lang *gotreesitter.Language) *gotreesitter.Node {
+	for p := n.Parent(); p != nil; p = p.Parent() {
+		parentType := p.Type(lang)
+		if parentType == "source_file" {
+			// n's ancestor just below source_file
+			return nil
+		}
+		grandparent := p.Parent()
+		if grandparent != nil && grandparent.Type(lang) == "source_file" {
+			switch p.Type(lang) {
+			case "test_block", "benchmark_block", "load_block":
+				return p
+			}
+		}
+	}
+	return nil
+}
