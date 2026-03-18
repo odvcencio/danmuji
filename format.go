@@ -3,22 +3,12 @@ package danmuji
 import (
 	"fmt"
 	"strings"
-	"sync"
 
 	gotreesitter "github.com/odvcencio/gotreesitter"
 )
 
-var (
-	fmtLangOnce   sync.Once
-	fmtLangCached *gotreesitter.Language
-	fmtLangErr    error
-)
-
 func getFmtLanguage() (*gotreesitter.Language, error) {
-	fmtLangOnce.Do(func() {
-		fmtLangCached, fmtLangErr = GenerateLanguage(DanmujiGrammar())
-	})
-	return fmtLangCached, fmtLangErr
+	return getDanmujiLanguage()
 }
 
 // FormatDanmuji parses a .dmj source file and returns it with canonical indentation.

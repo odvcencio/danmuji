@@ -4,9 +4,11 @@ package main
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -116,23 +118,39 @@ func build(path string, debug bool) error {
 }
 
 func buildDir(dir string, opts danmuji.TranspileOptions) error {
-	entries, err := os.ReadDir(dir)
+	files, err := collectDanmujiFiles(dir)
 	if err != nil {
 		return err
 	}
 
-	count := 0
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".dmj") {
-			continue
-		}
-		if _, err := transpileFile(filepath.Join(dir, entry.Name()), opts); err != nil {
+	for _, path := range files {
+		if _, err := transpileFile(path, opts); err != nil {
 			return err
 		}
-		count++
 	}
-	fmt.Printf("danmuji: transpiled %d file(s)\n", count)
+	fmt.Printf("danmuji: transpiled %d file(s)\n", len(files))
 	return nil
+}
+
+func collectDanmujiFiles(dir string) ([]string, error) {
+	var files []string
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if strings.HasSuffix(d.Name(), ".dmj") {
+			files = append(files, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(files)
+	return files, nil
 }
 
 // runTest implements `danmuji test [--watch] <path> [-- go-test-flags...]`.
@@ -174,7 +192,6 @@ func runTest(args []string) int {
 		return watchAndTest(path, goTestFlags)
 	}
 
-	// Discover .dmj files.
 	var dmjFiles []string
 	info, err := os.Stat(path)
 	if err != nil {
@@ -182,15 +199,10 @@ func runTest(args []string) int {
 		return 1
 	}
 	if info.IsDir() {
-		entries, err := os.ReadDir(path)
+		dmjFiles, err = collectDanmujiFiles(path)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			return 1
-		}
-		for _, entry := range entries {
-			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".dmj") {
-				dmjFiles = append(dmjFiles, filepath.Join(path, entry.Name()))
-			}
 		}
 	} else {
 		dmjFiles = append(dmjFiles, path)
@@ -222,7 +234,11 @@ func runTest(args []string) int {
 	// Run go test, streaming output to the terminal.
 	goArgs := []string{"test"}
 	goArgs = append(goArgs, goTestFlags...)
-	goArgs = append(goArgs, ".")
+	if info.IsDir() {
+		goArgs = append(goArgs, "./...")
+	} else {
+		goArgs = append(goArgs, ".")
+	}
 	cmd := exec.Command("go", goArgs...)
 	cmd.Dir = testDir
 	cmd.Stdout = os.Stdout
@@ -263,9 +279,16 @@ func watchAndTest(path string, goTestFlags []string) int {
 	}
 	defer watcher.Close()
 
-	if err := watcher.Add(watchDir); err != nil {
-		fmt.Fprintf(os.Stderr, "error watching %s: %v\n", watchDir, err)
-		return 1
+	if info.IsDir() {
+		if err := addWatchDirs(watcher, watchDir); err != nil {
+			fmt.Fprintf(os.Stderr, "error watching %s: %v\n", watchDir, err)
+			return 1
+		}
+	} else {
+		if err := watcher.Add(watchDir); err != nil {
+			fmt.Fprintf(os.Stderr, "error watching %s: %v\n", watchDir, err)
+			return 1
+		}
 	}
 
 	fmt.Printf("danmuji: watching %s for changes (ctrl+c to stop)\n", watchDir)
@@ -281,11 +304,16 @@ func watchAndTest(path string, goTestFlags []string) int {
 			if !ok {
 				return 0
 			}
-			// Only trigger on .dmj file writes.
+			if event.Op&fsnotify.Create != 0 {
+				if created, err := os.Stat(event.Name); err == nil && created.IsDir() {
+					_ = addWatchDirs(watcher, event.Name)
+					continue
+				}
+			}
 			if !strings.HasSuffix(event.Name, ".dmj") {
 				continue
 			}
-			if event.Op&(fsnotify.Write|fsnotify.Create) == 0 {
+			if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove|fsnotify.Rename) == 0 {
 				continue
 			}
 			// Debounce: reset timer on each event, run after 200ms of quiet.
@@ -303,6 +331,18 @@ func watchAndTest(path string, goTestFlags []string) int {
 			fmt.Fprintf(os.Stderr, "watch error: %v\n", err)
 		}
 	}
+}
+
+func addWatchDirs(watcher *fsnotify.Watcher, root string) error {
+	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return watcher.Add(path)
+		}
+		return nil
+	})
 }
 
 // runTestOnce runs a single test cycle (transpile, go test, cleanup).
@@ -358,21 +398,16 @@ func fmtDanmuji(path string) error {
 	}
 
 	if info.IsDir() {
-		entries, err := os.ReadDir(path)
+		files, err := collectDanmujiFiles(path)
 		if err != nil {
 			return err
 		}
-		count := 0
-		for _, entry := range entries {
-			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".dmj") {
-				continue
-			}
-			if err := fmtFile(filepath.Join(path, entry.Name())); err != nil {
+		for _, file := range files {
+			if err := fmtFile(file); err != nil {
 				return err
 			}
-			count++
 		}
-		fmt.Printf("danmuji fmt: formatted %d file(s)\n", count)
+		fmt.Printf("danmuji fmt: formatted %d file(s)\n", len(files))
 		return nil
 	}
 	return fmtFile(path)

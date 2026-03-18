@@ -5,6 +5,7 @@ package danmuji
 // exports DanmujiGrammar, GoGrammar, etc.) while keeping grammar code readable.
 
 import (
+	"github.com/odvcencio/gotreesitter"
 	"github.com/odvcencio/gotreesitter/grammargen"
 )
 
@@ -43,9 +44,12 @@ var (
 
 // Helper function aliases
 var (
-	AppendChoice    = grammargen.AppendChoice
-	AddConflict     = grammargen.AddConflict
-	GenerateLanguage = grammargen.GenerateLanguage
+	AppendChoice           = grammargen.AppendChoice
+	AddConflict            = grammargen.AddConflict
+	Generate               = grammargen.Generate
+	GenerateLanguage       = grammargen.GenerateLanguage
+	GenerateLanguageAndBlob = grammargen.GenerateLanguageAndBlob
+	LoadLanguageBlob       = gotreesitter.LoadLanguage
 )
 
 // Rule kind constants

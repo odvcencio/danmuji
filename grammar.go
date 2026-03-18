@@ -525,13 +525,13 @@ func DanmujiGrammar() *Grammar {
 		// ---------------------------------------------------------------
 		// Wire into Go: extend _top_level_declaration and _statement
 		// ---------------------------------------------------------------
-		AppendChoice(g, "_top_level_declaration",
+		AppendChoice(g, "_top_level_declaration", Choice(
 			Sym("test_block"),
 			Sym("benchmark_block"),
 			Sym("load_block"),
-		)
+		))
 
-		AppendChoice(g, "_statement",
+		AppendChoice(g, "_statement", Choice(
 			Sym("given_block"),
 			Sym("when_block"),
 			Sym("then_block"),
@@ -575,7 +575,7 @@ func DanmujiGrammar() *Grammar {
 			Sym("stop_block"),
 			Sym("signal_directive"),
 			Sym("timeout_directive"),
-		)
+		))
 
 		// ---------------------------------------------------------------
 		// GLR conflicts for keyword ambiguities

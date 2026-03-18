@@ -3,7 +3,6 @@ package danmuji
 import (
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -72,24 +71,8 @@ unit "basic" {
 	}
 	t.Logf("Transpiled Go:\n%s", goCode)
 
-	// Write to temp dir as a test file
-	tmpDir := t.TempDir()
-
-	// Need a go.mod for the test
-	os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module testmod\n\ngo 1.21\n"), 0644)
-	os.WriteFile(filepath.Join(tmpDir, "main_test.go"), []byte(goCode), 0644)
-
-	// Add testify dependency and tidy
-	goGet := exec.Command("go", "get", "github.com/stretchr/testify@latest")
-	goGet.Dir = tmpDir
-	if out, err := goGet.CombinedOutput(); err != nil {
-		t.Fatalf("go get testify failed: %v\n%s", err, out)
-	}
-	goTidy := exec.Command("go", "mod", "tidy")
-	goTidy.Dir = tmpDir
-	if out, err := goTidy.CombinedOutput(); err != nil {
-		t.Fatalf("go mod tidy failed: %v\n%s", err, out)
-	}
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "main_test.go", goCode)
 
 	// Run go test
 	cmd := exec.Command("go", "test", "-v", "./...")
@@ -123,21 +106,8 @@ unit "failing" {
 	}
 	t.Logf("Transpiled Go:\n%s", goCode)
 
-	tmpDir := t.TempDir()
-	os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module testmod\n\ngo 1.21\n"), 0644)
-	os.WriteFile(filepath.Join(tmpDir, "main_test.go"), []byte(goCode), 0644)
-
-	// Add testify dependency and tidy
-	goGet := exec.Command("go", "get", "github.com/stretchr/testify@latest")
-	goGet.Dir = tmpDir
-	if getOut, getErr := goGet.CombinedOutput(); getErr != nil {
-		t.Fatalf("go get testify failed: %v\n%s", getErr, getOut)
-	}
-	goTidy := exec.Command("go", "mod", "tidy")
-	goTidy.Dir = tmpDir
-	if tidyOut, tidyErr := goTidy.CombinedOutput(); tidyErr != nil {
-		t.Fatalf("go mod tidy failed: %v\n%s", tidyErr, tidyOut)
-	}
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "main_test.go", goCode)
 
 	cmd := exec.Command("go", "test", "-v", "./...")
 	cmd.Dir = tmpDir
@@ -173,21 +143,8 @@ unit "with mock" {
 	}
 	t.Logf("Transpiled Go:\n%s", goCode)
 
-	tmpDir := t.TempDir()
-	os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module testmod\n\ngo 1.21\n"), 0644)
-	os.WriteFile(filepath.Join(tmpDir, "main_test.go"), []byte(goCode), 0644)
-
-	// Add testify dependency and tidy
-	goGet := exec.Command("go", "get", "github.com/stretchr/testify@latest")
-	goGet.Dir = tmpDir
-	if getOut, getErr := goGet.CombinedOutput(); getErr != nil {
-		t.Fatalf("go get testify failed: %v\n%s", getErr, getOut)
-	}
-	goTidy := exec.Command("go", "mod", "tidy")
-	goTidy.Dir = tmpDir
-	if tidyOut, tidyErr := goTidy.CombinedOutput(); tidyErr != nil {
-		t.Fatalf("go mod tidy failed: %v\n%s", tidyErr, tidyOut)
-	}
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "main_test.go", goCode)
 
 	cmd := exec.Command("go", "test", "-v", "./...")
 	cmd.Dir = tmpDir
@@ -334,20 +291,8 @@ unit "echo" {
 	}
 	t.Logf("Transpiled Go:\n%s", goCode)
 
-	tmpDir := t.TempDir()
-	os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module testmod\n\ngo 1.21\n"), 0644)
-	os.WriteFile(filepath.Join(tmpDir, "exec_test.go"), []byte(goCode), 0644)
-
-	getCmd := exec.Command("go", "get", "github.com/stretchr/testify@latest")
-	getCmd.Dir = tmpDir
-	if out, err := getCmd.CombinedOutput(); err != nil {
-		t.Fatalf("go get testify failed: %v\n%s", err, out)
-	}
-	tidyCmd := exec.Command("go", "mod", "tidy")
-	tidyCmd.Dir = tmpDir
-	if out, err := tidyCmd.CombinedOutput(); err != nil {
-		t.Fatalf("go mod tidy failed: %v\n%s", err, out)
-	}
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "exec_test.go", goCode)
 
 	runCmd := exec.Command("go", "test", "-v", "./...")
 	runCmd.Dir = tmpDir
@@ -402,9 +347,8 @@ benchmark "addition" {
 	}
 	t.Logf("Transpiled Go:\n%s", goCode)
 
-	tmpDir := t.TempDir()
-	os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module testmod\n\ngo 1.21\n"), 0644)
-	os.WriteFile(filepath.Join(tmpDir, "bench_test.go"), []byte(goCode), 0644)
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "bench_test.go", goCode)
 
 	cmd := exec.Command("go", "test", "-bench=.", "-benchtime=1x", "-v", "./...")
 	cmd.Dir = tmpDir
@@ -591,20 +535,8 @@ unit "time travel" {
 	}
 	t.Logf("Transpiled Go:\n%s", goCode)
 
-	tmpDir := t.TempDir()
-	os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module testmod\n\ngo 1.21\n"), 0644)
-	os.WriteFile(filepath.Join(tmpDir, "main_test.go"), []byte(goCode), 0644)
-
-	getCmd := exec.Command("go", "get", "github.com/stretchr/testify@latest")
-	getCmd.Dir = tmpDir
-	if out, err := getCmd.CombinedOutput(); err != nil {
-		t.Fatalf("go get testify failed: %v\n%s", err, out)
-	}
-	tidyCmd := exec.Command("go", "mod", "tidy")
-	tidyCmd.Dir = tmpDir
-	if out, err := tidyCmd.CombinedOutput(); err != nil {
-		t.Fatalf("go mod tidy failed: %v\n%s", err, out)
-	}
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "main_test.go", goCode)
 
 	runCmd := exec.Command("go", "test", "-v", "./...")
 	runCmd.Dir = tmpDir
@@ -655,25 +587,8 @@ func TestTranspileDanmujiFullStack(t *testing.T) {
 	}
 
 	// Compile and run
-	tmpDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module testmod\n\ngo 1.21\n"), 0644); err != nil {
-		t.Fatalf("write go.mod: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(tmpDir, "full_test.go"), []byte(goCode), 0644); err != nil {
-		t.Fatalf("write test file: %v", err)
-	}
-
-	// Add testify dependency and tidy
-	getCmd := exec.Command("go", "get", "github.com/stretchr/testify@latest")
-	getCmd.Dir = tmpDir
-	if out, err := getCmd.CombinedOutput(); err != nil {
-		t.Fatalf("go get testify: %v\n%s", err, out)
-	}
-	tidyCmd := exec.Command("go", "mod", "tidy")
-	tidyCmd.Dir = tmpDir
-	if out, err := tidyCmd.CombinedOutput(); err != nil {
-		t.Fatalf("go mod tidy: %v\n%s", err, out)
-	}
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "full_test.go", goCode)
 
 	cmd := exec.Command("go", "test", "-v", "-bench=.", "-benchtime=1x", "./...")
 	cmd.Dir = tmpDir
@@ -833,20 +748,8 @@ unit "addition" {
 	t.Logf("Transpiled Go:\n%s", goCode)
 
 	// Compile and run
-	tmpDir := t.TempDir()
-	os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module testmod\n\ngo 1.21\n"), 0644)
-	os.WriteFile(filepath.Join(tmpDir, "table_test.go"), []byte(goCode), 0644)
-
-	getCmd := exec.Command("go", "get", "github.com/stretchr/testify@latest")
-	getCmd.Dir = tmpDir
-	if out, err := getCmd.CombinedOutput(); err != nil {
-		t.Fatalf("go get testify failed: %v\n%s", err, out)
-	}
-	tidyCmd := exec.Command("go", "mod", "tidy")
-	tidyCmd.Dir = tmpDir
-	if out, err := tidyCmd.CombinedOutput(); err != nil {
-		t.Fatalf("go mod tidy failed: %v\n%s", err, out)
-	}
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "table_test.go", goCode)
 
 	runCmd := exec.Command("go", "test", "-v", "./...")
 	runCmd.Dir = tmpDir
@@ -949,9 +852,8 @@ unit "integer invariants" {
 		t.Error("expected property function signature in generated code")
 	}
 
-	tmpDir := t.TempDir()
-	os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module testmod\n\ngo 1.21\n"), 0644)
-	os.WriteFile(filepath.Join(tmpDir, "property_test.go"), []byte(goCode), 0644)
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "property_test.go", goCode)
 
 	// Quick is from the standard library.
 	runCmd := exec.Command("go", "test", "-v", "./...")
@@ -984,9 +886,8 @@ unit "invalid invariants" {
 	}
 	t.Logf("Transpiled Go:\n%s", goCode)
 
-	tmpDir := t.TempDir()
-	os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module testmod\n\ngo 1.21\n"), 0644)
-	os.WriteFile(filepath.Join(tmpDir, "property_test.go"), []byte(goCode), 0644)
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "property_test.go", goCode)
 
 	// This property should fail; expect tests to fail and report the property failure.
 	runCmd := exec.Command("go", "test", "-v", "./...")
@@ -1020,16 +921,8 @@ unit "math scenarios" {
 	}
 	t.Logf("Transpiled:\n%s", goCode)
 
-	tmpDir := t.TempDir()
-	os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module testmod\n\ngo 1.21\n"), 0644)
-	os.WriteFile(filepath.Join(tmpDir, "main_test.go"), []byte(goCode), 0644)
-
-	getCmd := exec.Command("go", "get", "github.com/stretchr/testify@latest")
-	getCmd.Dir = tmpDir
-	getCmd.CombinedOutput()
-	tidyCmd := exec.Command("go", "mod", "tidy")
-	tidyCmd.Dir = tmpDir
-	tidyCmd.Run()
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "main_test.go", goCode)
 
 	cmd := exec.Command("go", "test", "-v", "./...")
 	cmd.Dir = tmpDir

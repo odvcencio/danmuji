@@ -8,20 +8,12 @@ import (
 	gotreesitter "github.com/odvcencio/gotreesitter"
 )
 
-// danmujiLang is a package-level cached language to avoid regenerating for each test.
-var danmujiLang *gotreesitter.Language
-
 func getDanmujiLang(t *testing.T) *gotreesitter.Language {
 	t.Helper()
-	if danmujiLang != nil {
-		return danmujiLang
-	}
-	g := DanmujiGrammar()
-	lang, err := GenerateLanguage(g)
+	lang, err := getDanmujiLanguage()
 	if err != nil {
-		t.Fatalf("GenerateLanguage(DanmujiGrammar) failed: %v", err)
+		t.Fatalf("getDanmujiLanguage failed: %v", err)
 	}
-	danmujiLang = lang
 	return lang
 }
 

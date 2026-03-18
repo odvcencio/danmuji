@@ -23,9 +23,9 @@ func TestHighlightQueryMatchesGenerated(t *testing.T) {
 }
 
 func TestHighlightQueryCompiles(t *testing.T) {
-	lang, err := GenerateLanguage(DanmujiGrammar())
+	lang, err := getDanmujiLanguage()
 	if err != nil {
-		t.Fatalf("GenerateLanguage: %v", err)
+		t.Fatalf("getDanmujiLanguage: %v", err)
 	}
 	query, err := os.ReadFile("highlights.scm")
 	if err != nil {
