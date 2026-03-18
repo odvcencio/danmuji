@@ -191,6 +191,153 @@ func expandRule(r *Rule, fieldName string) []LinearExpansion {
 	return []LinearExpansion{{}}
 }
 
+// ---------------------------------------------------------------------------
+// Layer 2: hand-written error overlay table
+// ---------------------------------------------------------------------------
+
+// ErrorOverlay provides a curated message and example for a specific error
+// context, keyed by "parent_node_type|prefix_signature".
+type ErrorOverlay struct {
+	Message string
+	Example string
+}
+
+// errorOverlays maps "parent_type|prefix_signature" to hand-written error
+// messages. The prefix signature is a comma-separated list of node types for
+// successfully-parsed children before the ERROR node.
+var errorOverlays = map[string]ErrorOverlay{
+	// BDD structure
+	"given_block|given":                            {"expected string after \"given\"", "given \"description\" { ... }"},
+	"given_block|given,interpreted_string_literal":  {"expected { to open block", "given \"description\" { ... }"},
+	"when_block|when":                              {"expected string after \"when\"", "when \"description\" { ... }"},
+	"when_block|when,interpreted_string_literal":    {"expected { to open block", "when \"description\" { ... }"},
+	"then_block|then":                              {"expected string after \"then\"", "then \"description\" { ... }"},
+	"then_block|then,interpreted_string_literal":    {"expected { to open block", "then \"description\" { ... }"},
+
+	// Test blocks
+	"test_block|unit":                              {"expected string after test category", "unit \"name\" { ... }"},
+	"test_block|unit,interpreted_string_literal":    {"expected { to open test block", "unit \"name\" { ... }"},
+	"test_block|integration":                       {"expected string after test category", "integration \"name\" { ... }"},
+	"test_block|e2e":                               {"expected string after test category", "e2e \"name\" { ... }"},
+
+	// Assertions
+	"expect_statement|expect":                      {"expected expression after \"expect\"", "expect x == 1"},
+	"reject_statement|reject":                      {"expected expression after \"reject\"", "reject ok"},
+	"verify_statement|verify":                      {"expected target after \"verify\"", "verify repo.Save called 1 times"},
+
+	// Test doubles
+	"mock_declaration|mock":                        {"expected name after \"mock\"", "mock RepoName { ... }"},
+	"mock_declaration|mock,identifier":             {"expected { to open mock body", "mock RepoName { ... }"},
+	"fake_declaration|fake":                        {"expected name after \"fake\"", "fake StoreName { ... }"},
+	"spy_declaration|spy":                          {"expected name after \"spy\"", "spy BusName { ... }"},
+	"mock_method|identifier,parameter_list":        {"expected -> return_type after parameters", "Save(u User) -> error = nil"},
+
+	// Data-driven
+	"each_do_block|each":                                            {"expected string after \"each\"", "each \"scenarios\" { ... } do { ... }"},
+	"each_do_block|each,interpreted_string_literal,block":           {"expected \"do\" keyword", "each \"scenarios\" { ... } do { ... }"},
+	"matrix_block|matrix":                                           {"expected string after \"matrix\"", "matrix \"dimensions\" { ... } do { ... }"},
+	"property_block|property":                                       {"expected string after \"property\"", "property \"name\" for all (x int) { ... }"},
+	"property_block|property,interpreted_string_literal":            {"expected \"for\" keyword", "property \"name\" for all (params) { ... }"},
+
+	// Temporal
+	"eventually_block|eventually":                  {"expected string after \"eventually\"", "eventually \"name\" within 5s { ... }"},
+	"consistently_block|consistently":              {"expected string after \"consistently\"", "consistently \"name\" for 2s { ... }"},
+
+	// Infrastructure
+	"needs_block|needs":                            {"expected service type after \"needs\"", "needs postgres db { ... }"},
+	"needs_block|needs,service_type":               {"expected identifier for service name", "needs postgres db { ... }"},
+	"benchmark_block|benchmark":                    {"expected string after \"benchmark\"", "benchmark \"name\" { ... }"},
+	"exec_block|exec":                              {"expected string after \"exec\"", "exec \"name\" { ... }"},
+	"snapshot_block|snapshot":                      {"expected string after \"snapshot\"", "snapshot \"name\" { ... }"},
+
+	// Process
+	"process_block|process":                        {"expected path after \"process\"", "process \"./cmd/server\" { ... }"},
+	"stop_block|stop":                              {"expected { to open stop block", "stop { signal SIGTERM ... }"},
+	"ready_clause|ready":                           {"expected mode (http, tcp, stdout, delay) after \"ready\"", "ready http \"http://host/health\""},
+}
+
+// ---------------------------------------------------------------------------
+// Layer 3: keyword-based fallback inference
+// ---------------------------------------------------------------------------
+
+// keywordToProduction maps danmuji keywords to their expected grammar
+// production. Used as a fallback when the ERROR node's parent isn't a
+// recognized production — we extract the first keyword from the error text
+// and infer which production the user was trying to write.
+var keywordToProduction = map[string]string{
+	"given": "given_block", "when": "when_block", "then": "then_block",
+	"expect": "expect_statement", "reject": "reject_statement", "verify": "verify_statement",
+	"mock": "mock_declaration", "fake": "fake_declaration", "spy": "spy_declaration",
+	"unit": "test_block", "integration": "test_block", "e2e": "test_block",
+	"benchmark": "benchmark_block", "load": "load_block",
+	"needs": "needs_block", "exec": "exec_block",
+	"process": "process_block", "stop": "stop_block",
+	"eventually": "eventually_block", "consistently": "consistently_block",
+	"each": "each_do_block", "matrix": "matrix_block", "property": "property_block",
+	"snapshot": "snapshot_block", "profile": "profile_block", "table": "table_declaration",
+	"before": "lifecycle_hook", "after": "lifecycle_hook",
+	"ready": "ready_clause", "signal": "signal_directive", "timeout": "timeout_directive",
+	"no_leaks": "no_leaks_directive", "fake_clock": "fake_clock_directive",
+}
+
+// inferFromKeyword extracts the first word from text and looks it up in
+// kwMap to determine which grammar production the user was attempting.
+// Compound keywords (no_leaks, fake_clock) are checked first.
+// Returns the production name or "" if no keyword matches.
+func inferFromKeyword(text string, kwMap map[string]string) string {
+	if text == "" {
+		return ""
+	}
+
+	// Check compound keywords first (underscore-joined multi-word keywords).
+	// These must be checked before splitting on whitespace because the
+	// individual words may also be valid keywords.
+	compoundKeywords := []string{"no_leaks", "fake_clock"}
+	for _, ck := range compoundKeywords {
+		if strings.HasPrefix(text, ck) {
+			// Ensure the compound keyword is followed by whitespace or end-of-string.
+			rest := text[len(ck):]
+			if rest == "" || rest[0] == ' ' || rest[0] == '\t' || rest[0] == '\n' {
+				if prod, ok := kwMap[ck]; ok {
+					return prod
+				}
+			}
+		}
+	}
+
+	// Extract the first whitespace-delimited word.
+	word := text
+	if idx := strings.IndexAny(text, " \t\n"); idx >= 0 {
+		word = text[:idx]
+	}
+
+	if prod, ok := kwMap[word]; ok {
+		return prod
+	}
+	return ""
+}
+
+// buildPrefixSignature walks the parent's children up to (but not including)
+// errNode and returns a comma-separated string of their Tree-sitter node types.
+// This signature is used as the suffix of overlay map keys.
+func buildPrefixSignature(parent, errNode *gotreesitter.Node, lang *gotreesitter.Language) string {
+	var parts []string
+	childCount := parent.ChildCount()
+	errStart := errNode.StartByte()
+	errEnd := errNode.EndByte()
+
+	for i := 0; i < childCount; i++ {
+		child := parent.Child(i)
+		// Stop when we reach the error node.
+		if child.StartByte() == errStart && child.EndByte() == errEnd {
+			break
+		}
+		parts = append(parts, child.Type(lang))
+	}
+
+	return strings.Join(parts, ",")
+}
+
 // FormatParseError is a placeholder — implemented in Task 6.
 func FormatParseError(source []byte, root *gotreesitter.Node, lang *gotreesitter.Language,
 	sourceFile string, expectations map[string]*ProductionExpectations) string {

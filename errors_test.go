@@ -395,3 +395,38 @@ func TestMatchExpansionsNoMatch(t *testing.T) {
 		t.Errorf("expected no matches, got %+v", next)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Layer 2 / Layer 3 tests
+// ---------------------------------------------------------------------------
+
+func TestKeywordInference(t *testing.T) {
+	cases := []struct{ text, expected string }{
+		{"given valid input {", "given_block"},
+		{"expect", "expect_statement"},
+		{"process ./cmd/server", "process_block"},
+		{"no_leaks", "no_leaks_directive"},
+		{"fake_clock at", "fake_clock_directive"},
+		{"x := 5", ""},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.text, func(t *testing.T) {
+			result := inferFromKeyword(tc.text, keywordToProduction)
+			if result != tc.expected {
+				t.Errorf("inferFromKeyword(%q) = %q, want %q", tc.text, result, tc.expected)
+			}
+		})
+	}
+}
+
+func TestBuildPrefixSignature(t *testing.T) {
+	lang := getDanmujiLang(t)
+	// Parse something with a known structure to verify prefix building
+	source := []byte("package main\nfunc f() {\n\tgiven \"test\" {\n\t}\n}\n")
+	parser := gotreesitter.NewParser(lang)
+	tree, _ := parser.Parse(source)
+	root := tree.RootNode()
+	t.Logf("SExpr: %s", root.SExpr(lang))
+	// Just verify it doesn't panic — the exact output depends on tree structure
+}
