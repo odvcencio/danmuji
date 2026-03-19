@@ -258,8 +258,14 @@ func DanmujiGrammar() *Grammar {
 		// ---------------------------------------------------------------
 		g.Define("load_config", Choice(
 			Seq(Str("rate"), Sym("_expression")),
-			Seq(Str("duration"), Sym("_expression")),
-			Seq(Str("rampup"), Sym("_expression")),
+			Seq(Str("duration"), Choice(
+				Sym("_expression"),
+				Sym("duration_literal"),
+			)),
+			Seq(Str("rampup"), Choice(
+				Sym("_expression"),
+				Sym("duration_literal"),
+			)),
 			Seq(Str("concurrency"), Sym("_expression")),
 		))
 

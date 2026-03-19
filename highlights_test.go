@@ -277,7 +277,8 @@ integration "process leaves" {
 
 load "leaf load" {
 	rate 25
-	rampup 1
+	duration 2s
+	rampup 1s
 	concurrency 4
 	target post "http://localhost:8080/api"
 
@@ -300,7 +301,7 @@ benchmark "leaf bench" {
 	assertCaptureTexts(t, captures, "keyword",
 		"verify", "called", "with", "not_called", "reject",
 		"process", "ready", "tcp", "stdout", "stop", "signal", "timeout", "expect", "exit_code",
-		"load", "rate", "rampup", "concurrency", "target", "post",
+		"load", "rate", "duration", "rampup", "concurrency", "target", "post",
 		"benchmark", "setup", "parallel", "measure",
 	)
 	assertCaptureTexts(t, captures, "constant", "SIGINT")

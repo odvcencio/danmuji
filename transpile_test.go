@@ -248,7 +248,8 @@ import "testing"
 
 load "api throughput" {
 	rate 10
-	duration 5
+	duration 5s
+	rampup 1s
 	target get "http://localhost:8080/health"
 	then "healthy" {
 		expect true
@@ -266,6 +267,12 @@ load "api throughput" {
 	}
 	if !strings.Contains(goCode, "vegeta.NewAttacker") {
 		t.Error("expected vegeta.NewAttacker in output")
+	}
+	if !strings.Contains(goCode, "duration := 5 * time.Second") {
+		t.Error("expected duration literal normalization in output")
+	}
+	if !strings.Contains(goCode, "rampup := 1 * time.Second") {
+		t.Error("expected rampup literal normalization in output")
 	}
 	if !strings.Contains(goCode, "func TestLoadApiThroughput") {
 		t.Error("expected TestLoadApiThroughput function")

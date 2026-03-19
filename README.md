@@ -381,7 +381,8 @@ Generates `b.RunParallel`.
 ```dmj
 load "checkout endpoint" {
     rate 50
-    duration 30
+    duration 30s
+    rampup 5s
     target post "http://localhost:8080/api/checkout"
 
     then "fast enough" {
@@ -392,7 +393,7 @@ load "checkout endpoint" {
 
 Generates [vegeta](https://github.com/tsenart/vegeta) attack code with rate limiting, duration, and metrics collection. Load tests get `//go:build e2e` by default.
 
-Additional load config options: `rampup` and `concurrency`.
+Additional load config options: `rampup` and `concurrency`. `duration` and `rampup` accept duration literals such as `30s`, `500ms`, or plain expressions.
 
 ### Profiling
 

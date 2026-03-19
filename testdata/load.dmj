@@ -4,7 +4,8 @@ import "testing"
 
 load "api throughput" {
 	rate 10
-	duration 5
+	duration 5s
+	rampup 1s
 	target get "http://localhost:8080/health"
 	then "healthy" {
 		expect true
