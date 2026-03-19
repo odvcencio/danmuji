@@ -10,6 +10,7 @@ import (
 
 const manualHighlightQueries = `
 ;; Manual danmuji highlight additions
+(tag) @attribute
 ((identifier) @keyword (#any-of? @keyword "exit_code" "stderr"))
 (signal_name) @constant
 (each_row_block table: (identifier) @variable)
@@ -77,7 +78,25 @@ spy Bus {
 	Publish(topic string)
 }
 
+@slow @parallel
 unit "highlight coverage" {
+	before each {
+		repo := &mockRepo{}
+		_ = repo
+	}
+
+	after each {
+		_ = "cleanup"
+	}
+
+	before all {
+		_ = "setup"
+	}
+
+	after all {
+		_ = "teardown"
+	}
+
 	fake_clock at "2026-01-01T00:00:00Z"
 	profile routines {}
 	no_leaks
@@ -117,6 +136,8 @@ unit "highlight coverage" {
 		expect stderr == ""
 	}
 
+	verify repo.Save called 0 times
+
 	snapshot "snap" {
 		"body"
 	}
@@ -136,6 +157,8 @@ unit "highlight coverage" {
 }
 
 integration "process coverage" {
+	needs postgres db {}
+
 	process "./cmd/server" {
 		args "--port 1234"
 		env { LOG_LEVEL: "debug" }
@@ -146,6 +169,23 @@ integration "process coverage" {
 		signal SIGTERM
 		timeout 1s
 		expect exit_code == 0
+	}
+}
+
+@skip
+unit "skip coverage" {
+	then "skipped" {
+		expect true
+	}
+}
+
+load "load coverage" {
+	rate 10
+	duration 5
+	target get "http://localhost:8080/health"
+
+	then "load target parses" {
+		expect true
 	}
 }
 
@@ -186,10 +226,11 @@ benchmark "bench" {
 	}
 
 	assertCaptureTexts(t, captures, "keyword",
-		"mock", "fake", "spy", "unit", "fake_clock", "profile", "routines", "no_leaks",
+		"mock", "fake", "spy", "unit", "before", "after", "all", "fake_clock", "profile", "routines", "no_leaks",
 		"table", "each", "row", "defaults", "matrix", "exec", "run", "expect", "contains",
-		"snapshot", "property", "up", "then", "eventually", "within", "consistently",
-		"integration", "process", "args", "env", "ready", "http", "stop", "signal", "timeout",
+		"verify", "called", "times", "snapshot", "property", "up", "then", "eventually", "within", "consistently",
+		"integration", "needs", "postgres", "process", "args", "env", "ready", "http", "stop", "signal", "timeout",
+		"load", "rate", "duration", "target", "get",
 		"benchmark", "measure", "report_allocs", "exit_code", "stderr",
 	)
 	assertCaptureTexts(t, captures, "type.definition", "Repo", "Store", "Bus", "sums")
@@ -197,6 +238,7 @@ benchmark "bench" {
 	assertCaptureTexts(t, captures, "variable", "sums")
 	assertCaptureTexts(t, captures, "property", "token", "method", "auth")
 	assertCaptureTexts(t, captures, "constant", "SIGTERM")
+	assertCaptureTexts(t, captures, "attribute", "@slow", "@parallel", "@skip")
 	assertCaptureTexts(t, captures, "string", `"highlight coverage"`, `"process coverage"`, `"./cmd/server"`, `"snap"`, `"bench"`)
 }
 

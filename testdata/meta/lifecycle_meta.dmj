@@ -1,0 +1,27 @@
+package lifecyclemeta_test
+
+import "testing"
+
+unit "before and after hooks apply to each subtest" {
+	counter := 0
+
+	before all {
+		counter = 1
+	}
+
+	before each {
+		counter = counter + 1
+	}
+
+	after each {
+		counter = counter + 10
+	}
+
+	then "first subtest sees setup state" {
+		expect counter == 2
+	}
+
+	then "second subtest sees prior cleanup and new setup" {
+		expect counter == 13
+	}
+}

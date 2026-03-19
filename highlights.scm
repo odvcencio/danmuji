@@ -177,6 +177,7 @@
 ;; stop_block
 
 ;; Manual danmuji highlight additions
+(tag) @attribute
 ((identifier) @keyword (#any-of? @keyword "exit_code" "stderr"))
 (signal_name) @constant
 (each_row_block table: (identifier) @variable)

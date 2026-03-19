@@ -144,14 +144,48 @@ func (t *dmjTranspiler) emitBlockInner(blockNode *gotreesitter.Node, indent stri
 	for i := 0; i < int(blockNode.NamedChildCount()); i++ {
 		c := blockNode.NamedChild(i)
 		if t.nodeType(c) == "statement_list" {
+			var beforeEachHooks []*gotreesitter.Node
+			var afterEachHooks []*gotreesitter.Node
 			for j := 0; j < int(c.NamedChildCount()); j++ {
 				stmt := c.NamedChild(j)
+				if t.nodeType(stmt) == "lifecycle_hook" {
+					hookText := strings.TrimSpace(t.text(stmt))
+					switch {
+					case strings.HasPrefix(hookText, "before each"):
+						beforeEachHooks = append(beforeEachHooks, stmt)
+						continue
+					case strings.HasPrefix(hookText, "after each"):
+						afterEachHooks = append(afterEachHooks, stmt)
+						continue
+					}
+				}
+
+				if len(beforeEachHooks) > 0 || len(afterEachHooks) > 0 {
+					if hooked, ok := t.emitStatementWithHooks(stmt, beforeEachHooks, afterEachHooks); ok {
+						fmt.Fprintf(&b, "%s%s\n", indent, hooked)
+						continue
+					}
+				}
+
 				fmt.Fprintf(&b, "%s%s\n", indent, t.emit(stmt))
 			}
 			return b.String()
 		}
 	}
 	return ""
+}
+
+func (t *dmjTranspiler) emitStatementWithHooks(stmt *gotreesitter.Node, beforeEachHooks, afterEachHooks []*gotreesitter.Node) (string, bool) {
+	switch t.nodeType(stmt) {
+	case "given_block":
+		return t.emitBDDBlockWithHooks(stmt, "given", beforeEachHooks, afterEachHooks), true
+	case "when_block":
+		return t.emitBDDBlockWithHooks(stmt, "when", beforeEachHooks, afterEachHooks), true
+	case "then_block":
+		return t.emitBDDBlockWithHooks(stmt, "then", beforeEachHooks, afterEachHooks), true
+	default:
+		return "", false
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -187,4 +221,39 @@ func (t *dmjTranspiler) emitBDDBlock(n *gotreesitter.Node, keyword string) strin
 	return b.String()
 }
 
+func (t *dmjTranspiler) emitBDDBlockWithHooks(n *gotreesitter.Node, keyword string, beforeEachHooks, afterEachHooks []*gotreesitter.Node) string {
+	desc := t.childByField(n, "description")
+	descText := `"` + keyword + `"`
+	label := keyword
+	if desc != nil {
+		descText = t.text(desc)
+		label = strings.Trim(descText, "\"'`")
+	}
+	t.pushContext(fmt.Sprintf("%s %s", keyword, label))
+	defer t.popContext()
+
+	var b strings.Builder
+	b.WriteString(t.lineDirective(n))
+	fmt.Fprintf(&b, "%s.Run(%s, func(%s *testing.T) {\n", t.testVar, descText, t.testVar)
+
+	for _, hook := range beforeEachHooks {
+		b.WriteString(t.emitBlockContentsIndented(hook, "\t"))
+	}
+	for _, hook := range afterEachHooks {
+		fmt.Fprintf(&b, "\t%s.Cleanup(func() {\n", t.testVar)
+		b.WriteString(t.emitBlockContentsIndented(hook, "\t\t"))
+		b.WriteString("\t})\n")
+	}
+
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		c := n.NamedChild(i)
+		if t.nodeType(c) == "block" {
+			b.WriteString(t.emitBlockInner(c, "\t"))
+			break
+		}
+	}
+
+	b.WriteString("})")
+	return b.String()
+}
 

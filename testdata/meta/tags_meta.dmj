@@ -1,0 +1,46 @@
+package tagsmeta_test
+
+import (
+	"strings"
+	"testing"
+
+	danmuji "github.com/odvcencio/danmuji"
+)
+
+unit "tagged transpilation emits runtime directives" {
+	source := []byte(`package tagged_test
+
+import "testing"
+
+@slow @parallel integration "tagged" {
+	then "works" {
+		expect true
+	}
+}
+`)
+
+	goCode, err := danmuji.TranspileDanmuji(source, danmuji.TranspileOptions{SourceFile: "/tmp/tagged.dmj"})
+
+	then "transpile succeeds" {
+		expect err == nil
+	}
+
+	then "integration files start with build tags" {
+		expect strings.HasPrefix(goCode, "//go:build integration\n\npackage tagged_test")
+	}
+
+	then "slow tags emit short mode guards" {
+		expect strings.Contains(goCode, "testing.Short()")
+	}
+
+	then "parallel tags emit t.Parallel" {
+		expect strings.Contains(goCode, "t.Parallel()")
+	}
+}
+
+@skip
+unit "skip tags short-circuit execution" {
+	then "would fail if it ran" {
+		expect false
+	}
+}

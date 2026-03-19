@@ -1,0 +1,46 @@
+package sourcemappingmeta_test
+
+import (
+	"strings"
+	"testing"
+
+	danmuji "github.com/odvcencio/danmuji"
+)
+
+unit "nested generated constructs preserve source mapping" {
+	source := []byte(`package nested_test
+
+import "testing"
+
+integration "server" {
+	process "./cmd/server" {
+		args "--port 9999"
+		ready delay 1s
+	}
+
+	stop {
+		signal SIGTERM
+		timeout 5s
+		expect exit_code == 0
+	}
+}
+`)
+
+	goCode, err := danmuji.TranspileDanmuji(source, danmuji.TranspileOptions{SourceFile: "/tmp/nested.dmj"})
+
+	then "transpile succeeds" {
+		expect err == nil
+	}
+
+	then "file level build tags stay first" {
+		expect strings.HasPrefix(goCode, "//go:build integration\n\npackage nested_test")
+	}
+
+	then "process blocks keep their source line" {
+		expect strings.Contains(goCode, "//line /tmp/nested.dmj:6")
+	}
+
+	then "stop blocks keep their source line" {
+		expect strings.Contains(goCode, "//line /tmp/nested.dmj:11")
+	}
+}
