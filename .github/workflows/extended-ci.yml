@@ -1,0 +1,38 @@
+name: extended-ci
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+  schedule:
+    - cron: "23 8 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  race:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DANMUJI_REQUIRE_DOCKER: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Confirm Docker daemon availability
+        run: docker info > /dev/null
+
+      - name: Run race suite
+        run: go test ./... -race -count=1

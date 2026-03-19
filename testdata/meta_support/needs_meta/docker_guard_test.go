@@ -12,6 +12,10 @@ import (
 
 func TestMain(m *testing.M) {
 	if !dockerAvailable() {
+		if os.Getenv("DANMUJI_REQUIRE_DOCKER") == "1" {
+			fmt.Fprintln(os.Stderr, "docker daemon unavailable but DANMUJI_REQUIRE_DOCKER=1")
+			os.Exit(1)
+		}
 		fmt.Fprintln(os.Stdout, "skipping needs_meta: docker daemon unavailable")
 		os.Exit(0)
 	}
