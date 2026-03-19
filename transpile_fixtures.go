@@ -355,7 +355,7 @@ func normalizeDurationExpression(raw string, fallback string) string {
 		return fallback
 	}
 	if matchDurationUnit.MatchString(v) {
-		return v
+		return durationLiteralToGo(v)
 	}
 	if matchInt.MatchString(v) {
 		return matchInt.ReplaceAllString(v, "$1 * time.Second")

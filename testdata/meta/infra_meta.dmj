@@ -1,0 +1,19 @@
+package inframeta_test
+
+import "testing"
+
+unit "goroutine profiling composes with normal assertions" {
+	profile routines {}
+
+	then "the unit still runs" {
+		expect true
+	}
+}
+
+unit "no leaks passes for clean tests" {
+	no_leaks
+
+	then "goroutines are reclaimed" {
+		expect true
+	}
+}

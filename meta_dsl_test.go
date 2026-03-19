@@ -87,7 +87,7 @@ replace github.com/odvcencio/danmuji => %s
 		t.Fatalf("go mod tidy: %v\n%s", err, out)
 	}
 
-	testCmd := exec.Command("go", "test", "-tags=integration,e2e", "-v", "./...")
+	testCmd := exec.Command("go", "test", "-tags=integration,e2e", "-run", ".", "-bench", ".", "-benchtime=1x", "-v", "./...")
 	testCmd.Dir = tmpDir
 	if out, err := testCmd.CombinedOutput(); err != nil {
 		t.Fatalf("go test meta specs: %v\n%s", err, out)

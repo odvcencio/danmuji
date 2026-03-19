@@ -1,0 +1,12 @@
+package execmeta_test
+
+import "testing"
+
+unit "exec captures shell output" {
+	exec "echo hello" {
+		run "echo hello"
+		expect exit_code == 0
+		expect stdout contains "hello"
+		expect stderr == ""
+	}
+}

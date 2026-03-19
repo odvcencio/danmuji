@@ -1,0 +1,33 @@
+package pollingmeta_test
+
+import (
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+unit "eventually observes asynchronous completion" {
+	var done atomic.Bool
+
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		done.Store(true)
+	}()
+
+	then "eventually sees the flag flip" {
+		eventually "done becomes true" within 250ms {
+			expect done.Load() == true
+		}
+	}
+}
+
+unit "consistently holds stable state" {
+	var state atomic.Int64
+	state.Store(1)
+
+	then "stable values stay stable" {
+		consistently "state remains one" for 75ms {
+			expect state.Load() == int64(1)
+		}
+	}
+}

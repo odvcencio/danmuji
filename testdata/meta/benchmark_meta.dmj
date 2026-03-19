@@ -1,0 +1,11 @@
+package benchmarkmeta_test
+
+import "testing"
+
+benchmark "string concat meta" {
+	measure {
+		s := "hello" + " " + "meta"
+		_ = s
+	}
+	report_allocs
+}
