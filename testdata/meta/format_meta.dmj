@@ -1,0 +1,38 @@
+package formatmeta_test
+
+import (
+	"strings"
+	"testing"
+
+	danmuji "github.com/odvcencio/danmuji"
+)
+
+unit "FormatDanmuji normalizes indentation" {
+	source := []byte(`package main_test
+
+import "testing"
+
+unit "test" {
+  given "a value" {
+    x := 42
+      then "it is 42" {
+        expect x == 42
+      }
+  }
+}
+`)
+
+	formatted, err := danmuji.FormatDanmuji(source)
+
+	then "format succeeds" {
+		expect err == nil
+	}
+
+	then "given blocks are indented with tabs" {
+		expect strings.Contains(formatted, "\tgiven \"a value\" {")
+	}
+
+	then "then blocks are indented with two tabs" {
+		expect strings.Contains(formatted, "\t\tthen \"it is 42\" {")
+	}
+}

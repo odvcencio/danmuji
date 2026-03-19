@@ -123,12 +123,11 @@ func buildDir(dir string, opts danmuji.TranspileOptions) error {
 		return err
 	}
 
-	for _, path := range files {
-		if _, err := transpileFile(path, opts); err != nil {
-			return err
-		}
+	generated, err := transpileFiles(files, opts)
+	if err != nil {
+		return err
 	}
-	fmt.Printf("danmuji: transpiled %d file(s)\n", len(files))
+	fmt.Printf("danmuji: transpiled %d file(s)\n", len(generated))
 	return nil
 }
 
@@ -151,6 +150,26 @@ func collectDanmujiFiles(dir string) ([]string, error) {
 	}
 	sort.Strings(files)
 	return files, nil
+}
+
+func transpileFiles(paths []string, opts danmuji.TranspileOptions) ([]string, error) {
+	var generated []string
+	var failures []string
+
+	for _, path := range paths {
+		outPath, err := transpileFile(path, opts)
+		if err != nil {
+			failures = append(failures, err.Error())
+			continue
+		}
+		generated = append(generated, outPath)
+	}
+
+	if len(failures) > 0 {
+		return generated, fmt.Errorf("%d file(s) failed to transpile:\n%s", len(failures), strings.Join(failures, "\n"))
+	}
+
+	return generated, nil
 }
 
 // runTest implements `danmuji test [--watch] <path> [-- go-test-flags...]`.
@@ -214,15 +233,11 @@ func runTest(args []string) int {
 	}
 
 	// Transpile all .dmj files, collecting generated paths for cleanup.
-	var generated []string
-	for _, f := range dmjFiles {
-		outPath, err := transpileFile(f, danmuji.TranspileOptions{})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			cleanup(generated)
-			return 1
-		}
-		generated = append(generated, outPath)
+	generated, err := transpileFiles(dmjFiles, danmuji.TranspileOptions{})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		cleanup(generated)
+		return 1
 	}
 
 	// Determine the directory to run `go test` in.

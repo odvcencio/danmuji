@@ -279,16 +279,11 @@ func (t *dmjTranspiler) findFakeMethods(n *gotreesitter.Node, out *[]fakeMethodI
 // ---------------------------------------------------------------------------
 
 func (t *dmjTranspiler) emitSpy(n *gotreesitter.Node) string {
-	nameNode := t.childByField(n, "name")
-	name := "Unknown"
-	if nameNode != nil {
-		name = t.text(nameNode)
-	}
-
-	// If no body, emit a placeholder comment (backwards compatible).
+	// Bodyless spies are rejected during the first pass. If one reaches codegen,
+	// emit nothing rather than a placeholder comment.
 	bodyNode := t.childByField(n, "body")
 	if bodyNode == nil {
-		return fmt.Sprintf("// TODO: spy for %s — wrap real implementation with call recording", name)
+		return ""
 	}
 
 	// With a body, the struct is emitted at package level via buildSpyDecl.
@@ -419,5 +414,3 @@ func extractSingleParamName(param string) string {
 	}
 	return param
 }
-
-

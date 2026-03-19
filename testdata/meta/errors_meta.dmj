@@ -1,0 +1,60 @@
+package errorsmeta_test
+
+import (
+	"strings"
+	"testing"
+
+	danmuji "github.com/odvcencio/danmuji"
+)
+
+unit "Parse errors anchor to the failing DSL line" {
+	source := []byte(`package broken_test
+
+func helper() {
+	expect
+}
+`)
+
+	_, err := danmuji.TranspileDanmuji(source, danmuji.TranspileOptions{SourceFile: "/tmp/bad_expect.dmj"})
+
+	then "transpile fails" {
+		expect err != nil
+	}
+
+	then "the error references the real failing line" {
+		expect strings.Contains(err.Error(), "/tmp/bad_expect.dmj:4:")
+	}
+
+	then "the error keeps the DSL-specific message" {
+		expect strings.Contains(err.Error(), `expected expression after "expect"`)
+	}
+
+	then "the error does not collapse to line one" {
+		reject strings.Contains(err.Error(), "/tmp/bad_expect.dmj:1:1")
+	}
+}
+
+unit "Bodyless spies are rejected semantically" {
+	source := []byte(`package spy_test
+
+import "testing"
+
+unit "spy placeholder" {
+	spy Logger
+}
+`)
+
+	_, err := danmuji.TranspileDanmuji(source, danmuji.TranspileOptions{SourceFile: "/tmp/spy_bad.dmj"})
+
+	then "transpile fails" {
+		expect err != nil
+	}
+
+	then "the error references the spy line" {
+		expect strings.Contains(err.Error(), "/tmp/spy_bad.dmj:6:")
+	}
+
+	then "the error explains the contract" {
+		expect strings.Contains(err.Error(), "spy Logger must declare at least one method")
+	}
+}

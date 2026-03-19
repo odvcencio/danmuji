@@ -354,7 +354,6 @@ func (t *dmjTranspiler) emitProperty(n *gotreesitter.Node) string {
 	t.emitPropertyBody(&b, bodyNode, "\t")
 	t.inPropertyBlock = oldInProperty
 
-	fmt.Fprintf(&b, "\treturn true\n")
 	fmt.Fprintf(&b, "}, &quick.Config{MaxCount: %s}); err != nil {\n", maxCount)
 	if len(name) > 0 {
 		fmt.Fprintf(&b, "\t\t%[1]s.Fatalf(\"danmuji:%[2]d property %%s failed: %%v\", %[3]q, err)\n", t.testVar, line, name)
@@ -424,5 +423,4 @@ func (t *dmjTranspiler) pollingDuration(durationNode *gotreesitter.Node, mode st
 	}
 	return normalizeDurationExpression(strings.TrimSpace(t.text(durationNode)), "1 * time.Second")
 }
-
 

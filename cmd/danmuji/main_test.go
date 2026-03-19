@@ -137,6 +137,42 @@ unit "nested" {
 	}
 }
 
+func TestBuildRecursiveAggregatesErrors(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeFile(t, filepath.Join(tmpDir, "good_test.dmj"), `package good_test
+
+import "testing"
+
+unit "good" {
+	then "works" {
+		expect true
+	}
+}
+`)
+	writeFile(t, filepath.Join(tmpDir, "bad_test.dmj"), `package bad_test
+
+func helper() {
+		expect
+}
+`)
+
+	err := build(tmpDir, false)
+	if err == nil {
+		t.Fatal("expected build to report aggregated transpile errors")
+	}
+	if !strings.Contains(err.Error(), `expected expression after "expect"`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(err.Error(), ":1:1: expected expression after \"expect\"") {
+		t.Fatalf("expected error to anchor near the invalid expect, got %v", err)
+	}
+
+	outputFile := filepath.Join(tmpDir, "good_danmuji_test.go")
+	if _, statErr := os.Stat(outputFile); statErr != nil {
+		t.Fatalf("expected successful file to still be generated: %v", statErr)
+	}
+}
+
 func TestBuildSingleFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	dmjPath := filepath.Join(tmpDir, "single.dmj")

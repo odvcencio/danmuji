@@ -1,0 +1,61 @@
+package transpilemeta_test
+
+import (
+	"strings"
+	"testing"
+
+	danmuji "github.com/odvcencio/danmuji"
+)
+
+unit "TranspileDanmuji emits test code" {
+	source := []byte(`package arithmetic_test
+
+import "testing"
+
+unit "arithmetic" {
+	then "adds" {
+		expect 1 + 1 == 2
+	}
+}
+`)
+
+	goCode, err := danmuji.TranspileDanmuji(source, danmuji.TranspileOptions{SourceFile: "/tmp/arithmetic.dmj"})
+
+	then "transpile succeeds" {
+		expect err == nil
+	}
+
+	then "generates a test function" {
+		expect strings.Contains(goCode, "func TestArithmetic(t *testing.T)")
+	}
+
+	then "emits line directives when a source file is set" {
+		expect strings.Contains(goCode, "//line /tmp/arithmetic.dmj:")
+	}
+}
+
+unit "TranspileDanmuji debug mode omits line directives" {
+	source := []byte(`package arithmetic_test
+
+import "testing"
+
+unit "arithmetic" {
+	then "adds" {
+		expect 1 + 1 == 2
+	}
+}
+`)
+
+	goCode, err := danmuji.TranspileDanmuji(source, danmuji.TranspileOptions{
+		SourceFile: "/tmp/arithmetic.dmj",
+		Debug:      true,
+	})
+
+	then "transpile succeeds" {
+		expect err == nil
+	}
+
+	then "line directives are omitted" {
+		reject strings.Contains(goCode, "//line")
+	}
+}

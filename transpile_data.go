@@ -23,7 +23,6 @@ func (t *dmjTranspiler) emitEachDo(n *gotreesitter.Node) string {
 
 	// Collect defaults
 	defaults := make(map[string]string) // field_name → default_value_source
-	var defaultsOrder []string
 
 	// Collect scenario entries
 	type scenarioEntry struct {
@@ -40,6 +39,7 @@ func (t *dmjTranspiler) emitEachDo(n *gotreesitter.Node) string {
 			allFields = append(allFields, f)
 		}
 	}
+	addField("name")
 
 	// Walk the scenarios block to find defaults_block and scenario_entry nodes.
 	scenariosBlock := t.childByField(n, "scenarios")
@@ -49,7 +49,6 @@ func (t *dmjTranspiler) emitEachDo(n *gotreesitter.Node) string {
 			case "defaults_block":
 				t.extractScenarioFields(child, func(key, val string) {
 					defaults[key] = val
-					defaultsOrder = append(defaultsOrder, key)
 					addField(key)
 				})
 			case "scenario_entry":
@@ -77,7 +76,7 @@ func (t *dmjTranspiler) emitEachDo(n *gotreesitter.Node) string {
 
 	// Emit scenario slice
 	fmt.Fprintf(&b, "scenarios := []%s{\n", structName)
-	for _, sc := range scenarios {
+	for idx, sc := range scenarios {
 		b.WriteString("\t{")
 		for i, f := range allFields {
 			if i > 0 {
@@ -87,6 +86,8 @@ func (t *dmjTranspiler) emitEachDo(n *gotreesitter.Node) string {
 				fmt.Fprintf(&b, "%s: %s", f, val)
 			} else if defVal, ok := defaults[f]; ok {
 				fmt.Fprintf(&b, "%s: %s", f, defVal)
+			} else if f == "name" {
+				fmt.Fprintf(&b, "%s: %q", f, fmt.Sprintf("scenario_%d", idx+1))
 			} else {
 				fmt.Fprintf(&b, "%s: nil", f)
 			}
@@ -358,4 +359,3 @@ func (t *dmjTranspiler) emitEachRow(n *gotreesitter.Node) string {
 
 	return b.String()
 }
-

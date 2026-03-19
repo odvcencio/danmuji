@@ -71,6 +71,9 @@ func TranspileDanmuji(source []byte, opts TranspileOptions) (string, error) {
 	}
 	// First pass: collect package-level declarations (mocks)
 	tr.collectTopLevel(root)
+	if err := tr.semanticError(); err != nil {
+		return "", err
+	}
 	// Second pass: emit the code
 	output := tr.emit(root)
 
@@ -124,6 +127,14 @@ type dmjTranspiler struct {
 	pollingHelpersEmitted bool
 	// Whether the syncBuffer type has been collected for package-level emission.
 	syncBufferEmitted bool
+	// Semantic diagnostics discovered during transpilation.
+	semanticErrors []transpileDiagnostic
+}
+
+type transpileDiagnostic struct {
+	line    int
+	message string
+	hint    string
 }
 
 // addImport records a package path that should be injected into the import block.
@@ -178,6 +189,41 @@ func (t *dmjTranspiler) popContext() {
 	t.contextStack = t.contextStack[:len(t.contextStack)-1]
 }
 
+func (t *dmjTranspiler) addSemanticError(n *gotreesitter.Node, message, hint string) {
+	line := 1
+	if n != nil {
+		line = t.lineOf(n)
+	}
+	t.semanticErrors = append(t.semanticErrors, transpileDiagnostic{
+		line:    line,
+		message: message,
+		hint:    hint,
+	})
+}
+
+func (t *dmjTranspiler) semanticError() error {
+	if len(t.semanticErrors) == 0 {
+		return nil
+	}
+
+	var b strings.Builder
+	for i, diag := range t.semanticErrors {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		location := fmt.Sprintf("danmuji:%d", diag.line)
+		if t.sourceFile != "" {
+			location = fmt.Sprintf("%s:%d", t.sourceFile, diag.line)
+		}
+		fmt.Fprintf(&b, "%s: %s", location, diag.message)
+		if diag.hint != "" {
+			fmt.Fprintf(&b, "\n   hint: %s", diag.hint)
+		}
+	}
+
+	return fmt.Errorf("%s", b.String())
+}
+
 func (t *dmjTranspiler) expectFailureContext(prefix, rawText string, n *gotreesitter.Node) string {
 	line := t.lineOf(n)
 	context := t.assertContextString()
@@ -216,6 +262,16 @@ func (t *dmjTranspiler) collectTopLevel(n *gotreesitter.Node) {
 		return
 	}
 	if nt == "spy_declaration" {
+		if t.childByField(n, "body") == nil {
+			name := "spy"
+			if nameNode := t.childByField(n, "name"); nameNode != nil {
+				name = t.text(nameNode)
+			}
+			t.addSemanticError(n,
+				fmt.Sprintf("spy %s must declare at least one method", name),
+				fmt.Sprintf("spy %s { Publish(topic string) }", name))
+			return
+		}
 		decl := t.buildSpyDecl(n)
 		if decl != "" {
 			t.mockDecls = append(t.mockDecls, decl)

@@ -402,20 +402,7 @@ func formatSingleError(source []byte, errNode *gotreesitter.Node, lang *gotreesi
 	sourceFile string, expectations map[string]*ProductionExpectations) string {
 
 	// Position information (0-indexed).
-	startPt := errNode.StartPoint()
-	endPt := errNode.EndPoint()
-	row := int(startPt.Row)
-	col := int(startPt.Column)
-
-	// For multi-line errors, clamp the underline to the end of the first line.
-	endCol := int(endPt.Column)
-	if endPt.Row != startPt.Row {
-		// Clamp to end of the starting line.
-		lines := strings.Split(string(source), "\n")
-		if row < len(lines) {
-			endCol = len(lines[row])
-		}
-	}
+	row, col, endCol := diagnosticSpan(source, errNode)
 
 	var message, example string
 
@@ -486,6 +473,88 @@ func formatSingleError(source []byte, errNode *gotreesitter.Node, lang *gotreesi
 
 	srcCtx := formatSourceLine(source, row, col, endCol)
 	return formatError(sourceFile, row, col, message, srcCtx, example)
+}
+
+func diagnosticSpan(source []byte, errNode *gotreesitter.Node) (row, col, endCol int) {
+	startPt := errNode.StartPoint()
+	endPt := errNode.EndPoint()
+	row = int(startPt.Row)
+	col = int(startPt.Column)
+	endCol = int(endPt.Column)
+
+	if kw, _ := scanForKeyword(errNode.Text(source), keywordToProduction); kw != "" {
+		if start, end, ok := keywordSpanInNode(source, errNode, kw); ok {
+			row, col = byteOffsetToPoint(source, start)
+			endRow, keywordEndCol := byteOffsetToPoint(source, end)
+			if endRow == row {
+				endCol = keywordEndCol
+			} else {
+				endCol = col + len(kw)
+			}
+		}
+	}
+
+	if endCol <= col || endPt.Row != startPt.Row {
+		lines := strings.Split(string(source), "\n")
+		if row >= 0 && row < len(lines) {
+			endCol = len(lines[row])
+		}
+	}
+	if endCol <= col {
+		endCol = col + 1
+	}
+
+	return row, col, endCol
+}
+
+func keywordSpanInNode(source []byte, errNode *gotreesitter.Node, keyword string) (start, end int, ok bool) {
+	text := errNode.Text(source)
+	localStart, localEnd, ok := findKeywordSpan(text, keyword)
+	if !ok {
+		return 0, 0, false
+	}
+	base := int(errNode.StartByte())
+	return base + localStart, base + localEnd, true
+}
+
+func findKeywordSpan(text, keyword string) (start, end int, ok bool) {
+	limit := len(text) - len(keyword)
+	for i := 0; i <= limit; i++ {
+		if text[i:i+len(keyword)] != keyword {
+			continue
+		}
+		beforeOK := i == 0 || !isIdentifierByte(text[i-1])
+		afterIdx := i + len(keyword)
+		afterOK := afterIdx == len(text) || !isIdentifierByte(text[afterIdx])
+		if beforeOK && afterOK {
+			return i, afterIdx, true
+		}
+	}
+	return 0, 0, false
+}
+
+func isIdentifierByte(b byte) bool {
+	return (b >= 'a' && b <= 'z') ||
+		(b >= 'A' && b <= 'Z') ||
+		(b >= '0' && b <= '9') ||
+		b == '_'
+}
+
+func byteOffsetToPoint(source []byte, offset int) (row, col int) {
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > len(source) {
+		offset = len(source)
+	}
+	prefix := string(source[:offset])
+	row = strings.Count(prefix, "\n")
+	lastNewline := strings.LastIndexByte(prefix, '\n')
+	if lastNewline >= 0 {
+		col = len(prefix) - lastNewline - 1
+		return row, col
+	}
+	return row, len(prefix)
 }
 
 // ---------------------------------------------------------------------------
@@ -605,6 +674,9 @@ func findErrors(root *gotreesitter.Node, lang *gotreesitter.Language) []*gotrees
 
 		// Found an error node. Determine its top-level block.
 		topLevel := findTopLevelBlock(n, lang)
+		if topLevel != nil && hasNestedDiagnostic(n) {
+			return gotreesitter.WalkContinue
+		}
 		if topLevel != nil {
 			key := topLevel.StartByte()
 			if seenTopLevel[key] {
@@ -633,6 +705,16 @@ func findErrors(root *gotreesitter.Node, lang *gotreesitter.Language) []*gotrees
 	})
 
 	return errors
+}
+
+func hasNestedDiagnostic(n *gotreesitter.Node) bool {
+	for i := 0; i < int(n.ChildCount()); i++ {
+		child := n.Child(i)
+		if child.IsError() || child.IsMissing() || child.HasError() {
+			return true
+		}
+	}
+	return false
 }
 
 // findTopLevelBlock walks up from a node to find the enclosing test_block,

@@ -7,6 +7,12 @@ import (
 	gotreesitter "github.com/odvcencio/gotreesitter"
 )
 
+const (
+	processVarName       = "_danmujiProc"
+	processStdoutVarName = "_danmujiProcStdout"
+	processStderrVarName = "_danmujiProcStderr"
+)
+
 // ---------------------------------------------------------------------------
 // no_leaks_directive → goroutine leak detection via t.Cleanup
 // ---------------------------------------------------------------------------
@@ -199,123 +205,18 @@ func (t *dmjTranspiler) emitProcess(n *gotreesitter.Node) string {
 		return t.text(n)
 	}
 
-	// Walk the body for process_args, process_env, ready_clause.
-	var argsNode *gotreesitter.Node
-	var envNode *gotreesitter.Node
-	var readyNode *gotreesitter.Node
-	t.walkChildren(bodyNode, func(child *gotreesitter.Node) {
-		switch t.nodeType(child) {
-		case "process_args":
-			argsNode = child
-		case "process_env":
-			envNode = child
-		case "ready_clause":
-			readyNode = child
-		}
-	})
-
-	// Check for a sibling stop_block in the parent.
-	hasStopBlock := false
-	parent := n.Parent()
-	if parent != nil {
-		for i := 0; i < int(parent.ChildCount()); i++ {
-			sib := parent.Child(i)
-			if t.nodeType(sib) == "stop_block" {
-				hasStopBlock = true
-				break
-			}
-		}
-		// Also check grandparent (in case parent is a block/statement_list wrapper).
-		if !hasStopBlock && parent.Parent() != nil {
-			gp := parent.Parent()
-			for i := 0; i < int(gp.ChildCount()); i++ {
-				sib := gp.Child(i)
-				if t.nodeType(sib) == "stop_block" {
-					hasStopBlock = true
-					break
-				}
-			}
-		}
-	}
+	argsNode, envNode, readyNode := t.findProcessClauses(bodyNode)
+	hasStopBlock := t.hasSiblingStopBlock(n)
+	args := t.processArgs(argsNode)
 
 	tv := t.testVar
 	var b strings.Builder
 	b.WriteString(t.lineDirective(n))
-	fmt.Fprintf(&b, "{\n")
-
-	if !isRunMode {
-		t.addImport("path/filepath")
-		// Build step.
-		fmt.Fprintf(&b, "\t_buildCmd := exec.Command(\"go\", \"build\", \"-o\", filepath.Join(%s.TempDir(), %q), %q)\n", tv, binaryName, rawPath)
-		fmt.Fprintf(&b, "\t_buildOut, _buildErr := _buildCmd.CombinedOutput()\n")
-		fmt.Fprintf(&b, "\trequire.NoError(%s, _buildErr, \"go build failed: %%s\", string(_buildOut))\n", tv)
-		fmt.Fprintf(&b, "\n")
-		fmt.Fprintf(&b, "\tvar procStdout, procStderr syncBuffer\n")
-
-		// Build the command args.
-		cmdArgs := fmt.Sprintf("filepath.Join(%s.TempDir(), %q)", tv, binaryName)
-		if argsNode != nil {
-			argValNode := t.childByField(argsNode, "value")
-			if argValNode != nil {
-				argStr := strings.Trim(t.text(argValNode), "\"'`")
-				fields := strings.Fields(argStr)
-				if len(fields) > 0 {
-					var quotedArgs []string
-					for _, f := range fields {
-						quotedArgs = append(quotedArgs, fmt.Sprintf("%q", f))
-					}
-					cmdArgs += ", " + strings.Join(quotedArgs, ", ")
-				}
-			}
-		}
-		fmt.Fprintf(&b, "\tproc := exec.Command(%s)\n", cmdArgs)
-	} else {
-		// Run mode — skip build, use path directly.
-		fmt.Fprintf(&b, "\tvar procStdout, procStderr syncBuffer\n")
-
-		cmdArgs := fmt.Sprintf("%q", rawPath)
-		if argsNode != nil {
-			argValNode := t.childByField(argsNode, "value")
-			if argValNode != nil {
-				argStr := strings.Trim(t.text(argValNode), "\"'`")
-				fields := strings.Fields(argStr)
-				if len(fields) > 0 {
-					var quotedArgs []string
-					for _, f := range fields {
-						quotedArgs = append(quotedArgs, fmt.Sprintf("%q", f))
-					}
-					cmdArgs += ", " + strings.Join(quotedArgs, ", ")
-				}
-			}
-		}
-		fmt.Fprintf(&b, "\tproc := exec.Command(%s)\n", cmdArgs)
-	}
-
-	fmt.Fprintf(&b, "\tproc.Stdout = &procStdout\n")
-	fmt.Fprintf(&b, "\tproc.Stderr = &procStderr\n")
-
-	// Env.
-	if envNode != nil {
-		t.addImport("os")
-		var envPairs []string
-		for i := 0; i < int(envNode.ChildCount()); i++ {
-			child := envNode.Child(i)
-			if t.nodeType(child) == "scenario_field" {
-				keyNode := t.childByField(child, "key")
-				valNode := t.childByField(child, "value")
-				if keyNode != nil && valNode != nil {
-					key := t.text(keyNode)
-					val := strings.Trim(t.text(valNode), "\"'`")
-					envPairs = append(envPairs, fmt.Sprintf("%q", key+"="+val))
-				}
-			}
-		}
-		if len(envPairs) > 0 {
-			fmt.Fprintf(&b, "\tproc.Env = append(os.Environ(), %s)\n", strings.Join(envPairs, ", "))
-		}
-	}
-
-	fmt.Fprintf(&b, "\trequire.NoError(%s, proc.Start())\n", tv)
+	t.emitProcessCommand(&b, isRunMode, rawPath, binaryName, args, tv)
+	fmt.Fprintf(&b, "%s.Stdout = &%s\n", processVarName, processStdoutVarName)
+	fmt.Fprintf(&b, "%s.Stderr = &%s\n", processVarName, processStderrVarName)
+	t.emitProcessEnv(&b, envNode)
+	fmt.Fprintf(&b, "require.NoError(%s, %s.Start())\n", tv, processVarName)
 
 	// Readiness polling.
 	if readyNode != nil {
@@ -332,21 +233,130 @@ func (t *dmjTranspiler) emitProcess(n *gotreesitter.Node) string {
 	if !hasStopBlock {
 		t.addImport("syscall")
 		t.addImport("time")
-		fmt.Fprintf(&b, "\t%s.Cleanup(func() {\n", tv)
-		fmt.Fprintf(&b, "\t\t_ = proc.Process.Signal(syscall.SIGTERM)\n")
-		fmt.Fprintf(&b, "\t\tdone := make(chan error, 1)\n")
-		fmt.Fprintf(&b, "\t\tgo func() { done <- proc.Wait() }()\n")
-		fmt.Fprintf(&b, "\t\tselect {\n")
-		fmt.Fprintf(&b, "\t\tcase <-done:\n")
-		fmt.Fprintf(&b, "\t\tcase <-time.After(10 * time.Second):\n")
-		fmt.Fprintf(&b, "\t\t\t_ = proc.Process.Kill()\n")
-		fmt.Fprintf(&b, "\t\t\t<-done\n")
-		fmt.Fprintf(&b, "\t\t}\n")
-		fmt.Fprintf(&b, "\t})\n")
+		t.emitImplicitProcessCleanup(&b, tv)
 	}
 
-	fmt.Fprintf(&b, "}\n")
 	return b.String()
+}
+
+func (t *dmjTranspiler) findProcessClauses(bodyNode *gotreesitter.Node) (argsNode, envNode, readyNode *gotreesitter.Node) {
+	t.walkChildren(bodyNode, func(child *gotreesitter.Node) {
+		switch t.nodeType(child) {
+		case "process_args":
+			argsNode = child
+		case "process_env":
+			envNode = child
+		case "ready_clause":
+			readyNode = child
+		}
+	})
+	return argsNode, envNode, readyNode
+}
+
+func (t *dmjTranspiler) hasSiblingStopBlock(n *gotreesitter.Node) bool {
+	parent := n.Parent()
+	if parent != nil {
+		for i := 0; i < int(parent.ChildCount()); i++ {
+			sib := parent.Child(i)
+			if t.nodeType(sib) == "stop_block" {
+				return true
+			}
+		}
+		if parent.Parent() != nil {
+			gp := parent.Parent()
+			for i := 0; i < int(gp.ChildCount()); i++ {
+				sib := gp.Child(i)
+				if t.nodeType(sib) == "stop_block" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func (t *dmjTranspiler) processArgs(argsNode *gotreesitter.Node) []string {
+	if argsNode == nil {
+		return nil
+	}
+	argValNode := t.childByField(argsNode, "value")
+	if argValNode == nil {
+		return nil
+	}
+	return strings.Fields(strings.Trim(t.text(argValNode), "\"'`"))
+}
+
+func quotedProcessArgs(base string, args []string) string {
+	if len(args) == 0 {
+		return base
+	}
+
+	parts := []string{base}
+	for _, arg := range args {
+		parts = append(parts, fmt.Sprintf("%q", arg))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func (t *dmjTranspiler) emitProcessCommand(b *strings.Builder, isRunMode bool, rawPath, binaryName string, args []string, tv string) {
+	fmt.Fprintf(b, "var %s, %s syncBuffer\n", processStdoutVarName, processStderrVarName)
+
+	baseCommand := fmt.Sprintf("%q", rawPath)
+	if !isRunMode {
+		t.addImport("path/filepath")
+		fmt.Fprintf(b, "_buildCmd := exec.Command(\"go\", \"build\", \"-o\", filepath.Join(%s.TempDir(), %q), %q)\n", tv, binaryName, rawPath)
+		fmt.Fprintf(b, "_buildOut, _buildErr := _buildCmd.CombinedOutput()\n")
+		fmt.Fprintf(b, "require.NoError(%s, _buildErr, \"go build failed: %%s\", string(_buildOut))\n\n", tv)
+		baseCommand = fmt.Sprintf("filepath.Join(%s.TempDir(), %q)", tv, binaryName)
+	}
+
+	fmt.Fprintf(b, "%s := exec.Command(%s)\n", processVarName, quotedProcessArgs(baseCommand, args))
+}
+
+func (t *dmjTranspiler) emitProcessEnv(b *strings.Builder, envNode *gotreesitter.Node) {
+	envPairs := t.processEnvPairs(envNode)
+	if len(envPairs) == 0 {
+		return
+	}
+	t.addImport("os")
+	fmt.Fprintf(b, "%s.Env = append(os.Environ(), %s)\n", processVarName, strings.Join(envPairs, ", "))
+}
+
+func (t *dmjTranspiler) processEnvPairs(envNode *gotreesitter.Node) []string {
+	if envNode == nil {
+		return nil
+	}
+
+	var envPairs []string
+	for i := 0; i < int(envNode.ChildCount()); i++ {
+		child := envNode.Child(i)
+		if t.nodeType(child) != "scenario_field" {
+			continue
+		}
+		keyNode := t.childByField(child, "key")
+		valNode := t.childByField(child, "value")
+		if keyNode == nil || valNode == nil {
+			continue
+		}
+		key := t.text(keyNode)
+		val := strings.Trim(t.text(valNode), "\"'`")
+		envPairs = append(envPairs, fmt.Sprintf("%q", key+"="+val))
+	}
+	return envPairs
+}
+
+func (t *dmjTranspiler) emitImplicitProcessCleanup(b *strings.Builder, tv string) {
+	fmt.Fprintf(b, "%s.Cleanup(func() {\n", tv)
+	fmt.Fprintf(b, "\t_ = %s.Process.Signal(syscall.SIGTERM)\n", processVarName)
+	fmt.Fprintf(b, "\tdone := make(chan error, 1)\n")
+	fmt.Fprintf(b, "\tgo func() { done <- %s.Wait() }()\n", processVarName)
+	fmt.Fprintf(b, "\tselect {\n")
+	fmt.Fprintf(b, "\tcase <-done:\n")
+	fmt.Fprintf(b, "\tcase <-time.After(10 * time.Second):\n")
+	fmt.Fprintf(b, "\t\t_ = %s.Process.Kill()\n", processVarName)
+	fmt.Fprintf(b, "\t\t<-done\n")
+	fmt.Fprintf(b, "\t}\n")
+	fmt.Fprintf(b, "})\n")
 }
 
 // emitReady generates readiness polling code for a process.
@@ -401,7 +411,7 @@ func (t *dmjTranspiler) emitReady(mode, target, tv string) string {
 		fmt.Fprintf(&b, "\t\t_ready := false\n")
 		fmt.Fprintf(&b, "\t\t_deadline := time.Now().Add(30 * time.Second)\n")
 		fmt.Fprintf(&b, "\t\tfor time.Now().Before(_deadline) {\n")
-		fmt.Fprintf(&b, "\t\t\tif strings.Contains(procStdout.String(), %q) {\n", targetStr)
+		fmt.Fprintf(&b, "\t\t\tif strings.Contains(%s.String(), %q) {\n", processStdoutVarName, targetStr)
 		fmt.Fprintf(&b, "\t\t\t\t_ready = true\n")
 		fmt.Fprintf(&b, "\t\t\t\tbreak\n")
 		fmt.Fprintf(&b, "\t\t\t}\n")
@@ -499,23 +509,23 @@ func (t *dmjTranspiler) emitStop(n *gotreesitter.Node) string {
 	var b strings.Builder
 	b.WriteString(t.lineDirective(n))
 	fmt.Fprintf(&b, "%s.Cleanup(func() {\n", tv)
-	fmt.Fprintf(&b, "\t_ = proc.Process.Signal(syscall.%s)\n", signalName)
+	fmt.Fprintf(&b, "\t_ = %s.Process.Signal(syscall.%s)\n", processVarName, signalName)
 	fmt.Fprintf(&b, "\tvar exitCode int\n")
 	fmt.Fprintf(&b, "\tdone := make(chan error, 1)\n")
-	fmt.Fprintf(&b, "\tgo func() { done <- proc.Wait() }()\n")
+	fmt.Fprintf(&b, "\tgo func() { done <- %s.Wait() }()\n", processVarName)
 	fmt.Fprintf(&b, "\tselect {\n")
 	fmt.Fprintf(&b, "\tcase err := <-done:\n")
 	fmt.Fprintf(&b, "\t\tif exitErr, ok := err.(*exec.ExitError); ok {\n")
-	fmt.Fprintf(&b, "\t\t\texitCode = exitErr.ExitCode()\n")
+		fmt.Fprintf(&b, "\t\t\texitCode = exitErr.ExitCode()\n")
 	fmt.Fprintf(&b, "\t\t}\n")
 	fmt.Fprintf(&b, "\tcase <-time.After(%s):\n", timeoutExpr)
-	fmt.Fprintf(&b, "\t\t_ = proc.Process.Kill()\n")
+	fmt.Fprintf(&b, "\t\t_ = %s.Process.Kill()\n", processVarName)
 	fmt.Fprintf(&b, "\t\t<-done\n")
 	fmt.Fprintf(&b, "\t\texitCode = -1\n")
 	fmt.Fprintf(&b, "\t}\n")
 	fmt.Fprintf(&b, "\tvar stdout, stderr bytes.Buffer\n")
-	fmt.Fprintf(&b, "\tstdout.WriteString(procStdout.String())\n")
-	fmt.Fprintf(&b, "\tstderr.WriteString(procStderr.String())\n")
+	fmt.Fprintf(&b, "\tstdout.WriteString(%s.String())\n", processStdoutVarName)
+	fmt.Fprintf(&b, "\tstderr.WriteString(%s.String())\n", processStderrVarName)
 	fmt.Fprintf(&b, "\t_ = exitCode\n")
 
 	// Emit assertion statements in exec mode.
@@ -545,4 +555,3 @@ func isExpressionNode(nodeType string) bool {
 	}
 	return false
 }
-

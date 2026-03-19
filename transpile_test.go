@@ -710,15 +710,12 @@ unit "spy placeholder" {
 }
 `)
 
-	goCode, err := TranspileDanmuji(source, TranspileOptions{})
-	if err != nil {
-		t.Fatalf("transpile: %v", err)
+	_, err := TranspileDanmuji(source, TranspileOptions{})
+	if err == nil {
+		t.Fatal("expected error for bodyless spy")
 	}
-	t.Logf("Transpiled Go:\n%s", goCode)
-
-	// Without a body, spy should emit a TODO comment
-	if !strings.Contains(goCode, "// TODO: spy for Logger") {
-		t.Error("expected TODO placeholder for bodyless spy")
+	if !strings.Contains(err.Error(), "spy Logger must declare at least one method") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -1023,7 +1020,7 @@ e2e "server lifecycle" {
 	if !strings.Contains(goCode, "go build") || !strings.Contains(goCode, `exec.Command("go", "build"`) {
 		t.Error("expected go build command in output")
 	}
-	if !strings.Contains(goCode, "proc.Start()") {
+	if !strings.Contains(goCode, "_danmujiProc.Start()") {
 		t.Error("expected proc.Start() in output")
 	}
 	if !strings.Contains(goCode, "http.Get") {
@@ -1104,7 +1101,7 @@ func TestTranspileDanmujiReadyModes(t *testing.T) {
 		{
 			name:   "stdout",
 			ready:  `ready stdout "server started"`,
-			expect: "procStdout.String()",
+			expect: "_danmujiProcStdout.String()",
 		},
 		{
 			name:   "delay",
