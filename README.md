@@ -219,7 +219,11 @@ spy EventBus {
 }
 ```
 
-Wraps a real implementation. Records all calls and arguments, then delegates to `inner`. Use when you need real side effects but also want to verify they happened.
+Records all calls and arguments. If `inner` is set, calls delegate to it. If `inner` is unset, methods fall back to their declared default return (or the zero value when no default is declared). Use when you want verification plus optional pass-through to a real implementation.
+
+```go
+bus := &spyEventBus{inner: realBus}
+```
 
 A spy must declare at least one method. Bare `spy Logger` declarations are rejected during transpilation.
 
@@ -411,7 +415,11 @@ unit "goroutine check" {
 
 Captures `runtime/pprof` profiles inline with your tests. Supports: `cpu`, `mem`, `allocs`, `routines`, `blockprofile`, `mutexprofile`.
 
-Profile directives: `show top N` to print top N entries, `save "path"` to write a profile file.
+Profile directives:
+- `save "path"` writes file-backed profiles to an explicit path.
+- `show top N` records the request and logs the profile path, but does not shell out to `go tool pprof` automatically.
+
+`routines` tracks goroutine deltas inline; it does not currently write a `.pprof` file.
 
 ### Goroutine leak detection
 

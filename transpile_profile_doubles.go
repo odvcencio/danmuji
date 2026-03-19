@@ -298,12 +298,12 @@ func (t *dmjTranspiler) buildSpyDecl(n *gotreesitter.Node) string {
 	if nameNode == nil {
 		return ""
 	}
+	t.addImport("reflect")
 	spyName := t.text(nameNode)
 	structName := "spy" + spyName
 
 	bodyNode := t.childByField(n, "body")
 	if bodyNode == nil {
-		// No body — emit a TODO placeholder. Not collected at package level.
 		return ""
 	}
 
@@ -347,12 +347,23 @@ func (t *dmjTranspiler) buildSpyDecl(n *gotreesitter.Node) string {
 		argsSlice += "}"
 		fmt.Fprintf(&b, "\ts.%sArgs = append(s.%sArgs, %s)\n", m.name, m.name, argsSlice)
 
-		// Delegate to inner
+		// Delegate to inner when it has been provided.
+		fmt.Fprintf(&b, "\t_innerValue := reflect.ValueOf(s.inner)\n")
 		callArgs := strings.Join(paramNames, ", ")
 		if m.returnType != "" {
-			fmt.Fprintf(&b, "\treturn s.inner.%s(%s)\n", m.name, callArgs)
+			fmt.Fprintf(&b, "\tif _innerValue.IsValid() && !_innerValue.IsZero() {\n")
+			fmt.Fprintf(&b, "\t\treturn s.inner.%s(%s)\n", m.name, callArgs)
+			fmt.Fprintf(&b, "\t}\n")
+			if m.defaultVal != "" {
+				fmt.Fprintf(&b, "\treturn %s\n", m.defaultVal)
+			} else {
+				fmt.Fprintf(&b, "\tvar _zero %s\n", m.returnType)
+				fmt.Fprintf(&b, "\treturn _zero\n")
+			}
 		} else {
-			fmt.Fprintf(&b, "\ts.inner.%s(%s)\n", m.name, callArgs)
+			fmt.Fprintf(&b, "\tif _innerValue.IsValid() && !_innerValue.IsZero() {\n")
+			fmt.Fprintf(&b, "\t\ts.inner.%s(%s)\n", m.name, callArgs)
+			fmt.Fprintf(&b, "\t}\n")
 		}
 
 		fmt.Fprintf(&b, "}\n\n")

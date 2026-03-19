@@ -18,6 +18,7 @@ const manualHighlightQueries = `
 (matrix_field key: (identifier) @property)
 (process_block path: (_) @string)
 (ready_clause target: (_) @string)
+(profile_directive (_) @string)
 `
 
 func expectedHighlightQuery() string {
@@ -296,6 +297,11 @@ benchmark "leaf bench" {
 		_ = 2
 	}
 }
+
+unit "profile leaves" {
+	profile mem save "mem.pprof" {}
+	profile cpu show top 5 {}
+}
 `)
 
 	assertCaptureTexts(t, captures, "keyword",
@@ -303,10 +309,11 @@ benchmark "leaf bench" {
 		"process", "ready", "tcp", "stdout", "stop", "signal", "timeout", "expect", "exit_code",
 		"load", "rate", "duration", "rampup", "concurrency", "target", "post",
 		"benchmark", "setup", "parallel", "measure",
+		"profile", "mem", "cpu", "save", "show", "top",
 	)
 	assertCaptureTexts(t, captures, "constant", "SIGINT")
 	assertCaptureTexts(t, captures, "string",
-		`"verify leaves"`, `"process leaves"`, `"./cmd/server"`, `"127.0.0.1:1234"`, `"ready"`, `"leaf load"`, `"leaf bench"`,
+		`"verify leaves"`, `"process leaves"`, `"./cmd/server"`, `"127.0.0.1:1234"`, `"ready"`, `"leaf load"`, `"leaf bench"`, `"mem.pprof"`,
 	)
 }
 

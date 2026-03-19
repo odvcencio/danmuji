@@ -185,3 +185,4 @@
 (matrix_field key: (identifier) @property)
 (process_block path: (_) @string)
 (ready_clause target: (_) @string)
+(profile_directive (_) @string)

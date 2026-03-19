@@ -105,6 +105,8 @@ type dmjTranspiler struct {
 	// Package-level mock declarations collected during first pass.
 	// These are emitted before the test function that contained them.
 	mockDecls []string
+	// Set of package-level declaration bodies already collected for this file.
+	packageDeclSeen map[string]bool
 	// Set of mock_declaration nodes (by start byte) that have been collected
 	// so emit() can skip emitting them inline.
 	collectedMockStarts map[uint32]bool
@@ -149,6 +151,20 @@ func (t *dmjTranspiler) addImport(pkg string) {
 		t.neededImports = make(map[string]bool)
 	}
 	t.neededImports[pkg] = true
+}
+
+func (t *dmjTranspiler) appendPackageDecl(decl string) {
+	if strings.TrimSpace(decl) == "" {
+		return
+	}
+	if t.packageDeclSeen == nil {
+		t.packageDeclSeen = make(map[string]bool)
+	}
+	if t.packageDeclSeen[decl] {
+		return
+	}
+	t.packageDeclSeen[decl] = true
+	t.mockDecls = append(t.mockDecls, decl)
 }
 
 func (t *dmjTranspiler) text(n *gotreesitter.Node) string {
@@ -266,12 +282,12 @@ func (t *dmjTranspiler) collectTopLevel(n *gotreesitter.Node) {
 		}
 	}
 	if nt == "mock_declaration" {
-		t.mockDecls = append(t.mockDecls, t.buildMockDecl(n))
+		t.appendPackageDecl(t.buildMockDecl(n))
 		t.collectedMockStarts[n.StartByte()] = true
 		return
 	}
 	if nt == "fake_declaration" {
-		t.mockDecls = append(t.mockDecls, t.buildFakeDecl(n))
+		t.appendPackageDecl(t.buildFakeDecl(n))
 		t.collectedMockStarts[n.StartByte()] = true
 		return
 	}
@@ -288,7 +304,7 @@ func (t *dmjTranspiler) collectTopLevel(n *gotreesitter.Node) {
 		}
 		decl := t.buildSpyDecl(n)
 		if decl != "" {
-			t.mockDecls = append(t.mockDecls, decl)
+			t.appendPackageDecl(decl)
 			t.collectedMockStarts[n.StartByte()] = true
 		}
 		return
@@ -350,7 +366,7 @@ func (c *fakeClock) SetLocation(loc *time.Location) {
 }
 
 		`
-		t.mockDecls = append(t.mockDecls, t.fakeClockTypeDecl)
+		t.appendPackageDecl(t.fakeClockTypeDecl)
 		// Don't return — continue recursion to find nested mocks
 	}
 	if (nt == "eventually_block" || nt == "consistently_block" || nt == "property_block" ||
@@ -358,13 +374,13 @@ func (c *fakeClock) SetLocation(loc *time.Location) {
 		t.pollingHelpersEmitted = true
 		t.addImport("reflect")
 		t.addImport("strings")
-		t.mockDecls = append(t.mockDecls, pollingAssertionHelpers)
+		t.appendPackageDecl(pollingAssertionHelpers)
 	}
 	if nt == "process_block" && !t.syncBufferEmitted {
 		t.syncBufferEmitted = true
 		t.addImport("sync")
 		t.addImport("bytes")
-		t.mockDecls = append(t.mockDecls, syncBufferHelper)
+		t.appendPackageDecl(syncBufferHelper)
 		// Don't return — continue recursion to find nested mocks
 	}
 	for i := 0; i < int(n.ChildCount()); i++ {

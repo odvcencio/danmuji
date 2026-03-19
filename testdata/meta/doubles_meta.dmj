@@ -2,6 +2,24 @@ package doublesmeta_test
 
 import "testing"
 
+type EventBus interface {
+	Publish(topic string)
+	Subscribe(topic string) error
+}
+
+type recordingBus struct {
+	topics []string
+}
+
+func (b *recordingBus) Publish(topic string) {
+	b.topics = append(b.topics, topic)
+}
+
+func (b *recordingBus) Subscribe(topic string) error {
+	b.topics = append(b.topics, "sub:"+topic)
+	return nil
+}
+
 unit "mock methods track calls" {
 	mock Repo {
 		Save(name string) -> error = nil
@@ -31,5 +49,45 @@ unit "fake methods execute their real bodies" {
 
 	then "fake implementation runs" {
 		expect result == 5
+	}
+}
+
+unit "spies record calls and fall back safely" {
+	spy EventBus {
+		Publish(topic string)
+		Subscribe(topic string) -> error = nil
+	}
+
+	bus := &spyEventBus{}
+	err := bus.Subscribe("alerts")
+	bus.Publish("alerts")
+
+	then "default return is used when inner is unset" {
+		expect err == nil
+	}
+
+	then "spy verification can match recorded arguments" {
+		verify bus.Publish called with ("alerts")
+	}
+}
+
+unit "spies delegate to inner when provided" {
+	spy EventBus {
+		Publish(topic string)
+		Subscribe(topic string) -> error = nil
+	}
+
+	realBus := &recordingBus{}
+	bus := &spyEventBus{inner: realBus}
+	err := bus.Subscribe("alerts")
+	bus.Publish("alerts")
+
+	then "delegation preserves side effects" {
+		expect len(realBus.topics) == 2
+		expect realBus.topics contains "alerts"
+	}
+
+	then "delegation preserves return values" {
+		expect err == nil
 	}
 }

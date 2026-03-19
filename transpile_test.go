@@ -699,8 +699,14 @@ unit "with spy" {
 	if !strings.Contains(goCode, "SubscribeCalls") {
 		t.Error("expected SubscribeCalls counter")
 	}
+	if !strings.Contains(goCode, "reflect.ValueOf(s.inner)") {
+		t.Error("expected zero-value inner guard")
+	}
 	if !strings.Contains(goCode, ".inner.") {
 		t.Error("expected .inner. delegation call")
+	}
+	if !strings.Contains(goCode, "return nil") {
+		t.Error("expected default return fallback for nil inner")
 	}
 }
 

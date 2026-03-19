@@ -1,9 +1,29 @@
 package inframeta_test
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
 
 unit "goroutine profiling composes with normal assertions" {
 	profile routines {}
+
+	then "the unit still runs" {
+		expect true
+	}
+}
+
+unit "memory profiles can be saved to disk" {
+	profile mem save "mem_profile.pprof" {}
+
+	then "profile file exists" {
+		_, err := os.Stat("mem_profile.pprof")
+		expect err == nil
+	}
+}
+
+unit "show top directives are accepted" {
+	profile mem show top 5 {}
 
 	then "the unit still runs" {
 		expect true
