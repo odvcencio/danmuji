@@ -1,0 +1,11 @@
+package needsmeta_test
+
+import "testing"
+
+integration "redis dependency starts" {
+	needs redis cache {}
+
+	then "container setup succeeds" {
+		expect true
+	}
+}

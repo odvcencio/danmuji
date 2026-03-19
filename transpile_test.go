@@ -180,6 +180,12 @@ integration "with database" {
 	if !strings.Contains(goCode, "GenericContainer") {
 		t.Error("expected testcontainers.GenericContainer in generated code")
 	}
+	if !strings.Contains(goCode, `ExposedPorts: []string{"5432/tcp"}`) {
+		t.Error("expected service port to be exposed")
+	}
+	if !strings.Contains(goCode, `dbContainer.Endpoint(ctx, "5432/tcp")`) {
+		t.Error("expected Endpoint to use a string port argument")
+	}
 	if !strings.Contains(goCode, "require.NoError") {
 		t.Error("expected require.NoError in generated code")
 	}
@@ -268,6 +274,9 @@ load "api throughput" {
 	if !strings.Contains(goCode, "vegeta.NewAttacker") {
 		t.Error("expected vegeta.NewAttacker in output")
 	}
+	if !strings.HasPrefix(goCode, "//go:build e2e\n\npackage load_test") {
+		t.Error("expected load build tag at the top of the generated file")
+	}
 	if !strings.Contains(goCode, "duration := 5 * time.Second") {
 		t.Error("expected duration literal normalization in output")
 	}
@@ -276,6 +285,40 @@ load "api throughput" {
 	}
 	if !strings.Contains(goCode, "func TestLoadApiThroughput") {
 		t.Error("expected TestLoadApiThroughput function")
+	}
+}
+
+func TestTranspileDanmujiMixedNumericComparisonCompile(t *testing.T) {
+	source := []byte(`package numeric_test
+
+import "testing"
+
+unit "mixed numeric comparison" {
+	then "int64 compares against literal" {
+		var count int64 = 1
+		expect count > 0
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+
+	if !strings.Contains(goCode, "assert.True(t, count > 0") {
+		t.Error("expected relational comparisons to emit boolean assertions")
+	}
+
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "numeric_test.go", goCode)
+
+	runCmd := exec.Command("go", "test", "-v", "./...")
+	runCmd.Dir = tmpDir
+	out, err := runCmd.CombinedOutput()
+	t.Logf("go test output:\n%s", string(out))
+	if err != nil {
+		t.Fatalf("go test failed: %v\n%s", err, out)
 	}
 }
 
@@ -1072,6 +1115,27 @@ e2e "run binary" {
 	}
 	if !strings.Contains(goCode, `exec.Command("./bin/mytool"`) {
 		t.Error("expected direct exec.Command with path")
+	}
+}
+
+func TestTranspileDanmujiProcessQuotedArgs(t *testing.T) {
+	source := []byte(`package tool_test
+
+import "testing"
+
+e2e "quoted args" {
+	process run "./bin/mytool" {
+		args "--verbose --message 'hello world'"
+	}
+}
+`)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+
+	if !strings.Contains(goCode, `"--verbose", "--message", "hello world"`) {
+		t.Fatalf("expected quoted process args to be preserved, got:\n%s", goCode)
 	}
 }
 

@@ -1,0 +1,18 @@
+package processrunmeta_test
+
+import "testing"
+
+integration "process run uses prebuilt binary" {
+	process run "./bin/readytool" {
+		args "--ready prebuilt --message 'hello world'"
+		ready stdout "prebuilt"
+	}
+
+	stop {
+		signal SIGTERM
+		timeout 5s
+		expect exit_code == 0
+		expect stdout contains "hello world"
+		expect stderr contains "shutdown complete"
+	}
+}

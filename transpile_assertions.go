@@ -211,16 +211,16 @@ func (t *dmjTranspiler) emitExpectAssertion(n *gotreesitter.Node) string {
 			return ld + fmt.Sprintf("assert.NotEqual(%s, %s, %s, %s)", t.testVar, rT, lT, msg)
 		case "<":
 			t.addImport("github.com/stretchr/testify/assert")
-			return ld + fmt.Sprintf("assert.Less(%s, %s, %s, %s)", t.testVar, lT, rT, msg)
+			return ld + fmt.Sprintf("assert.True(%s, %s < %s, %s)", t.testVar, lT, rT, msg)
 		case ">":
 			t.addImport("github.com/stretchr/testify/assert")
-			return ld + fmt.Sprintf("assert.Greater(%s, %s, %s, %s)", t.testVar, lT, rT, msg)
+			return ld + fmt.Sprintf("assert.True(%s, %s > %s, %s)", t.testVar, lT, rT, msg)
 		case "<=":
 			t.addImport("github.com/stretchr/testify/assert")
-			return ld + fmt.Sprintf("assert.LessOrEqual(%s, %s, %s, %s)", t.testVar, lT, rT, msg)
+			return ld + fmt.Sprintf("assert.True(%s, %s <= %s, %s)", t.testVar, lT, rT, msg)
 		case ">=":
 			t.addImport("github.com/stretchr/testify/assert")
-			return ld + fmt.Sprintf("assert.GreaterOrEqual(%s, %s, %s, %s)", t.testVar, lT, rT, msg)
+			return ld + fmt.Sprintf("assert.True(%s, %s >= %s, %s)", t.testVar, lT, rT, msg)
 		}
 	}
 
@@ -423,4 +423,3 @@ func (t *dmjTranspiler) pollingDuration(durationNode *gotreesitter.Node, mode st
 	}
 	return normalizeDurationExpression(strings.TrimSpace(t.text(durationNode)), "1 * time.Second")
 }
-

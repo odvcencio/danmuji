@@ -281,6 +281,12 @@ func (t *dmjTranspiler) collectTopLevel(n *gotreesitter.Node) {
 			t.fileCategories[t.text(categoryNode)] = true
 		}
 	}
+	if nt == "load_block" {
+		if t.fileCategories == nil {
+			t.fileCategories = make(map[string]bool)
+		}
+		t.fileCategories["e2e"] = true
+	}
 	if nt == "mock_declaration" {
 		t.appendPackageDecl(t.buildMockDecl(n))
 		t.collectedMockStarts[n.StartByte()] = true

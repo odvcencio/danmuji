@@ -249,7 +249,11 @@ func (t *dmjTranspiler) emitNeedsBlock(n *gotreesitter.Node) string {
 	fmt.Fprintf(&b, "\tctx := context.Background()\n")
 	fmt.Fprintf(&b, "\t%sReq := testcontainers.ContainerRequest{\n", varName)
 	fmt.Fprintf(&b, "\t\tImage:  %q,\n", serviceImage)
-	fmt.Fprintf(&b, "\t\tExposedPorts: []string{},\n")
+	if waitForPort {
+		fmt.Fprintf(&b, "\t\tExposedPorts: []string{%q},\n", servicePort)
+	} else {
+		fmt.Fprintf(&b, "\t\tExposedPorts: []string{},\n")
+	}
 	if waitForPort {
 		fmt.Fprintf(&b, "\t\tWaitingFor:   wait.ForListeningPort(nat.Port(%q)),\n", servicePort)
 	}
@@ -261,7 +265,7 @@ func (t *dmjTranspiler) emitNeedsBlock(n *gotreesitter.Node) string {
 	fmt.Fprintf(&b, "\trequire.NoError(%s, err)\n", tv)
 	fmt.Fprintf(&b, "\t%s.Cleanup(func() { _ = %sContainer.Terminate(ctx) })\n", tv, varName)
 	if waitForPort {
-		fmt.Fprintf(&b, "\t%sEndpoint, err := %sContainer.Endpoint(ctx, nat.Port(%q))\n", varName, varName, servicePort)
+		fmt.Fprintf(&b, "\t%sEndpoint, err := %sContainer.Endpoint(ctx, %q)\n", varName, varName, servicePort)
 		fmt.Fprintf(&b, "\trequire.NoError(%s, err)\n", tv)
 		fmt.Fprintf(&b, "\t_ = %sEndpoint\n", varName)
 	}
@@ -336,9 +340,6 @@ func (t *dmjTranspiler) emitLoad(n *gotreesitter.Node) string {
 	})
 
 	var b strings.Builder
-
-	// Build constraint
-	fmt.Fprintf(&b, "//go:build e2e\n\n")
 
 	// Function signature
 	fmt.Fprintf(&b, "func TestLoad%s(t *testing.T) {\n", name)

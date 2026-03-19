@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode"
 	gotreesitter "github.com/odvcencio/gotreesitter"
 )
 
@@ -283,7 +284,52 @@ func (t *dmjTranspiler) processArgs(argsNode *gotreesitter.Node) []string {
 	if argValNode == nil {
 		return nil
 	}
-	return strings.Fields(strings.Trim(t.text(argValNode), "\"'`"))
+	return splitProcessArgs(strings.Trim(t.text(argValNode), "\"'`"))
+}
+
+func splitProcessArgs(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+
+	var args []string
+	var current strings.Builder
+	inSingle := false
+	inDouble := false
+	escaped := false
+
+	flush := func() {
+		if current.Len() == 0 {
+			return
+		}
+		args = append(args, current.String())
+		current.Reset()
+	}
+
+	for _, r := range raw {
+		switch {
+		case escaped:
+			current.WriteRune(r)
+			escaped = false
+		case r == '\\' && !inSingle:
+			escaped = true
+		case r == '\'' && !inDouble:
+			inSingle = !inSingle
+		case r == '"' && !inSingle:
+			inDouble = !inDouble
+		case unicode.IsSpace(r) && !inSingle && !inDouble:
+			flush()
+		default:
+			current.WriteRune(r)
+		}
+	}
+
+	if escaped {
+		current.WriteRune('\\')
+	}
+	flush()
+	return args
 }
 
 func quotedProcessArgs(base string, args []string) string {

@@ -15,3 +15,31 @@ integration "process lifecycle" {
 		expect stderr contains "shutdown complete"
 	}
 }
+
+integration "process tcp readiness" {
+	process "./cmd/server" {
+		args "--port 18082"
+		ready tcp "127.0.0.1:18082"
+	}
+
+	stop {
+		signal SIGTERM
+		timeout 5s
+		expect exit_code == 0
+	}
+}
+
+integration "process stdout readiness uses environment" {
+	process "./cmd/server" {
+		args "--port 18083"
+		env { READY_LOG: "env-ready" }
+		ready stdout "env-ready"
+	}
+
+	stop {
+		signal SIGTERM
+		timeout 5s
+		expect exit_code == 0
+		expect stderr contains "shutdown complete"
+	}
+}

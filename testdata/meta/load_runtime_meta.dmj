@@ -1,0 +1,15 @@
+package loadruntimemeta_test
+
+import "testing"
+
+load "local health endpoint" {
+	rate 5
+	duration 200ms
+	rampup 100ms
+	concurrency 2
+	target get "http://127.0.0.1:18084/health"
+
+	then "attack sends requests" {
+		expect loadRequestCount.Load() > 0
+	}
+}

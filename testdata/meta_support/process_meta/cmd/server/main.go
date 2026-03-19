@@ -11,6 +11,7 @@ import (
 
 func main() {
 	port := flag.String("port", "18081", "HTTP port")
+	readyLog := flag.String("ready-log", "", "stdout readiness marker")
 	flag.Parse()
 
 	mux := http.NewServeMux()
@@ -28,6 +29,14 @@ func main() {
 	go func() {
 		errCh <- srv.ListenAndServe()
 	}()
+
+	marker := *readyLog
+	if marker == "" {
+		marker = os.Getenv("READY_LOG")
+	}
+	if marker != "" {
+		fmt.Fprintln(os.Stdout, marker)
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
