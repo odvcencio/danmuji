@@ -1,0 +1,17 @@
+package processmeta_test
+
+import "testing"
+
+integration "process lifecycle" {
+	process "./cmd/server" {
+		args "--port 18081"
+		ready http "http://127.0.0.1:18081/health"
+	}
+
+	stop {
+		signal SIGTERM
+		timeout 5s
+		expect exit_code == 0
+		expect stderr contains "shutdown complete"
+	}
+}

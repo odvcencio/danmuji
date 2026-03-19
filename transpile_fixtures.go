@@ -2,10 +2,6 @@ package danmuji
 
 import (
 	"fmt"
-	"go/ast"
-	"go/format"
-	"go/parser"
-	"go/token"
 	"regexp"
 	"sort"
 	"strconv"
@@ -462,25 +458,20 @@ func (t *dmjTranspiler) injectImports(code string) string {
 		return code
 	}
 
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "", code, parser.ParseComments)
-	if err != nil {
-		return code
+	existing := map[string]bool{}
+	blockRe := regexp.MustCompile(`(?ms)^import\s*\(\n(.*?)\n\)`)
+	blockMatch := blockRe.FindStringSubmatchIndex(code)
+	if blockMatch != nil {
+		importPathRe := regexp.MustCompile(`"([^"]+)"`)
+		for _, match := range importPathRe.FindAllStringSubmatch(code[blockMatch[2]:blockMatch[3]], -1) {
+			existing[match[1]] = true
+		}
 	}
 
-	// Find existing imports to avoid duplicates.
-	existing := map[string]bool{}
-	for _, decl := range file.Decls {
-		gd, ok := decl.(*ast.GenDecl)
-		if !ok || gd.Tok != token.IMPORT {
-			continue
-		}
-		for _, spec := range gd.Specs {
-			is := spec.(*ast.ImportSpec)
-			if is.Path != nil {
-				existing[strings.Trim(is.Path.Value, "\"")] = true
-			}
-		}
+	singleRe := regexp.MustCompile(`(?m)^import\s+"([^"]+)"\s*$`)
+	singleMatch := singleRe.FindStringSubmatchIndex(code)
+	if singleMatch != nil {
+		existing[code[singleMatch[2]:singleMatch[3]]] = true
 	}
 
 	var imports []string
@@ -495,33 +486,56 @@ func (t *dmjTranspiler) injectImports(code string) string {
 	}
 	sort.Strings(imports)
 
-	var importDecl *ast.GenDecl
-	for _, decl := range file.Decls {
-		gd, ok := decl.(*ast.GenDecl)
-		if !ok || gd.Tok != token.IMPORT {
-			continue
+	buildImportBlock := func(paths []string) string {
+		var b strings.Builder
+		b.WriteString("import (\n")
+		for _, path := range paths {
+			fmt.Fprintf(&b, "\t%q\n", path)
 		}
-		importDecl = gd
-		break
+		b.WriteString(")")
+		return b.String()
 	}
 
-	if importDecl == nil {
-		importDecl = &ast.GenDecl{
-			Tok:   token.IMPORT,
-			Specs: []ast.Spec{},
+	if blockMatch != nil {
+		all := make([]string, 0, len(existing)+len(imports))
+		for path := range existing {
+			all = append(all, path)
 		}
-		file.Decls = append([]ast.Decl{importDecl}, file.Decls...)
+		all = append(all, imports...)
+		sort.Strings(all)
+		return code[:blockMatch[0]] + buildImportBlock(all) + code[blockMatch[1]:]
 	}
 
-	for _, path := range imports {
-		importDecl.Specs = append(importDecl.Specs, &ast.ImportSpec{Path: &ast.BasicLit{Kind: token.STRING, Value: strconv.Quote(path)}})
+	if singleMatch != nil {
+		all := []string{code[singleMatch[2]:singleMatch[3]]}
+		all = append(all, imports...)
+		sort.Strings(all)
+		return code[:singleMatch[0]] + buildImportBlock(all) + code[singleMatch[1]:]
 	}
 
-	var buf strings.Builder
-	if err := format.Node(&buf, fset, file); err != nil {
+	packageRe := regexp.MustCompile(`(?m)^package\s+\w+\s*$`)
+	packageMatch := packageRe.FindStringIndex(code)
+	if packageMatch == nil {
 		return code
 	}
 
-	return buf.String()
+	return code[:packageMatch[1]] + "\n\n" + buildImportBlock(imports) + code[packageMatch[1]:]
 }
 
+func (t *dmjTranspiler) injectBuildConstraints(code string) string {
+	if len(t.fileCategories) == 0 || t.fileCategories["unit"] {
+		return code
+	}
+
+	var tags []string
+	for _, category := range []string{"integration", "e2e"} {
+		if t.fileCategories[category] {
+			tags = append(tags, category)
+		}
+	}
+	if len(tags) == 0 {
+		return code
+	}
+
+	return fmt.Sprintf("//go:build %s\n\n%s", strings.Join(tags, " || "), code)
+}

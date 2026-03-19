@@ -1,0 +1,41 @@
+package datameta_test
+
+import "testing"
+
+unit "table rows drive row assertions" {
+	table sums {
+		| 1 | 2 | 3 |
+		| 5 | 7 | 12 |
+	}
+
+	each row in sums {
+		then "sum matches expected column" {
+			expect row.col0.(int)+row.col1.(int) == row.col2
+		}
+	}
+}
+
+unit "scenario defaults feed each-do cases" {
+	each "math scenarios" {
+		defaults { b: 0, expected: 0 }
+		{ name: "identity", a: 5, expected: 5 }
+		{ name: "sum", a: 2, b: 3, expected: 5 }
+	} do {
+		then "addition matches scenario data" {
+			result := scenario.a.(int) + scenario.b.(int)
+			expect result == scenario.expected
+		}
+	}
+}
+
+unit "matrix expands combinations" {
+	matrix "method x auth" {
+		method: { "GET", "POST" }
+		auth: { "none", "bearer" }
+	} do {
+		then "combination fields are populated" {
+			expect scenario.method not_nil
+			expect scenario.auth not_nil
+		}
+	}
+}

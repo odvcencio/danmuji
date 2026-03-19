@@ -76,6 +76,7 @@ func TranspileDanmuji(source []byte, opts TranspileOptions) (string, error) {
 	}
 	// Second pass: emit the code
 	output := tr.emit(root)
+	output = tr.injectBuildConstraints(output)
 
 	// Inject all collected imports
 	output = tr.injectImports(output)
@@ -129,6 +130,8 @@ type dmjTranspiler struct {
 	syncBufferEmitted bool
 	// Semantic diagnostics discovered during transpilation.
 	semanticErrors []transpileDiagnostic
+	// Test categories encountered in this file.
+	fileCategories map[string]bool
 }
 
 type transpileDiagnostic struct {
@@ -251,6 +254,14 @@ func (t *dmjTranspiler) collectTopLevel(n *gotreesitter.Node) {
 		t.collectedMockStarts = make(map[uint32]bool)
 	}
 	nt := t.nodeType(n)
+	if nt == "test_block" {
+		if categoryNode := t.childByField(n, "category"); categoryNode != nil {
+			if t.fileCategories == nil {
+				t.fileCategories = make(map[string]bool)
+			}
+			t.fileCategories[t.text(categoryNode)] = true
+		}
+	}
 	if nt == "mock_declaration" {
 		t.mockDecls = append(t.mockDecls, t.buildMockDecl(n))
 		t.collectedMockStarts[n.StartByte()] = true
@@ -522,16 +533,6 @@ func sanitizeTestName(name string) string {
 func (t *dmjTranspiler) emitTestBlock(n *gotreesitter.Node) string {
 	var b strings.Builder
 
-	// Extract category
-	category := ""
-	for i := 0; i < int(n.NamedChildCount()); i++ {
-		c := n.NamedChild(i)
-		if t.nodeType(c) == "test_category" {
-			category = t.text(c)
-			break
-		}
-	}
-
 	// Extract name
 	nameNode := t.childByField(n, "name")
 	name := "Test"
@@ -548,11 +549,6 @@ func (t *dmjTranspiler) emitTestBlock(n *gotreesitter.Node) string {
 				tags = append(tags, strings.TrimSpace(t.text(tc)))
 			}
 		}
-	}
-
-	// Build constraint for category
-	if category == "integration" || category == "e2e" {
-		fmt.Fprintf(&b, "//go:build %s\n\n", category)
 	}
 
 	// Emit any collected mock declarations before the function

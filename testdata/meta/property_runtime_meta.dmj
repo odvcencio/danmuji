@@ -1,0 +1,9 @@
+package propertyruntime_test
+
+import "testing"
+
+unit "property blocks run quick checks" {
+	property "addition commutes" for all (a int, b int) up to 100 {
+		expect a+b == b+a
+	}
+}

@@ -1,0 +1,10 @@
+package snapshotmeta_test
+
+import "testing"
+
+unit "snapshots capture current output" {
+	snapshot "jsonish" {
+		payload := "{\"status\":\"ok\",\"count\":2}"
+		payload
+	}
+}

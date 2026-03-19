@@ -283,11 +283,7 @@ func (t *dmjTranspiler) emitTable(n *gotreesitter.Node) string {
 	for i := 0; i < int(n.ChildCount()); i++ {
 		c := n.Child(i)
 		if t.nodeType(c) == "table_row" {
-			var cells []string
-			for j := 0; j < int(c.NamedChildCount()); j++ {
-				cell := c.NamedChild(j)
-				cells = append(cells, t.emit(cell))
-			}
+			cells := t.extractTableRowCells(c)
 			if len(cells) > maxCols {
 				maxCols = len(cells)
 			}
@@ -327,6 +323,116 @@ func (t *dmjTranspiler) emitTable(n *gotreesitter.Node) string {
 	fmt.Fprintf(&b, "_ = %s\n", tableName)
 
 	return b.String()
+}
+
+func (t *dmjTranspiler) extractTableRowCells(row *gotreesitter.Node) []string {
+	rowText := strings.TrimSpace(t.text(row))
+	if strings.Contains(rowText, "|") {
+		var cells []string
+		var current strings.Builder
+		depthParen := 0
+		depthBracket := 0
+		depthBrace := 0
+		inSingle := false
+		inDouble := false
+		inBacktick := false
+		escaped := false
+
+		flush := func() {
+			cell := strings.TrimSpace(current.String())
+			if cell != "" {
+				cells = append(cells, cell)
+			}
+			current.Reset()
+		}
+
+		for _, r := range rowText {
+			if escaped {
+				current.WriteRune(r)
+				escaped = false
+				continue
+			}
+
+			if inSingle || inDouble {
+				current.WriteRune(r)
+				if r == '\\' {
+					escaped = true
+					continue
+				}
+				if inSingle && r == '\'' {
+					inSingle = false
+				}
+				if inDouble && r == '"' {
+					inDouble = false
+				}
+				continue
+			}
+
+			if inBacktick {
+				current.WriteRune(r)
+				if r == '`' {
+					inBacktick = false
+				}
+				continue
+			}
+
+			switch r {
+			case '\'':
+				inSingle = true
+				current.WriteRune(r)
+			case '"':
+				inDouble = true
+				current.WriteRune(r)
+			case '`':
+				inBacktick = true
+				current.WriteRune(r)
+			case '(':
+				depthParen++
+				current.WriteRune(r)
+			case ')':
+				if depthParen > 0 {
+					depthParen--
+				}
+				current.WriteRune(r)
+			case '[':
+				depthBracket++
+				current.WriteRune(r)
+			case ']':
+				if depthBracket > 0 {
+					depthBracket--
+				}
+				current.WriteRune(r)
+			case '{':
+				depthBrace++
+				current.WriteRune(r)
+			case '}':
+				if depthBrace > 0 {
+					depthBrace--
+				}
+				current.WriteRune(r)
+			case '|':
+				if depthParen == 0 && depthBracket == 0 && depthBrace == 0 {
+					flush()
+					continue
+				}
+				current.WriteRune(r)
+			default:
+				current.WriteRune(r)
+			}
+		}
+
+		flush()
+		if len(cells) > 0 {
+			return cells
+		}
+	}
+
+	var cells []string
+	for j := 0; j < int(row.NamedChildCount()); j++ {
+		cell := row.NamedChild(j)
+		cells = append(cells, t.emit(cell))
+	}
+	return cells
 }
 
 // ---------------------------------------------------------------------------

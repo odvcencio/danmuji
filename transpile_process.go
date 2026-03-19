@@ -304,10 +304,12 @@ func (t *dmjTranspiler) emitProcessCommand(b *strings.Builder, isRunMode bool, r
 	baseCommand := fmt.Sprintf("%q", rawPath)
 	if !isRunMode {
 		t.addImport("path/filepath")
-		fmt.Fprintf(b, "_buildCmd := exec.Command(\"go\", \"build\", \"-o\", filepath.Join(%s.TempDir(), %q), %q)\n", tv, binaryName, rawPath)
+		fmt.Fprintf(b, "_danmujiProcDir := %s.TempDir()\n", tv)
+		fmt.Fprintf(b, "_danmujiProcBinary := filepath.Join(_danmujiProcDir, %q)\n", binaryName)
+		fmt.Fprintf(b, "_buildCmd := exec.Command(\"go\", \"build\", \"-o\", _danmujiProcBinary, %q)\n", rawPath)
 		fmt.Fprintf(b, "_buildOut, _buildErr := _buildCmd.CombinedOutput()\n")
 		fmt.Fprintf(b, "require.NoError(%s, _buildErr, \"go build failed: %%s\", string(_buildOut))\n\n", tv)
-		baseCommand = fmt.Sprintf("filepath.Join(%s.TempDir(), %q)", tv, binaryName)
+		baseCommand = "_danmujiProcBinary"
 	}
 
 	fmt.Fprintf(b, "%s := exec.Command(%s)\n", processVarName, quotedProcessArgs(baseCommand, args))

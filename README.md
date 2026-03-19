@@ -61,14 +61,14 @@ go install github.com/odvcencio/danmuji/cmd/danmuji@latest
 # Transpile a single file
 danmuji build ./path/to/user_test.dmj
 
-# Transpile all .dmj files in a directory
+# Transpile all .dmj files in a directory tree
 danmuji build ./mypackage/
 
 # Run the generated tests
 go test -v ./mypackage/...
 ```
 
-Each `.dmj` file produces a `_danmuji_test.go` file in the same directory. Put `.dmj` files next to your Go code, just like `_test.go` files.
+Directory builds recurse into subdirectories. Each `.dmj` file produces a `_danmuji_test.go` file in the same directory. Put `.dmj` files next to your Go code, just like `_test.go` files.
 
 ### Run tests directly
 
@@ -96,6 +96,7 @@ e2e "full flow" { ... }             // go test -tags=e2e ./...
 ```
 
 `integration` and `e2e` blocks emit `//go:build` tags. Plain `go test` only runs unit tests.
+For predictable filtering, keep tagged specs in their own `.dmj` files.
 
 ### Given / When / Then
 
@@ -220,6 +221,8 @@ spy EventBus {
 
 Wraps a real implementation. Records all calls and arguments, then delegates to `inner`. Use when you need real side effects but also want to verify they happened.
 
+A spy must declare at least one method. Bare `spy Logger` declarations are rejected during transpilation.
+
 ### Lifecycle hooks
 
 ```dmj
@@ -276,7 +279,7 @@ unit "AuthMiddleware" {
 }
 ```
 
-Each entry inherits from `defaults` and only specifies what changes. Generates a typed struct, slice, and `for...range` with parallel subtests.
+Each entry inherits from `defaults` and only specifies what changes. Generates a scenario struct, slice, and `for...range` with parallel subtests.
 
 ### Matrix tests
 
@@ -319,13 +322,13 @@ unit "addition" {
     }
     each row in cases {
         then "adds correctly" {
-            expect row.Col0 + row.Col1 == row.Col2
+            expect row.col0.(int) + row.col1.(int) == row.col2
         }
     }
 }
 ```
 
-Generates a typed struct per table and iterates with `for...range`.
+Generates a struct per table with `col0`, `col1`, ... `interface{}` fields and iterates with `for...range`.
 
 ### Containers (testcontainers-go)
 
@@ -531,7 +534,7 @@ Danmuji doesn't replace your existing tests. It layers on top.
 
 ## Status
 
-Working and tested. 123 tests pass across grammar parsing, transpiler output, highlight queries, and end-to-end compile-and-run tests that verify the generated Go code actually compiles and executes correctly.
+Working and tested. The suite covers grammar parsing, transpiler output, highlight queries, self-hosted `.dmj` meta specs, and end-to-end compile-and-run tests that verify the generated Go code actually compiles and executes correctly.
 
 This is an early release. The grammar and transpiler are functional but the generated code patterns may evolve.
 

@@ -1,0 +1,15 @@
+package fakeclockmeta_test
+
+import "testing"
+
+unit "fake clocks pin time" {
+	fake_clock at "2026-01-01T00:00:00Z"
+
+	then "clock starts at the configured instant" {
+		expect clock.Now().Year() == 2026
+	}
+
+	then "clock month is january" {
+		expect int(clock.Now().Month()) == 1
+	}
+}

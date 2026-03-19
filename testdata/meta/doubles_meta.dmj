@@ -1,0 +1,35 @@
+package doublesmeta_test
+
+import "testing"
+
+unit "mock methods track calls" {
+	mock Repo {
+		Save(name string) -> error = nil
+	}
+
+	repo := &mockRepo{}
+	err := repo.Save("alice")
+
+	then "default return is used" {
+		expect err == nil
+	}
+
+	then "call count increments" {
+		expect repo.SaveCalls == 1
+	}
+}
+
+unit "fake methods execute their real bodies" {
+	fake Calculator {
+		Add(a int, b int) -> int {
+			return a + b
+		}
+	}
+
+	calc := &fakeCalculator{}
+	result := calc.Add(2, 3)
+
+	then "fake implementation runs" {
+		expect result == 5
+	}
+}
