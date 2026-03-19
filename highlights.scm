@@ -175,3 +175,11 @@
 ;; process_block
 
 ;; stop_block
+
+;; Manual danmuji highlight additions
+((identifier) @keyword (#any-of? @keyword "exit_code" "stderr"))
+(signal_name) @constant
+(each_row_block table: (identifier) @variable)
+(scenario_field key: (identifier) @property)
+(matrix_field key: (identifier) @property)
+(process_block path: (_) @string)
