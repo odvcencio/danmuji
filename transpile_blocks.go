@@ -183,6 +183,16 @@ func (t *dmjTranspiler) emitStatementWithHooks(stmt *gotreesitter.Node, beforeEa
 		return t.emitBDDBlockWithHooks(stmt, "when", beforeEachHooks, afterEachHooks), true
 	case "then_block":
 		return t.emitBDDBlockWithHooks(stmt, "then", beforeEachHooks, afterEachHooks), true
+	case "each_do_block", "matrix_block", "each_row_block":
+		oldBefore := t.beforeEachHookContext
+		oldAfter := t.afterEachHookContext
+		t.beforeEachHookContext = beforeEachHooks
+		t.afterEachHookContext = afterEachHooks
+		defer func() {
+			t.beforeEachHookContext = oldBefore
+			t.afterEachHookContext = oldAfter
+		}()
+		return t.emit(stmt), true
 	default:
 		return "", false
 	}
@@ -236,19 +246,10 @@ func (t *dmjTranspiler) emitBDDBlockWithHooks(n *gotreesitter.Node, keyword stri
 	b.WriteString(t.lineDirective(n))
 	fmt.Fprintf(&b, "%s.Run(%s, func(%s *testing.T) {\n", t.testVar, descText, t.testVar)
 
-	for _, hook := range beforeEachHooks {
-		b.WriteString(t.emitBlockContentsIndented(hook, "\t"))
-	}
-	for _, hook := range afterEachHooks {
-		fmt.Fprintf(&b, "\t%s.Cleanup(func() {\n", t.testVar)
-		b.WriteString(t.emitBlockContentsIndented(hook, "\t\t"))
-		b.WriteString("\t})\n")
-	}
-
 	for i := 0; i < int(n.NamedChildCount()); i++ {
 		c := n.NamedChild(i)
 		if t.nodeType(c) == "block" {
-			b.WriteString(t.emitBlockInner(c, "\t"))
+			b.WriteString(t.emitSubtestBodyWithHooks(c, "\t", beforeEachHooks, afterEachHooks))
 			break
 		}
 	}
@@ -257,3 +258,16 @@ func (t *dmjTranspiler) emitBDDBlockWithHooks(n *gotreesitter.Node, keyword stri
 	return b.String()
 }
 
+func (t *dmjTranspiler) emitSubtestBodyWithHooks(bodyNode *gotreesitter.Node, indent string, beforeEachHooks, afterEachHooks []*gotreesitter.Node) string {
+	var b strings.Builder
+	for _, hook := range beforeEachHooks {
+		b.WriteString(t.emitBlockContentsIndented(hook, indent))
+	}
+	for _, hook := range afterEachHooks {
+		fmt.Fprintf(&b, "%s%s.Cleanup(func() {\n", indent, t.testVar)
+		b.WriteString(t.emitBlockContentsIndented(hook, indent+"\t"))
+		fmt.Fprintf(&b, "%s})\n", indent)
+	}
+	b.WriteString(t.emitBlockInner(bodyNode, indent))
+	return b.String()
+}

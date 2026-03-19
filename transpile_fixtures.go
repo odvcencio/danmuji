@@ -58,6 +58,7 @@ func (t *dmjTranspiler) buildMockDecl(n *gotreesitter.Node) string {
 	fmt.Fprintf(&b, "type %s struct {\n", structName)
 	for _, m := range methods {
 		fmt.Fprintf(&b, "\t%sCalls int\n", m.name)
+		fmt.Fprintf(&b, "\t%sArgs [][]interface{}\n", m.name)
 		if m.returnType != "" {
 			fmt.Fprintf(&b, "\t%sResult %s\n", m.name, m.returnType)
 		}
@@ -66,12 +67,23 @@ func (t *dmjTranspiler) buildMockDecl(n *gotreesitter.Node) string {
 
 	// Methods
 	for _, m := range methods {
+		paramNames := extractParamNames(m.params)
+
 		fmt.Fprintf(&b, "func (m *%s) %s%s", structName, m.name, m.params)
 		if m.returnType != "" {
 			fmt.Fprintf(&b, " %s", m.returnType)
 		}
 		fmt.Fprintf(&b, " {\n")
 		fmt.Fprintf(&b, "\tm.%sCalls++\n", m.name)
+		argsSlice := "[]interface{}{"
+		for i, pn := range paramNames {
+			if i > 0 {
+				argsSlice += ", "
+			}
+			argsSlice += pn
+		}
+		argsSlice += "}"
+		fmt.Fprintf(&b, "\tm.%sArgs = append(m.%sArgs, %s)\n", m.name, m.name, argsSlice)
 		if m.defaultVal != "" {
 			fmt.Fprintf(&b, "\treturn %s\n", m.defaultVal)
 		} else if m.returnType != "" {
@@ -137,6 +149,32 @@ func (t *dmjTranspiler) emitVerify(n *gotreesitter.Node) string {
 	if strings.Contains(assertText, "not_called") {
 		return fmt.Sprintf("if %sCalls != 0 { %s.Errorf(\"expected %%s not called, got %%d calls\", %q, %sCalls) }",
 			targetText, t.testVar, targetText, targetText)
+	}
+	if strings.Contains(assertText, "called") && strings.Contains(assertText, "with") {
+		argsExpr := ""
+		if open := strings.Index(assertText, "("); open >= 0 {
+			if close := strings.LastIndex(assertText, ")"); close > open {
+				argsExpr = strings.TrimSpace(assertText[open+1 : close])
+			}
+		}
+		expectedArgs := "[]interface{}{}"
+		if argsExpr != "" {
+			expectedArgs = fmt.Sprintf("[]interface{}{%s}", argsExpr)
+		}
+		return fmt.Sprintf(`{
+	_expectedArgs := %s
+	_matched := false
+	for _, _callArgs := range %sArgs {
+		if danmujiDeepEqual(_expectedArgs, _callArgs) {
+			_matched = true
+			break
+		}
+	}
+	if !_matched {
+		%s.Errorf("expected call to %%s with %%v, got %%v", %q, _expectedArgs, %sArgs)
+	}
+}`,
+			expectedArgs, targetText, t.testVar, targetText, targetText)
 	}
 	if strings.Contains(assertText, "called") && strings.Contains(assertText, "times") {
 		parts := strings.Fields(assertText)

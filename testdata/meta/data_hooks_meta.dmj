@@ -1,0 +1,53 @@
+package datahooksmeta_test
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+)
+
+unit "before each hooks apply to each row subtests" {
+	table sums {
+		| 1 | 2 | 3 |
+	}
+
+	before each {
+		computed := row.col0.(int) + row.col1.(int)
+	}
+
+	each row in sums {
+		then "hook code can read row values" {
+			expect computed == row.col2
+		}
+	}
+}
+
+unit "before each hooks apply to each-do scenarios" {
+	before each {
+		label := fmt.Sprintf("%v-%v", scenario.name, scenario.token)
+	}
+
+	each "auth cases" {
+		defaults { token: "valid" }
+		{ name: "ok" }
+	} do {
+		then "hook code can read scenario values" {
+			expect strings.Contains(label, "ok")
+		}
+	}
+}
+
+unit "before each hooks apply to matrix scenarios" {
+	before each {
+		combo := fmt.Sprintf("%v:%v", scenario.method, scenario.auth)
+	}
+
+	matrix "method x auth" {
+		method: { "GET" }
+		auth: { "none" }
+	} do {
+		then "hook code can read matrix dimensions" {
+			expect strings.Contains(combo, ":")
+		}
+	}
+}

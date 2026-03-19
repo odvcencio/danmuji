@@ -105,7 +105,11 @@ func (t *dmjTranspiler) emitEachDo(n *gotreesitter.Node) string {
 
 	// Emit the body
 	if bodyNode != nil {
-		b.WriteString(t.emitBlockInner(bodyNode, "\t\t"))
+		if len(t.beforeEachHookContext) > 0 || len(t.afterEachHookContext) > 0 {
+			b.WriteString(t.emitSubtestBodyWithHooks(bodyNode, "\t\t", t.beforeEachHookContext, t.afterEachHookContext))
+		} else {
+			b.WriteString(t.emitBlockInner(bodyNode, "\t\t"))
+		}
 	}
 
 	fmt.Fprintf(&b, "\t})\n")
@@ -256,7 +260,11 @@ func (t *dmjTranspiler) emitMatrix(n *gotreesitter.Node) string {
 
 	// Emit the body
 	if bodyNode != nil {
-		b.WriteString(t.emitBlockInner(bodyNode, "\t\t"))
+		if len(t.beforeEachHookContext) > 0 || len(t.afterEachHookContext) > 0 {
+			b.WriteString(t.emitSubtestBodyWithHooks(bodyNode, "\t\t", t.beforeEachHookContext, t.afterEachHookContext))
+		} else {
+			b.WriteString(t.emitBlockInner(bodyNode, "\t\t"))
+		}
 	}
 
 	fmt.Fprintf(&b, "\t})\n")
@@ -455,7 +463,11 @@ func (t *dmjTranspiler) emitEachRow(n *gotreesitter.Node) string {
 	for i := 0; i < int(n.NamedChildCount()); i++ {
 		c := n.NamedChild(i)
 		if t.nodeType(c) == "block" {
-			b.WriteString(t.emitBlockInner(c, "\t\t"))
+			if len(t.beforeEachHookContext) > 0 || len(t.afterEachHookContext) > 0 {
+				b.WriteString(t.emitSubtestBodyWithHooks(c, "\t\t", t.beforeEachHookContext, t.afterEachHookContext))
+			} else {
+				b.WriteString(t.emitBlockInner(c, "\t\t"))
+			}
 			break
 		}
 	}

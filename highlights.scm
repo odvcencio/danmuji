@@ -184,3 +184,4 @@
 (scenario_field key: (identifier) @property)
 (matrix_field key: (identifier) @property)
 (process_block path: (_) @string)
+(ready_clause target: (_) @string)

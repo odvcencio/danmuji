@@ -132,6 +132,9 @@ type dmjTranspiler struct {
 	semanticErrors []transpileDiagnostic
 	// Test categories encountered in this file.
 	fileCategories map[string]bool
+	// Active outer before/after each hooks to inject into generated subtests.
+	beforeEachHookContext []*gotreesitter.Node
+	afterEachHookContext  []*gotreesitter.Node
 }
 
 type transpileDiagnostic struct {
@@ -350,7 +353,8 @@ func (c *fakeClock) SetLocation(loc *time.Location) {
 		t.mockDecls = append(t.mockDecls, t.fakeClockTypeDecl)
 		// Don't return — continue recursion to find nested mocks
 	}
-	if (nt == "eventually_block" || nt == "consistently_block" || nt == "property_block") && !t.pollingHelpersEmitted {
+	if (nt == "eventually_block" || nt == "consistently_block" || nt == "property_block" ||
+		(nt == "verify_statement" && strings.Contains(t.text(n), "called") && strings.Contains(t.text(n), "with"))) && !t.pollingHelpersEmitted {
 		t.pollingHelpersEmitted = true
 		t.addImport("reflect")
 		t.addImport("strings")

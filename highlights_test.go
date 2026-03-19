@@ -17,6 +17,7 @@ const manualHighlightQueries = `
 (scenario_field key: (identifier) @property)
 (matrix_field key: (identifier) @property)
 (process_block path: (_) @string)
+(ready_clause target: (_) @string)
 `
 
 func expectedHighlightQuery() string {
@@ -54,13 +55,46 @@ func TestHighlightQueryCompiles(t *testing.T) {
 	}
 }
 
-func TestHighlightQueryCoversDanmujiDSL(t *testing.T) {
+func parseHighlightCaptures(t *testing.T, source string) map[string]map[string]bool {
+	t.Helper()
+
 	lang, err := getDanmujiLanguage()
 	if err != nil {
 		t.Fatalf("getDanmujiLanguage: %v", err)
 	}
 
-	source := []byte(`package highlightmeta_test
+	parser := gotreesitter.NewParser(lang)
+	tree, err := parser.Parse([]byte(source))
+	if err != nil {
+		t.Fatalf("parse highlight sample: %v", err)
+	}
+	if tree.RootNode().HasError() {
+		t.Fatalf("highlight sample did not parse cleanly")
+	}
+
+	query, err := gotreesitter.NewQuery(expectedHighlightQuery(), lang)
+	if err != nil {
+		t.Fatalf("compile highlight query: %v", err)
+	}
+
+	captures := map[string]map[string]bool{}
+	cursor := query.Exec(tree.RootNode(), lang, []byte(source))
+	for {
+		capture, ok := cursor.NextCapture()
+		if !ok {
+			break
+		}
+		if captures[capture.Name] == nil {
+			captures[capture.Name] = map[string]bool{}
+		}
+		captures[capture.Name][capture.Text([]byte(source))] = true
+	}
+
+	return captures
+}
+
+func TestHighlightQueryCoversDanmujiDSL(t *testing.T) {
+	captures := parseHighlightCaptures(t, `package highlightmeta_test
 
 import "testing"
 
@@ -198,33 +232,6 @@ benchmark "bench" {
 }
 `)
 
-	parser := gotreesitter.NewParser(lang)
-	tree, err := parser.Parse(source)
-	if err != nil {
-		t.Fatalf("parse highlight sample: %v", err)
-	}
-	if tree.RootNode().HasError() {
-		t.Fatalf("highlight sample did not parse cleanly")
-	}
-
-	query, err := gotreesitter.NewQuery(expectedHighlightQuery(), lang)
-	if err != nil {
-		t.Fatalf("compile highlight query: %v", err)
-	}
-
-	captures := map[string]map[string]bool{}
-	cursor := query.Exec(tree.RootNode(), lang, source)
-	for {
-		capture, ok := cursor.NextCapture()
-		if !ok {
-			break
-		}
-		if captures[capture.Name] == nil {
-			captures[capture.Name] = map[string]bool{}
-		}
-		captures[capture.Name][capture.Text(source)] = true
-	}
-
 	assertCaptureTexts(t, captures, "keyword",
 		"mock", "fake", "spy", "unit", "before", "after", "all", "fake_clock", "profile", "routines", "no_leaks",
 		"table", "each", "row", "defaults", "matrix", "exec", "run", "expect", "contains",
@@ -240,6 +247,66 @@ benchmark "bench" {
 	assertCaptureTexts(t, captures, "constant", "SIGTERM")
 	assertCaptureTexts(t, captures, "attribute", "@slow", "@parallel", "@skip")
 	assertCaptureTexts(t, captures, "string", `"highlight coverage"`, `"process coverage"`, `"./cmd/server"`, `"snap"`, `"bench"`)
+}
+
+func TestHighlightQueryCoversRemainingDSLLeaves(t *testing.T) {
+	captures := parseHighlightCaptures(t, `package highlightleafmeta_test
+
+import "testing"
+
+unit "verify leaves" {
+	then "verify variants" {
+		verify client.Save called with ("alice")
+		verify client.Save not_called
+		reject false
+	}
+}
+
+integration "process leaves" {
+	process "./cmd/server" {
+		ready tcp "127.0.0.1:1234"
+		ready stdout "ready"
+	}
+
+	stop {
+		signal SIGINT
+		timeout 2s
+		expect exit_code == 0
+	}
+}
+
+load "leaf load" {
+	rate 25
+	rampup 1
+	concurrency 4
+	target post "http://localhost:8080/api"
+
+	then "load target parses" {
+		expect true
+	}
+}
+
+benchmark "leaf bench" {
+	setup {
+		_ = 1
+	}
+
+	parallel measure {
+		_ = 2
+	}
+}
+`)
+
+	assertCaptureTexts(t, captures, "keyword",
+		"verify", "called", "with", "not_called", "reject",
+		"process", "ready", "tcp", "stdout", "stop", "signal", "timeout", "expect", "exit_code",
+		"load", "rate", "rampup", "concurrency", "target", "post",
+		"benchmark", "setup", "parallel", "measure",
+	)
+	assertCaptureTexts(t, captures, "constant", "SIGINT")
+	assertCaptureTexts(t, captures, "string",
+		`"verify leaves"`, `"process leaves"`, `"./cmd/server"`, `"127.0.0.1:1234"`, `"ready"`, `"leaf load"`, `"leaf bench"`,
+	)
 }
 
 func assertCaptureTexts(t *testing.T, captures map[string]map[string]bool, captureName string, texts ...string) {

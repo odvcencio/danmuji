@@ -1,0 +1,21 @@
+package verifymeta_test
+
+import "testing"
+
+mock Repo {
+	Save(name string) -> error = nil
+}
+
+unit "verify called with matches recorded arguments" {
+	repo := &mockRepo{}
+	repo.Save("alice")
+	repo.Save("bob")
+
+	then "matching arguments satisfy verification" {
+		verify repo.Save called with ("alice")
+	}
+
+	then "call counts still work alongside arg verification" {
+		verify repo.Save called 2 times
+	}
+}
