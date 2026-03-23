@@ -285,6 +285,28 @@ unit "AuthMiddleware" {
 
 Each entry inherits from `defaults` and only specifies what changes. Generates a scenario struct, slice, and `for...range` with parallel subtests.
 
+### HTTP test helpers
+
+When a `.dmj` file references `danmujiHTTP.`, danmuji injects a small helper set around `net/http/httptest`:
+
+```dmj
+unit "users handler" {
+    handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        w.WriteHeader(http.StatusCreated)
+    })
+
+    req := danmujiHTTP.POST("/users", map[string]string{"name": "alice"})
+    rec := danmujiHTTP.Serve(handler, req)
+
+    then "creates users" {
+        expect rec.Code == http.StatusCreated
+    }
+}
+```
+
+Available methods: `Request`, `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, and `Serve`.
+String bodies become plain text, `[]byte` bodies stay binary, `io.Reader` passes through, and other body values are JSON-marshaled automatically with `Content-Type: application/json`.
+
 ### Matrix tests
 
 ```dmj

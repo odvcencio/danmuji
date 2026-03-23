@@ -2,19 +2,19 @@ package danmuji
 
 import (
 	"fmt"
+	gotreesitter "github.com/odvcencio/gotreesitter"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
-	gotreesitter "github.com/odvcencio/gotreesitter"
 )
 
 // Package-level cached language and expectation map to avoid regenerating on every call.
 var (
-	danmujiLangOnce            sync.Once
-	danmujiLangCached          *gotreesitter.Language
-	danmujiLangErr             error
-	danmujiExpectationsCached  map[string]*ProductionExpectations
+	danmujiLangOnce           sync.Once
+	danmujiLangCached         *gotreesitter.Language
+	danmujiLangErr            error
+	danmujiExpectationsCached map[string]*ProductionExpectations
 )
 
 func getDanmujiLanguage() (*gotreesitter.Language, error) {
@@ -63,11 +63,12 @@ func TranspileDanmuji(source []byte, opts TranspileOptions) (string, error) {
 	}
 
 	tr := &dmjTranspiler{
-		src:                source,
-		lang:               lang,
-		testVar:            "t",
-		sourceFile:         opts.SourceFile,
-		emitLineDirectives: opts.SourceFile != "" && !opts.Debug,
+		src:                      source,
+		lang:                     lang,
+		testVar:                  "t",
+		httpTestHelpersRequested: strings.Contains(string(source), "danmujiHTTP."),
+		sourceFile:               opts.SourceFile,
+		emitLineDirectives:       opts.SourceFile != "" && !opts.Debug,
 	}
 	// First pass: collect package-level declarations (mocks)
 	tr.collectTopLevel(root)
@@ -98,6 +99,8 @@ type dmjTranspiler struct {
 	src     []byte
 	lang    *gotreesitter.Language
 	testVar string // "t" for tests, "b" for benchmarks
+	// Whether the source references danmujiHTTP helper methods.
+	httpTestHelpersRequested bool
 	// Source file path for //line directives.
 	sourceFile string
 	// Whether to emit //line directives (true when sourceFile != "" && !Debug).
@@ -130,6 +133,8 @@ type dmjTranspiler struct {
 	pollingHelpersEmitted bool
 	// Whether the syncBuffer type has been collected for package-level emission.
 	syncBufferEmitted bool
+	// Whether the danmujiHTTP helper set has been collected for package-level emission.
+	httpTestHelpersEmitted bool
 	// Semantic diagnostics discovered during transpilation.
 	semanticErrors []transpileDiagnostic
 	// Test categories encountered in this file.
@@ -286,6 +291,19 @@ func (t *dmjTranspiler) collectTopLevel(n *gotreesitter.Node) {
 			t.fileCategories = make(map[string]bool)
 		}
 		t.fileCategories["e2e"] = true
+	}
+	if nt == "source_file" && t.httpTestHelpersRequested && !t.httpTestHelpersEmitted {
+		t.httpTestHelpersEmitted = true
+		t.addImport("bytes")
+		t.addImport("encoding/json")
+		t.addImport("io")
+		t.addImport("net/http")
+		t.addImport("net/http/httptest")
+		t.addImport("strings")
+		t.appendPackageDecl(httpTestHelpers)
+	}
+	if nt == "fuzz_block" {
+		t.validateFuzzBlock(n)
 	}
 	if nt == "mock_declaration" {
 		t.appendPackageDecl(t.buildMockDecl(n))
@@ -473,6 +491,8 @@ func (t *dmjTranspiler) emit(n *gotreesitter.Node) string {
 		return t.emitConsistently(n)
 	case "property_block":
 		return t.emitProperty(n)
+	case "fuzz_block":
+		return t.emitFuzz(n)
 	case "each_do_block":
 		return t.emitEachDo(n)
 	case "matrix_block":

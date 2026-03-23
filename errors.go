@@ -208,52 +208,54 @@ type ErrorOverlay struct {
 var errorOverlays = map[string]ErrorOverlay{
 	// BDD structure
 	"given_block|given":                            {"expected string after \"given\"", "given \"description\" { ... }"},
-	"given_block|given,interpreted_string_literal":  {"expected { to open block", "given \"description\" { ... }"},
+	"given_block|given,interpreted_string_literal": {"expected { to open block", "given \"description\" { ... }"},
 	"when_block|when":                              {"expected string after \"when\"", "when \"description\" { ... }"},
-	"when_block|when,interpreted_string_literal":    {"expected { to open block", "when \"description\" { ... }"},
+	"when_block|when,interpreted_string_literal":   {"expected { to open block", "when \"description\" { ... }"},
 	"then_block|then":                              {"expected string after \"then\"", "then \"description\" { ... }"},
-	"then_block|then,interpreted_string_literal":    {"expected { to open block", "then \"description\" { ... }"},
+	"then_block|then,interpreted_string_literal":   {"expected { to open block", "then \"description\" { ... }"},
 
 	// Test blocks
-	"test_block|unit":                              {"expected string after test category", "unit \"name\" { ... }"},
-	"test_block|unit,interpreted_string_literal":    {"expected { to open test block", "unit \"name\" { ... }"},
-	"test_block|integration":                       {"expected string after test category", "integration \"name\" { ... }"},
-	"test_block|e2e":                               {"expected string after test category", "e2e \"name\" { ... }"},
+	"test_block|unit": {"expected string after test category", "unit \"name\" { ... }"},
+	"test_block|unit,interpreted_string_literal": {"expected { to open test block", "unit \"name\" { ... }"},
+	"test_block|integration":                     {"expected string after test category", "integration \"name\" { ... }"},
+	"test_block|e2e":                             {"expected string after test category", "e2e \"name\" { ... }"},
 
 	// Assertions
-	"expect_statement|expect":                      {"expected expression after \"expect\"", "expect x == 1"},
-	"reject_statement|reject":                      {"expected expression after \"reject\"", "reject ok"},
-	"verify_statement|verify":                      {"expected target after \"verify\"", "verify repo.Save called 1 times"},
+	"expect_statement|expect": {"expected expression after \"expect\"", "expect x == 1"},
+	"reject_statement|reject": {"expected expression after \"reject\"", "reject ok"},
+	"verify_statement|verify": {"expected target after \"verify\"", "verify repo.Save called 1 times"},
 
 	// Test doubles
-	"mock_declaration|mock":                        {"expected name after \"mock\"", "mock RepoName { ... }"},
-	"mock_declaration|mock,identifier":             {"expected { to open mock body", "mock RepoName { ... }"},
-	"fake_declaration|fake":                        {"expected name after \"fake\"", "fake StoreName { ... }"},
-	"spy_declaration|spy":                          {"expected name after \"spy\"", "spy BusName { ... }"},
-	"mock_method|identifier,parameter_list":        {"expected -> return_type after parameters", "Save(u User) -> error = nil"},
+	"mock_declaration|mock":                 {"expected name after \"mock\"", "mock RepoName { ... }"},
+	"mock_declaration|mock,identifier":      {"expected { to open mock body", "mock RepoName { ... }"},
+	"fake_declaration|fake":                 {"expected name after \"fake\"", "fake StoreName { ... }"},
+	"spy_declaration|spy":                   {"expected name after \"spy\"", "spy BusName { ... }"},
+	"mock_method|identifier,parameter_list": {"expected -> return_type after parameters", "Save(u User) -> error = nil"},
 
 	// Data-driven
-	"each_do_block|each":                                            {"expected string after \"each\"", "each \"scenarios\" { ... } do { ... }"},
-	"each_do_block|each,interpreted_string_literal,block":           {"expected \"do\" keyword", "each \"scenarios\" { ... } do { ... }"},
-	"matrix_block|matrix":                                           {"expected string after \"matrix\"", "matrix \"dimensions\" { ... } do { ... }"},
-	"property_block|property":                                       {"expected string after \"property\"", "property \"name\" for all (x int) { ... }"},
-	"property_block|property,interpreted_string_literal":            {"expected \"for\" keyword", "property \"name\" for all (params) { ... }"},
+	"each_do_block|each": {"expected string after \"each\"", "each \"scenarios\" { ... } do { ... }"},
+	"each_do_block|each,interpreted_string_literal,block": {"expected \"do\" keyword", "each \"scenarios\" { ... } do { ... }"},
+	"matrix_block|matrix":                                {"expected string after \"matrix\"", "matrix \"dimensions\" { ... } do { ... }"},
+	"property_block|property":                            {"expected string after \"property\"", "property \"name\" for all (x int) { ... }"},
+	"property_block|property,interpreted_string_literal": {"expected \"for\" keyword", "property \"name\" for all (params) { ... }"},
+	"fuzz_block|fuzz":                                    {"expected string after \"fuzz\"", "fuzz \"name\" with (input string) { ... }"},
+	"fuzz_block|fuzz,interpreted_string_literal":         {"expected \"with\" keyword", "fuzz \"name\" with (input string) { ... }"},
 
 	// Temporal
-	"eventually_block|eventually":                  {"expected string after \"eventually\"", "eventually \"name\" within 5s { ... }"},
-	"consistently_block|consistently":              {"expected string after \"consistently\"", "consistently \"name\" for 2s { ... }"},
+	"eventually_block|eventually":     {"expected string after \"eventually\"", "eventually \"name\" within 5s { ... }"},
+	"consistently_block|consistently": {"expected string after \"consistently\"", "consistently \"name\" for 2s { ... }"},
 
 	// Infrastructure
-	"needs_block|needs":                            {"expected service type after \"needs\"", "needs postgres db { ... }"},
-	"needs_block|needs,service_type":               {"expected identifier for service name", "needs postgres db { ... }"},
-	"benchmark_block|benchmark":                    {"expected string after \"benchmark\"", "benchmark \"name\" { ... }"},
-	"exec_block|exec":                              {"expected string after \"exec\"", "exec \"name\" { ... }"},
-	"snapshot_block|snapshot":                      {"expected string after \"snapshot\"", "snapshot \"name\" { ... }"},
+	"needs_block|needs":              {"expected service type after \"needs\"", "needs postgres db { ... }"},
+	"needs_block|needs,service_type": {"expected identifier for service name", "needs postgres db { ... }"},
+	"benchmark_block|benchmark":      {"expected string after \"benchmark\"", "benchmark \"name\" { ... }"},
+	"exec_block|exec":                {"expected string after \"exec\"", "exec \"name\" { ... }"},
+	"snapshot_block|snapshot":        {"expected string after \"snapshot\"", "snapshot \"name\" { ... }"},
 
 	// Process
-	"process_block|process":                        {"expected path after \"process\"", "process \"./cmd/server\" { ... }"},
-	"stop_block|stop":                              {"expected { to open stop block", "stop { signal SIGTERM ... }"},
-	"ready_clause|ready":                           {"expected mode (http, tcp, stdout, delay) after \"ready\"", "ready http \"http://host/health\""},
+	"process_block|process": {"expected path after \"process\"", "process \"./cmd/server\" { ... }"},
+	"stop_block|stop":       {"expected { to open stop block", "stop { signal SIGTERM ... }"},
+	"ready_clause|ready":    {"expected mode (http, tcp, stdout, delay) after \"ready\"", "ready http \"http://host/health\""},
 }
 
 // ---------------------------------------------------------------------------
@@ -273,7 +275,7 @@ var keywordToProduction = map[string]string{
 	"needs": "needs_block", "exec": "exec_block",
 	"process": "process_block", "stop": "stop_block",
 	"eventually": "eventually_block", "consistently": "consistently_block",
-	"each": "each_do_block", "matrix": "matrix_block", "property": "property_block",
+	"each": "each_do_block", "matrix": "matrix_block", "property": "property_block", "fuzz": "fuzz_block",
 	"snapshot": "snapshot_block", "profile": "profile_block", "table": "table_declaration",
 	"before": "lifecycle_hook", "after": "lifecycle_hook",
 	"ready": "ready_clause", "signal": "signal_directive", "timeout": "timeout_directive",
@@ -317,38 +319,53 @@ func inferFromKeyword(text string, kwMap map[string]string) string {
 	return ""
 }
 
-// scanForKeyword scans all words in text for a danmuji keyword, trying the
-// first word first (via inferFromKeyword), then scanning subsequent words.
-// Returns the keyword and its production name, or ("", "") if none found.
-func scanForKeyword(text string, kwMap map[string]string) (string, string) {
-	// Try first word (preserves existing inferFromKeyword behavior).
-	if prod := inferFromKeyword(text, kwMap); prod != "" {
-		kw := text
-		if idx := strings.IndexAny(text, " \t\n"); idx >= 0 {
-			kw = text[:idx]
+func keywordSignal(keyword string) int {
+	switch keyword {
+	case "unit", "integration", "e2e", "benchmark", "load":
+		return 1
+	default:
+		return 2
+	}
+}
+
+// bestKeywordMatch scans text for danmuji keywords and returns the most useful
+// one for diagnostics. Inner DSL keywords outrank outer wrappers like `unit`,
+// and later matches win ties so recovery wrappers point closer to the real
+// failure.
+func bestKeywordMatch(text string, kwMap map[string]string) (keyword, production string, start, signal int) {
+	start = -1
+	signal = -1
+
+	for i := 0; i < len(text); {
+		if !isIdentifierByte(text[i]) {
+			i++
+			continue
 		}
-		// Check compound keywords.
-		for _, ck := range []string{"no_leaks", "fake_clock"} {
-			if strings.HasPrefix(text, ck) {
-				rest := text[len(ck):]
-				if rest == "" || rest[0] == ' ' || rest[0] == '\t' || rest[0] == '\n' {
-					return ck, prod
-				}
+		j := i + 1
+		for j < len(text) && isIdentifierByte(text[j]) {
+			j++
+		}
+		word := text[i:j]
+		if prod, ok := kwMap[word]; ok {
+			wordSignal := keywordSignal(word)
+			if wordSignal > signal || (wordSignal == signal && i > start) {
+				keyword = word
+				production = prod
+				start = i
+				signal = wordSignal
 			}
 		}
-		return kw, prod
+		i = j
 	}
 
-	// Scan all words in the text for a keyword.
-	words := strings.Fields(text)
-	for _, w := range words {
-		// Strip braces/parens that may be attached to the word.
-		w = strings.TrimRight(w, "{(")
-		if prod, ok := kwMap[w]; ok {
-			return w, prod
-		}
-	}
-	return "", ""
+	return keyword, production, start, signal
+}
+
+// scanForKeyword scans all words in text for the most useful danmuji keyword.
+// Returns the keyword and its production name, or ("", "") if none found.
+func scanForKeyword(text string, kwMap map[string]string) (string, string) {
+	kw, prod, _, _ := bestKeywordMatch(text, kwMap)
+	return kw, prod
 }
 
 // buildPrefixSignature walks the parent's children up to (but not including)
@@ -379,7 +396,7 @@ func buildPrefixSignature(parent, errNode *gotreesitter.Node, lang *gotreesitter
 func FormatParseError(source []byte, root *gotreesitter.Node, lang *gotreesitter.Language,
 	sourceFile string, expectations map[string]*ProductionExpectations) string {
 
-	errors := findErrors(root, lang)
+	errors := findErrors(source, root, lang)
 	if len(errors) == 0 {
 		return "unknown parse error"
 	}
@@ -471,8 +488,85 @@ func formatSingleError(source []byte, errNode *gotreesitter.Node, lang *gotreesi
 		}
 	}
 
+	if context := describeDiagnosticContext(errNode, lang, source); context != "" {
+		message = fmt.Sprintf("%s in %s", message, context)
+	}
+
 	srcCtx := formatSourceLine(source, row, col, endCol)
 	return formatError(sourceFile, row, col, message, srcCtx, example)
+}
+
+func describeDiagnosticContext(errNode *gotreesitter.Node, lang *gotreesitter.Language, source []byte) string {
+	topLevel := findTopLevelBlock(errNode, lang)
+	if topLevel != nil {
+		textOfField := func(field string) string {
+			child := topLevel.ChildByFieldName(field, lang)
+			if child == nil {
+				return ""
+			}
+			return strings.TrimSpace(child.Text(source))
+		}
+
+		switch topLevel.Type(lang) {
+		case "test_block":
+			category := textOfField("category")
+			name := textOfField("name")
+			switch {
+			case category != "" && name != "":
+				return category + " " + name
+			case category != "":
+				return category + " test"
+			}
+		case "benchmark_block", "load_block":
+			name := textOfField("name")
+			if name != "" {
+				keyword := strings.TrimSuffix(topLevel.Type(lang), "_block")
+				return keyword + " " + name
+			}
+		}
+	}
+
+	kw, _, kwStart, _ := bestKeywordMatch(errNode.Text(source), keywordToProduction)
+	if kwStart < 0 || kw == "" {
+		return ""
+	}
+
+	absKeywordStart := int(errNode.StartByte()) + kwStart
+	return inferContextFromSource(source, absKeywordStart)
+}
+
+func inferContextFromSource(source []byte, offset int) string {
+	lines := strings.Split(string(source), "\n")
+	row, _ := byteOffsetToPoint(source, offset)
+	if row >= len(lines) {
+		row = len(lines) - 1
+	}
+	for i := row; i >= 0; i-- {
+		if context, ok := parseTopLevelContextLine(strings.TrimSpace(lines[i])); ok {
+			return context
+		}
+	}
+	return ""
+}
+
+func parseTopLevelContextLine(line string) (string, bool) {
+	for _, keyword := range []string{"unit", "integration", "e2e", "benchmark", "load"} {
+		prefix := keyword + " "
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		namePart := strings.TrimSpace(strings.TrimPrefix(line, prefix))
+		if !strings.HasPrefix(namePart, "\"") {
+			return keyword, true
+		}
+		for i := 1; i < len(namePart); i++ {
+			if namePart[i] == '"' && namePart[i-1] != '\\' {
+				return keyword + " " + namePart[:i+1], true
+			}
+		}
+		return keyword, true
+	}
+	return "", false
 }
 
 func diagnosticSpan(source []byte, errNode *gotreesitter.Node) (row, col, endCol int) {
@@ -482,7 +576,7 @@ func diagnosticSpan(source []byte, errNode *gotreesitter.Node) (row, col, endCol
 	col = int(startPt.Column)
 	endCol = int(endPt.Column)
 
-	if kw, _ := scanForKeyword(errNode.Text(source), keywordToProduction); kw != "" {
+	if kw, _, _, _ := bestKeywordMatch(errNode.Text(source), keywordToProduction); kw != "" {
 		if start, end, ok := keywordSpanInNode(source, errNode, kw); ok {
 			row, col = byteOffsetToPoint(source, start)
 			endRow, keywordEndCol := byteOffsetToPoint(source, end)
@@ -567,8 +661,8 @@ func byteOffsetToPoint(source []byte, offset int) (row, col int) {
 //
 // Returns two lines joined by a newline, e.g.:
 //
-//	  4 | 	given valid {
-//	    | 	      ^^^^^
+//	4 | 	given valid {
+//	  | 	      ^^^^^
 //
 // Returns "" when row is out of range.
 func formatSourceLine(source []byte, row, startCol, endCol int) string {
@@ -656,13 +750,31 @@ func formatError(sourceFile string, row, col int, message, sourceContext, exampl
 // Error discovery
 // ---------------------------------------------------------------------------
 
-// findErrors walks the tree and collects ERROR/MISSING nodes.
-// Returns at most one error per top-level block (direct child of source_file
-// that is a test_block, benchmark_block, or load_block).
-// For errors outside top-level blocks, returns the first error only.
-func findErrors(root *gotreesitter.Node, lang *gotreesitter.Language) []*gotreesitter.Node {
-	var errors []*gotreesitter.Node
-	seenTopLevel := make(map[uint32]bool) // start byte of top-level block -> already reported
+// findErrors walks the tree and selects the most useful ERROR/MISSING node per
+// top-level block (or one global non-top-level error). Candidates with a real
+// danmuji keyword outrank generic punctuation wrappers.
+func findErrors(source []byte, root *gotreesitter.Node, lang *gotreesitter.Language) []*gotreesitter.Node {
+	type diagnosticGroup struct {
+		key   string
+		nodes []*gotreesitter.Node
+	}
+
+	groups := make(map[string]*diagnosticGroup)
+	var ordered []*diagnosticGroup
+
+	getGroup := func(n *gotreesitter.Node) *diagnosticGroup {
+		key := "non-top-level"
+		if topLevel := findTopLevelBlock(n, lang); topLevel != nil {
+			key = fmt.Sprintf("top:%d", topLevel.StartByte())
+		}
+		if g, ok := groups[key]; ok {
+			return g
+		}
+		g := &diagnosticGroup{key: key}
+		groups[key] = g
+		ordered = append(ordered, g)
+		return g
+	}
 
 	gotreesitter.Walk(root, func(n *gotreesitter.Node, depth int) gotreesitter.WalkAction {
 		if !n.IsError() && !n.IsMissing() {
@@ -672,39 +784,52 @@ func findErrors(root *gotreesitter.Node, lang *gotreesitter.Language) []*gotrees
 			return gotreesitter.WalkSkipChildren
 		}
 
-		// Found an error node. Determine its top-level block.
-		topLevel := findTopLevelBlock(n, lang)
-		if topLevel != nil && hasNestedDiagnostic(n) {
-			return gotreesitter.WalkContinue
-		}
-		if topLevel != nil {
-			key := topLevel.StartByte()
-			if seenTopLevel[key] {
-				return gotreesitter.WalkSkipChildren
-			}
-			seenTopLevel[key] = true
-		} else {
-			// Error outside a top-level block — only report if first
-			if len(errors) > 0 {
-				// Check if we already have a non-top-level error
-				hasNonTopLevel := false
-				for _, e := range errors {
-					if findTopLevelBlock(e, lang) == nil {
-						hasNonTopLevel = true
-						break
-					}
-				}
-				if hasNonTopLevel {
-					return gotreesitter.WalkSkipChildren
-				}
-			}
-		}
-
-		errors = append(errors, n)
-		return gotreesitter.WalkSkipChildren
+		g := getGroup(n)
+		g.nodes = append(g.nodes, n)
+		return gotreesitter.WalkContinue
 	})
 
+	var errors []*gotreesitter.Node
+	for _, g := range ordered {
+		if len(g.nodes) == 0 {
+			continue
+		}
+		errors = append(errors, pickBestDiagnostic(source, g.nodes))
+		if g.key == "non-top-level" {
+			break
+		}
+	}
 	return errors
+}
+
+func pickBestDiagnostic(source []byte, candidates []*gotreesitter.Node) *gotreesitter.Node {
+	best := candidates[0]
+	for _, candidate := range candidates[1:] {
+		if betterDiagnostic(source, candidate, best) {
+			best = candidate
+		}
+	}
+	return best
+}
+
+func betterDiagnostic(source []byte, candidate, best *gotreesitter.Node) bool {
+	_, _, _, candidateSignal := bestKeywordMatch(candidate.Text(source), keywordToProduction)
+	_, _, _, bestSignal := bestKeywordMatch(best.Text(source), keywordToProduction)
+	if candidateSignal != bestSignal {
+		return candidateSignal > bestSignal
+	}
+
+	candidateSpan := candidate.EndByte() - candidate.StartByte()
+	bestSpan := best.EndByte() - best.StartByte()
+	if candidateSpan != bestSpan {
+		return candidateSpan < bestSpan
+	}
+
+	if candidate.IsMissing() != best.IsMissing() {
+		return !candidate.IsMissing()
+	}
+
+	return candidate.StartByte() < best.StartByte()
 }
 
 func hasNestedDiagnostic(n *gotreesitter.Node) bool {

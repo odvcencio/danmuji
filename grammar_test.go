@@ -515,6 +515,25 @@ func f() {
 	}
 }
 
+func TestDanmujiFuzz(t *testing.T) {
+	input := `package main
+func f() {
+	fuzz "round trip text" with (input string, limit int) {
+		expect len(input) >= 0
+		_ = limit
+	}
+}
+`
+	sexp := parseDanmuji(t, input)
+	t.Logf("SExpr: %s", sexp)
+	if !strings.Contains(sexp, "fuzz_block") {
+		t.Error("expected fuzz_block")
+	}
+	if strings.Contains(sexp, "ERROR") {
+		t.Errorf("unexpected ERROR: %s", sexp)
+	}
+}
+
 func TestDanmujiEachDoWithDefaults(t *testing.T) {
 	input := `package main
 func f() {
@@ -709,5 +728,31 @@ func f() {
 	}
 	if strings.Contains(sexp, "ERROR") {
 		t.Errorf("unexpected ERROR: %s", sexp)
+	}
+}
+
+func TestDanmujiKeywordLikeIdentifiersRemainValidGo(t *testing.T) {
+	input := `package main
+unit "keyword identifiers" {
+	given "plain Go bindings" {
+		exec := 1
+		profile := 2
+		args := profile
+
+		then "still parses as Go" {
+			expect exec == 1
+			expect profile == 2
+			expect args == 2
+		}
+	}
+}
+`
+	sexp := parseDanmuji(t, input)
+	t.Logf("SExpr: %s", sexp)
+	if strings.Contains(sexp, "ERROR") {
+		t.Fatalf("keyword-like identifiers should parse cleanly: %s", sexp)
+	}
+	if !strings.Contains(sexp, "short_var_declaration") {
+		t.Error("expected short_var_declaration nodes for keyword-like identifiers")
 	}
 }

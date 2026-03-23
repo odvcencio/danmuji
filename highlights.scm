@@ -29,6 +29,7 @@
 "expect" @keyword
 "fake" @keyword
 "fake_clock" @keyword
+"fuzz" @keyword
 "get" @keyword
 "given" @keyword
 "http" @keyword
@@ -165,6 +166,9 @@
 
 ;; property_block
 (property_block name: (_) @string)
+
+;; fuzz_block
+(fuzz_block name: (_) @string)
 
 ;; eventually_block
 (eventually_block name: (_) @string)

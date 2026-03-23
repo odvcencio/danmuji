@@ -1032,6 +1032,114 @@ unit "invalid invariants" {
 	}
 }
 
+func TestTranspileDanmujiFuzz(t *testing.T) {
+	source := []byte(`package fuzz_test
+
+import "testing"
+
+fuzz "round trip text" with (input string, b byte) {
+	_ = b
+	expect len([]byte(input)) >= 0
+}
+`)
+
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if !strings.Contains(goCode, "func FuzzRoundTripText(f *testing.F)") {
+		t.Error("expected Fuzz function signature in generated code")
+	}
+	if !strings.Contains(goCode, `f.Add("", byte(0))`) {
+		t.Error("expected zero-value seed corpus in generated code")
+	}
+	if !strings.Contains(goCode, "f.Fuzz(func(t *testing.T, input string, b byte)") {
+		t.Error("expected fuzz callback signature in generated code")
+	}
+
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "fuzz_test.go", goCode)
+
+	runCmd := exec.Command("go", "test", "-v", "./...")
+	runCmd.Dir = tmpDir
+	out, err := runCmd.CombinedOutput()
+	t.Logf("go test output:\n%s", string(out))
+	if err != nil {
+		t.Fatalf("go test failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "PASS") {
+		t.Error("expected PASS in go test output")
+	}
+}
+
+func TestTranspileDanmujiHTTPTestHelpers(t *testing.T) {
+	source := []byte(`package httphelper_test
+
+import (
+	"net/http"
+	"testing"
+)
+
+unit "handler helpers" {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if got := r.Header.Get("Content-Type"); got != "application/json" {
+			w.WriteHeader(http.StatusUnsupportedMediaType)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte("created"))
+	})
+
+	req := danmujiHTTP.POST("/users", map[string]string{"name": "alice"})
+	rec := danmujiHTTP.Serve(handler, req)
+
+	then "status code matches" {
+		expect rec.Code == http.StatusCreated
+	}
+
+	then "body is recorded" {
+		expect rec.Body.String() == "created"
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if !strings.Contains(goCode, "var danmujiHTTP danmujiHTTPHelperSet") {
+		t.Error("expected danmujiHTTP helper declaration in generated code")
+	}
+	if !strings.Contains(goCode, "httptest.NewRequest") {
+		t.Error("expected httptest.NewRequest helper in generated code")
+	}
+	if !strings.Contains(goCode, "httptest.NewRecorder") {
+		t.Error("expected httptest.NewRecorder helper in generated code")
+	}
+
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "http_helper_test.go", goCode)
+
+	runCmd := exec.Command("go", "test", "-v", "./...")
+	runCmd.Dir = tmpDir
+	out, err := runCmd.CombinedOutput()
+	t.Logf("go test output:\n%s", string(out))
+	if err != nil {
+		t.Fatalf("go test failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "PASS") {
+		t.Error("expected PASS in go test output")
+	}
+}
+
 func TestTranspileDanmujiEachDoCompile(t *testing.T) {
 	source := []byte(`package main_test
 import "testing"
@@ -1379,5 +1487,41 @@ e2e "server implicit" {
 	}
 	if !strings.Contains(goCode, "syscall.SIGTERM") {
 		t.Error("expected syscall.SIGTERM in implicit cleanup")
+	}
+}
+
+func TestTranspileDanmujiKeywordLikeIdentifiersRemainValidGo(t *testing.T) {
+	source := []byte(`package main
+
+import "testing"
+
+unit "keyword identifiers" {
+	given "plain Go bindings" {
+		exec := 1
+		profile := 2
+		args := profile
+
+		then "still transpiles" {
+			expect exec == 1
+			expect profile == 2
+			expect args == 2
+		}
+	}
+}
+`)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if !strings.Contains(goCode, "exec := 1") {
+		t.Error("expected exec short declaration in output")
+	}
+	if !strings.Contains(goCode, "profile := 2") {
+		t.Error("expected profile short declaration in output")
+	}
+	if !strings.Contains(goCode, "args := profile") {
+		t.Error("expected args short declaration in output")
 	}
 }

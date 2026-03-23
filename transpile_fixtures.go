@@ -448,6 +448,66 @@ func (b *syncBuffer) String() string {
 }
 `
 
+const httpTestHelpers = `
+type danmujiHTTPHelperSet struct{}
+
+var danmujiHTTP danmujiHTTPHelperSet
+
+func (danmujiHTTPHelperSet) Request(method, target string, body interface{}) *http.Request {
+	reader, contentType := danmujiHTTPBody(body)
+	req := httptest.NewRequest(method, target, reader)
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	return req
+}
+
+func (h danmujiHTTPHelperSet) GET(target string) *http.Request {
+	return h.Request(http.MethodGet, target, nil)
+}
+
+func (h danmujiHTTPHelperSet) POST(target string, body interface{}) *http.Request {
+	return h.Request(http.MethodPost, target, body)
+}
+
+func (h danmujiHTTPHelperSet) PUT(target string, body interface{}) *http.Request {
+	return h.Request(http.MethodPut, target, body)
+}
+
+func (h danmujiHTTPHelperSet) PATCH(target string, body interface{}) *http.Request {
+	return h.Request(http.MethodPatch, target, body)
+}
+
+func (h danmujiHTTPHelperSet) DELETE(target string, body interface{}) *http.Request {
+	return h.Request(http.MethodDelete, target, body)
+}
+
+func (danmujiHTTPHelperSet) Serve(handler http.Handler, req *http.Request) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	return rec
+}
+
+func danmujiHTTPBody(body interface{}) (io.Reader, string) {
+	switch v := body.(type) {
+	case nil:
+		return nil, ""
+	case string:
+		return strings.NewReader(v), "text/plain; charset=utf-8"
+	case []byte:
+		return bytes.NewReader(v), "application/octet-stream"
+	case io.Reader:
+		return v, ""
+	default:
+		encoded, err := json.Marshal(v)
+		if err != nil {
+			panic(err)
+		}
+		return bytes.NewReader(encoded), "application/json"
+	}
+}
+`
+
 var pollingAssertionHelpers = `
 func danmujiDeepEqual(expected, actual interface{}) bool {
 	if reflect.DeepEqual(expected, actual) {

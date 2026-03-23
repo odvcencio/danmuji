@@ -15,6 +15,21 @@ func DanmujiGrammar() *Grammar {
 				Str("e2e"),
 			))
 
+		baseIdentifier := g.Rules["identifier"]
+		softKeywordIdentifier := func(keyword string) *Rule {
+			return Alias(Str(keyword), "identifier", true)
+		}
+
+		// Danmuji keywords should remain usable as ordinary Go identifiers when
+		// they appear in Go syntax like `exec := ...` or `profile := ...`.
+		g.Define("identifier",
+			Choice(
+				baseIdentifier,
+				softKeywordIdentifier("args"),
+				softKeywordIdentifier("exec"),
+				softKeywordIdentifier("profile"),
+			))
+
 		// ---------------------------------------------------------------
 		// Tags: @slow, @smoke, @skip, @focus, @flaky, @parallel,
 		//       or any @identifier
@@ -435,6 +450,19 @@ func DanmujiGrammar() *Grammar {
 			Field("body", Sym("block")),
 		))
 
+		// fuzz_block: "fuzz" string "with" parameter_list block
+		//
+		//   fuzz "parser handles arbitrary text" with (input string) {
+		//     expect len(input) >= 0
+		//   }
+		g.Define("fuzz_block", Seq(
+			Str("fuzz"),
+			Field("name", Sym("_string_literal")),
+			Str("with"),
+			Field("params", Sym("parameter_list")),
+			Field("body", Sym("block")),
+		))
+
 		// ---------------------------------------------------------------
 		// Polling semantics
 		//
@@ -531,6 +559,12 @@ func DanmujiGrammar() *Grammar {
 		// ---------------------------------------------------------------
 		// Wire into Go: extend _top_level_declaration and _statement
 		// ---------------------------------------------------------------
+		dslStatement := func(name string) *Rule {
+			// Prefer valid Go statements when danmuji keywords are reused as
+			// ordinary identifiers, e.g. `exec := ...` or `profile := ...`.
+			return PrecDynamic(-1, Sym(name))
+		}
+
 		AppendChoice(g, "_top_level_declaration", Choice(
 			Sym("test_block"),
 			Sym("benchmark_block"),
@@ -538,49 +572,50 @@ func DanmujiGrammar() *Grammar {
 		))
 
 		AppendChoice(g, "_statement", Choice(
-			Sym("given_block"),
-			Sym("when_block"),
-			Sym("then_block"),
-			Sym("expect_statement"),
-			Sym("reject_statement"),
-			Sym("mock_declaration"),
-			Sym("fake_declaration"),
-			Sym("spy_declaration"),
-			Sym("verify_statement"),
-			Sym("lifecycle_hook"),
-			Sym("table_declaration"),
-			Sym("each_row_block"),
+			dslStatement("given_block"),
+			dslStatement("when_block"),
+			dslStatement("then_block"),
+			dslStatement("expect_statement"),
+			dslStatement("reject_statement"),
+			dslStatement("mock_declaration"),
+			dslStatement("fake_declaration"),
+			dslStatement("spy_declaration"),
+			dslStatement("verify_statement"),
+			dslStatement("lifecycle_hook"),
+			dslStatement("table_declaration"),
+			dslStatement("each_row_block"),
 			Sym("mock_method"),
 			Sym("fake_method"),
-			Sym("needs_block"),
-			Sym("setup_block"),
-			Sym("measure_block"),
-			Sym("parallel_measure_block"),
-			Sym("report_directive"),
-			Sym("exec_block"),
-			Sym("run_command"),
-			Sym("load_config"),
-			Sym("target_block"),
-			Sym("profile_block"),
-			Sym("no_leaks_directive"),
-			Sym("fake_clock_directive"),
-			Sym("snapshot_block"),
-			Sym("each_do_block"),
-			Sym("matrix_block"),
-			Sym("property_block"),
-			Sym("eventually_block"),
-			Sym("consistently_block"),
-			Sym("defaults_block"),
+			dslStatement("needs_block"),
+			dslStatement("setup_block"),
+			dslStatement("measure_block"),
+			dslStatement("parallel_measure_block"),
+			dslStatement("report_directive"),
+			dslStatement("exec_block"),
+			dslStatement("run_command"),
+			dslStatement("load_config"),
+			dslStatement("target_block"),
+			dslStatement("profile_block"),
+			dslStatement("no_leaks_directive"),
+			dslStatement("fake_clock_directive"),
+			dslStatement("snapshot_block"),
+			dslStatement("each_do_block"),
+			dslStatement("matrix_block"),
+			dslStatement("property_block"),
+			dslStatement("fuzz_block"),
+			dslStatement("eventually_block"),
+			dslStatement("consistently_block"),
+			dslStatement("defaults_block"),
 			Sym("scenario_entry"),
 			Sym("scenario_field"),
 			Sym("matrix_field"),
-			Sym("process_block"),
-			Sym("process_args"),
-			Sym("process_env"),
-			Sym("ready_clause"),
-			Sym("stop_block"),
-			Sym("signal_directive"),
-			Sym("timeout_directive"),
+			dslStatement("process_block"),
+			dslStatement("process_args"),
+			dslStatement("process_env"),
+			dslStatement("ready_clause"),
+			dslStatement("stop_block"),
+			dslStatement("signal_directive"),
+			dslStatement("timeout_directive"),
 		))
 
 		// ---------------------------------------------------------------
@@ -616,6 +651,7 @@ func DanmujiGrammar() *Grammar {
 		AddConflict(g, "_statement", "each_do_block")
 		AddConflict(g, "_statement", "matrix_block")
 		AddConflict(g, "_statement", "property_block")
+		AddConflict(g, "_statement", "fuzz_block")
 		AddConflict(g, "_statement", "defaults_block")
 		AddConflict(g, "_statement", "scenario_entry")
 		AddConflict(g, "_statement", "scenario_field")

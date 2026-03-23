@@ -195,7 +195,7 @@ func TestFindErrorsSingleError(t *testing.T) {
 	if !root.HasError() {
 		t.Skip("no error in parse tree — grammar may accept this")
 	}
-	errors := findErrors(root, lang)
+	errors := findErrors(source, root, lang)
 	if len(errors) == 0 {
 		t.Fatal("expected at least one error node")
 	}
@@ -216,7 +216,7 @@ func TestFindErrorsNoErrors(t *testing.T) {
 		t.Fatalf("parse: %v", err)
 	}
 	root := tree.RootNode()
-	errors := findErrors(root, lang)
+	errors := findErrors(source, root, lang)
 	if len(errors) != 0 {
 		t.Errorf("expected 0 errors for valid Go, got %d", len(errors))
 	}
@@ -245,7 +245,7 @@ unit "test2" {
 	if !root.HasError() {
 		t.Skip("no errors found")
 	}
-	errors := findErrors(root, lang)
+	errors := findErrors(source, root, lang)
 	t.Logf("Found %d error(s)", len(errors))
 	// Should report errors from both blocks (up to 1 per top-level block)
 }
@@ -273,7 +273,7 @@ func TestDescribeExpected(t *testing.T) {
 		t.Skip("no error")
 	}
 	t.Logf("SExpr: %s", root.SExpr(lang))
-	errors := findErrors(root, lang)
+	errors := findErrors(source, root, lang)
 	if len(errors) == 0 {
 		t.Fatal("expected error node")
 	}
@@ -485,6 +485,32 @@ func TestTranspileDanmujiErrorFormat(t *testing.T) {
 	t.Logf("Error: %s", errMsg)
 	if strings.Contains(errMsg, "(source_file") {
 		t.Error("expected human-readable error, got s-expression")
+	}
+}
+
+func TestFormatParseErrorUsesDeepestLocalDiagnostic(t *testing.T) {
+	source := []byte("package main\n\nunit \"good\" {\n}\n\nunit \"broken\" {\n\tgiven {\n\t}\n}\n")
+	g := DanmujiGrammar()
+	expectations := buildExpectationMap(g)
+	lang := getDanmujiLang(t)
+	parser := gotreesitter.NewParser(lang)
+	tree, _ := parser.Parse(source)
+	root := tree.RootNode()
+	if !root.HasError() {
+		t.Skip("no error")
+	}
+
+	result := FormatParseError(source, root, lang, "/tmp/test.dmj", expectations)
+	t.Logf("Error output:\n%s", result)
+
+	if strings.Contains(result, "/tmp/test.dmj:3:1:") {
+		t.Fatalf("expected local diagnostic, got wrapper location:\n%s", result)
+	}
+	if !strings.Contains(result, "/tmp/test.dmj:7:2:") {
+		t.Fatalf("expected local error at given block, got:\n%s", result)
+	}
+	if !strings.Contains(result, `expected string after "given" in unit "broken"`) {
+		t.Fatalf("expected richer context in message, got:\n%s", result)
 	}
 }
 
