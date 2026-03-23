@@ -2,8 +2,8 @@ package danmuji
 
 import (
 	"fmt"
-	"strings"
 	gotreesitter "github.com/odvcencio/gotreesitter"
+	"strings"
 )
 
 // ---------------------------------------------------------------------------
@@ -207,9 +207,11 @@ func (t *dmjTranspiler) emitExecExpect(n *gotreesitter.Node) string {
 			t.addImport("github.com/stretchr/testify/assert")
 			switch opT {
 			case "==":
-				return fmt.Sprintf("assert.Equal(%s, %s, %s)", t.testVar, rT, lT)
+				assertionName := t.equalityAssertionName(left, right)
+				return fmt.Sprintf("%s(%s, %s, %s)", assertionName, t.testVar, rT, lT)
 			case "!=":
-				return fmt.Sprintf("assert.NotEqual(%s, %s, %s)", t.testVar, rT, lT)
+				assertionName := t.inequalityAssertionName(left, right)
+				return fmt.Sprintf("%s(%s, %s, %s)", assertionName, t.testVar, rT, lT)
 			}
 		}
 		// Bare identifier like "expect exit_code"
@@ -295,5 +297,3 @@ func (t *dmjTranspiler) translateExecIdent(ident string) string {
 		return ident
 	}
 }
-
-

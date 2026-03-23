@@ -2,8 +2,8 @@ package danmuji
 
 import (
 	"fmt"
-	"strings"
 	gotreesitter "github.com/odvcencio/gotreesitter"
+	"strings"
 )
 
 // ---------------------------------------------------------------------------
@@ -20,6 +20,43 @@ func (t *dmjTranspiler) emitExpect(n *gotreesitter.Node) string {
 		return t.emitExpectCondition(n)
 	}
 	return t.emitExpectAssertion(n)
+}
+
+func (t *dmjTranspiler) equalityAssertionName(left, right *gotreesitter.Node) string {
+	if t.usesNumericLiteralEquality(left, right) {
+		return "assert.EqualValues"
+	}
+	return "assert.Equal"
+}
+
+func (t *dmjTranspiler) inequalityAssertionName(left, right *gotreesitter.Node) string {
+	if t.usesNumericLiteralEquality(left, right) {
+		return "assert.NotEqualValues"
+	}
+	return "assert.NotEqual"
+}
+
+func (t *dmjTranspiler) usesNumericLiteralEquality(left, right *gotreesitter.Node) bool {
+	return t.isNumericLiteral(left) || t.isNumericLiteral(right)
+}
+
+func (t *dmjTranspiler) isNumericLiteral(n *gotreesitter.Node) bool {
+	if n == nil {
+		return false
+	}
+
+	switch t.nodeType(n) {
+	case "int_literal", "float_literal", "rune_literal", "imaginary_literal":
+		return true
+	case "parenthesized_expression", "unary_expression":
+		for i := 0; i < int(n.NamedChildCount()); i++ {
+			if t.isNumericLiteral(n.NamedChild(i)) {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 func (t *dmjTranspiler) emitExpectCondition(n *gotreesitter.Node) string {
@@ -169,7 +206,8 @@ func (t *dmjTranspiler) emitExpectAssertion(n *gotreesitter.Node) string {
 				return ld + fmt.Sprintf("assert.NotNil(%s, %s, %s)", t.testVar, actualText, msg)
 			}
 			t.addImport("github.com/stretchr/testify/assert")
-			return ld + fmt.Sprintf("assert.NotEqual(%s, %s, %s, %s)", t.testVar, expectedText, actualText, msg)
+			assertionName := t.inequalityAssertionName(actual, expected)
+			return ld + fmt.Sprintf("%s(%s, %s, %s, %s)", assertionName, t.testVar, expectedText, actualText, msg)
 		}
 		if expectedText == "nil" && strings.HasSuffix(actualText, "err") {
 			t.addImport("github.com/stretchr/testify/require")
@@ -180,7 +218,8 @@ func (t *dmjTranspiler) emitExpectAssertion(n *gotreesitter.Node) string {
 			return ld + fmt.Sprintf("assert.Nil(%s, %s, %s)", t.testVar, actualText, msg)
 		}
 		t.addImport("github.com/stretchr/testify/assert")
-		return ld + fmt.Sprintf("assert.Equal(%s, %s, %s, %s)", t.testVar, expectedText, actualText, msg)
+		assertionName := t.equalityAssertionName(actual, expected)
+		return ld + fmt.Sprintf("%s(%s, %s, %s, %s)", assertionName, t.testVar, expectedText, actualText, msg)
 	}
 
 	if t.nodeType(actual) == "binary_expression" && actual.ChildCount() >= 3 {
@@ -201,14 +240,16 @@ func (t *dmjTranspiler) emitExpectAssertion(n *gotreesitter.Node) string {
 				return ld + fmt.Sprintf("assert.Nil(%s, %s, %s)", t.testVar, lT, msg)
 			}
 			t.addImport("github.com/stretchr/testify/assert")
-			return ld + fmt.Sprintf("assert.Equal(%s, %s, %s, %s)", t.testVar, rT, lT, msg)
+			assertionName := t.equalityAssertionName(left, right)
+			return ld + fmt.Sprintf("%s(%s, %s, %s, %s)", assertionName, t.testVar, rT, lT, msg)
 		case "!=":
 			if rT == "nil" {
 				t.addImport("github.com/stretchr/testify/assert")
 				return ld + fmt.Sprintf("assert.NotNil(%s, %s, %s)", t.testVar, lT, msg)
 			}
 			t.addImport("github.com/stretchr/testify/assert")
-			return ld + fmt.Sprintf("assert.NotEqual(%s, %s, %s, %s)", t.testVar, rT, lT, msg)
+			assertionName := t.inequalityAssertionName(left, right)
+			return ld + fmt.Sprintf("%s(%s, %s, %s, %s)", assertionName, t.testVar, rT, lT, msg)
 		case "<":
 			t.addImport("github.com/stretchr/testify/assert")
 			return ld + fmt.Sprintf("assert.True(%s, %s < %s, %s)", t.testVar, lT, rT, msg)

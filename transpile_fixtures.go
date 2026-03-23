@@ -2,11 +2,11 @@ package danmuji
 
 import (
 	"fmt"
+	gotreesitter "github.com/odvcencio/gotreesitter"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
-	gotreesitter "github.com/odvcencio/gotreesitter"
 )
 
 // ---------------------------------------------------------------------------
@@ -450,7 +450,86 @@ func (b *syncBuffer) String() string {
 
 var pollingAssertionHelpers = `
 func danmujiDeepEqual(expected, actual interface{}) bool {
-	return reflect.DeepEqual(expected, actual)
+	if reflect.DeepEqual(expected, actual) {
+		return true
+	}
+
+	expectedValue := reflect.ValueOf(expected)
+	actualValue := reflect.ValueOf(actual)
+	if !expectedValue.IsValid() || !actualValue.IsValid() {
+		return false
+	}
+	if !danmujiIsNumericKind(expectedValue.Kind()) || !danmujiIsNumericKind(actualValue.Kind()) {
+		return false
+	}
+
+	return danmujiNumericEqual(expectedValue, actualValue)
+}
+
+func danmujiNumericEqual(expected, actual reflect.Value) bool {
+	switch {
+	case danmujiIsSignedKind(expected.Kind()):
+		expectedInt := expected.Int()
+		switch {
+		case danmujiIsSignedKind(actual.Kind()):
+			return expectedInt == actual.Int()
+		case danmujiIsUnsignedKind(actual.Kind()):
+			return expectedInt >= 0 && uint64(expectedInt) == actual.Uint()
+		case danmujiIsFloatKind(actual.Kind()):
+			return float64(expectedInt) == actual.Float()
+		}
+	case danmujiIsUnsignedKind(expected.Kind()):
+		expectedUint := expected.Uint()
+		switch {
+		case danmujiIsSignedKind(actual.Kind()):
+			actualInt := actual.Int()
+			return actualInt >= 0 && expectedUint == uint64(actualInt)
+		case danmujiIsUnsignedKind(actual.Kind()):
+			return expectedUint == actual.Uint()
+		case danmujiIsFloatKind(actual.Kind()):
+			return float64(expectedUint) == actual.Float()
+		}
+	case danmujiIsFloatKind(expected.Kind()):
+		expectedFloat := expected.Float()
+		switch {
+		case danmujiIsSignedKind(actual.Kind()):
+			return expectedFloat == float64(actual.Int())
+		case danmujiIsUnsignedKind(actual.Kind()):
+			return expectedFloat == float64(actual.Uint())
+		case danmujiIsFloatKind(actual.Kind()):
+			return expectedFloat == actual.Float()
+		}
+	}
+
+	return false
+}
+
+func danmujiIsNumericKind(kind reflect.Kind) bool {
+	return danmujiIsSignedKind(kind) || danmujiIsUnsignedKind(kind) || danmujiIsFloatKind(kind)
+}
+
+func danmujiIsSignedKind(kind reflect.Kind) bool {
+	switch kind {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return true
+	}
+	return false
+}
+
+func danmujiIsUnsignedKind(kind reflect.Kind) bool {
+	switch kind {
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return true
+	}
+	return false
+}
+
+func danmujiIsFloatKind(kind reflect.Kind) bool {
+	switch kind {
+	case reflect.Float32, reflect.Float64:
+		return true
+	}
+	return false
 }
 
 func danmujiContains(actual, expected interface{}) (found bool) {

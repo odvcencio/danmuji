@@ -322,6 +322,86 @@ unit "mixed numeric comparison" {
 	}
 }
 
+func TestTranspileDanmujiMixedNumericEqualityUsesValueAssertions(t *testing.T) {
+	source := []byte(`package numeric_test
+
+import "testing"
+
+unit "mixed numeric equality" {
+	then "int64 literal compares by value" {
+		var count int64 = 1000
+		expect count == 1000
+		expect 1000 == count
+	}
+
+	then "uint32 hex literal compares by value" {
+		var code uint32 = 0x47
+		expect code == 0x47
+	}
+
+	then "uint8 zero literal compares by value" {
+		var b uint8 = 0x00
+		expect b == 0x00
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+
+	if !strings.Contains(goCode, "assert.EqualValues") {
+		t.Fatal("expected numeric literal equality to emit assert.EqualValues")
+	}
+
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "numeric_values_test.go", goCode)
+
+	runCmd := exec.Command("go", "test", "-v", "./...")
+	runCmd.Dir = tmpDir
+	out, err := runCmd.CombinedOutput()
+	t.Logf("go test output:\n%s", string(out))
+	if err != nil {
+		t.Fatalf("go test failed: %v\n%s", err, out)
+	}
+}
+
+func TestTranspileDanmujiMixedNumericInequalityUsesValueAssertions(t *testing.T) {
+	source := []byte(`package numeric_test
+
+import "testing"
+
+unit "mixed numeric inequality" {
+	then "int64 inequality fails when values match" {
+		var count int64 = 1000
+		expect count != 1000
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+
+	if !strings.Contains(goCode, "assert.NotEqualValues") {
+		t.Fatal("expected numeric literal inequality to emit assert.NotEqualValues")
+	}
+
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "numeric_not_values_test.go", goCode)
+
+	runCmd := exec.Command("go", "test", "-v", "./...")
+	runCmd.Dir = tmpDir
+	out, _ := runCmd.CombinedOutput()
+	t.Logf("go test output:\n%s", string(out))
+
+	if !strings.Contains(string(out), "FAIL") {
+		t.Fatal("expected go test to fail when typed numeric values are equal")
+	}
+}
+
 func TestTranspileDanmujiExecCompile(t *testing.T) {
 	source := []byte(`package exec_test
 
