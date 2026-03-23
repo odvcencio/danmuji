@@ -2328,52 +2328,100 @@
         {
           "members": [
             {
-              "name": "given_block",
-              "type": "SYMBOL"
+              "content": {
+                "name": "given_block",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "when_block",
-              "type": "SYMBOL"
+              "content": {
+                "name": "when_block",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "then_block",
-              "type": "SYMBOL"
+              "content": {
+                "name": "then_block",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "expect_statement",
-              "type": "SYMBOL"
+              "content": {
+                "name": "expect_statement",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "reject_statement",
-              "type": "SYMBOL"
+              "content": {
+                "name": "reject_statement",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "mock_declaration",
-              "type": "SYMBOL"
+              "content": {
+                "name": "mock_declaration",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "fake_declaration",
-              "type": "SYMBOL"
+              "content": {
+                "name": "fake_declaration",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "spy_declaration",
-              "type": "SYMBOL"
+              "content": {
+                "name": "spy_declaration",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "verify_statement",
-              "type": "SYMBOL"
+              "content": {
+                "name": "verify_statement",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "lifecycle_hook",
-              "type": "SYMBOL"
+              "content": {
+                "name": "lifecycle_hook",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "table_declaration",
-              "type": "SYMBOL"
+              "content": {
+                "name": "table_declaration",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "each_row_block",
-              "type": "SYMBOL"
+              "content": {
+                "name": "each_row_block",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
               "name": "mock_method",
@@ -2384,80 +2432,164 @@
               "type": "SYMBOL"
             },
             {
-              "name": "needs_block",
-              "type": "SYMBOL"
+              "content": {
+                "name": "needs_block",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "setup_block",
-              "type": "SYMBOL"
+              "content": {
+                "name": "setup_block",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "measure_block",
-              "type": "SYMBOL"
+              "content": {
+                "name": "measure_block",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "parallel_measure_block",
-              "type": "SYMBOL"
+              "content": {
+                "name": "parallel_measure_block",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "report_directive",
-              "type": "SYMBOL"
+              "content": {
+                "name": "report_directive",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "exec_block",
-              "type": "SYMBOL"
+              "content": {
+                "name": "exec_block",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "run_command",
-              "type": "SYMBOL"
+              "content": {
+                "name": "run_command",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "load_config",
-              "type": "SYMBOL"
+              "content": {
+                "name": "load_config",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "target_block",
-              "type": "SYMBOL"
+              "content": {
+                "name": "target_block",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "profile_block",
-              "type": "SYMBOL"
+              "content": {
+                "name": "profile_block",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "no_leaks_directive",
-              "type": "SYMBOL"
+              "content": {
+                "name": "no_leaks_directive",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "fake_clock_directive",
-              "type": "SYMBOL"
+              "content": {
+                "name": "fake_clock_directive",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "snapshot_block",
-              "type": "SYMBOL"
+              "content": {
+                "name": "snapshot_block",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "each_do_block",
-              "type": "SYMBOL"
+              "content": {
+                "name": "each_do_block",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "matrix_block",
-              "type": "SYMBOL"
+              "content": {
+                "name": "matrix_block",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "property_block",
-              "type": "SYMBOL"
+              "content": {
+                "name": "property_block",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "eventually_block",
-              "type": "SYMBOL"
+              "content": {
+                "name": "fuzz_block",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "consistently_block",
-              "type": "SYMBOL"
+              "content": {
+                "name": "eventually_block",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "defaults_block",
-              "type": "SYMBOL"
+              "content": {
+                "name": "consistently_block",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
+            },
+            {
+              "content": {
+                "name": "defaults_block",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
               "name": "scenario_entry",
@@ -2472,32 +2604,60 @@
               "type": "SYMBOL"
             },
             {
-              "name": "process_block",
-              "type": "SYMBOL"
+              "content": {
+                "name": "process_block",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "process_args",
-              "type": "SYMBOL"
+              "content": {
+                "name": "process_args",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "process_env",
-              "type": "SYMBOL"
+              "content": {
+                "name": "process_env",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "ready_clause",
-              "type": "SYMBOL"
+              "content": {
+                "name": "ready_clause",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "stop_block",
-              "type": "SYMBOL"
+              "content": {
+                "name": "stop_block",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "signal_directive",
-              "type": "SYMBOL"
+              "content": {
+                "name": "signal_directive",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             },
             {
-              "name": "timeout_directive",
-              "type": "SYMBOL"
+              "content": {
+                "name": "timeout_directive",
+                "type": "SYMBOL"
+              },
+              "type": "PREC_DYNAMIC",
+              "value": -1
             }
           ],
           "type": "CHOICE"
@@ -4778,8 +4938,40 @@
       "type": "SEQ"
     },
     "identifier": {
-      "type": "PATTERN",
-      "value": "[_\\p{XID_Start}][_\\p{XID_Continue}]*"
+      "members": [
+        {
+          "type": "PATTERN",
+          "value": "[_\\p{XID_Start}][_\\p{XID_Continue}]*"
+        },
+        {
+          "content": {
+            "type": "STRING",
+            "value": "args"
+          },
+          "named": true,
+          "type": "ALIAS",
+          "value": "identifier"
+        },
+        {
+          "content": {
+            "type": "STRING",
+            "value": "exec"
+          },
+          "named": true,
+          "type": "ALIAS",
+          "value": "identifier"
+        },
+        {
+          "content": {
+            "type": "STRING",
+            "value": "profile"
+          },
+          "named": true,
+          "type": "ALIAS",
+          "value": "identifier"
+        }
+      ],
+      "type": "CHOICE"
     },
     "_type_identifier": {
       "content": {
@@ -8786,6 +8978,43 @@
       ],
       "type": "SEQ"
     },
+    "fuzz_block": {
+      "members": [
+        {
+          "type": "STRING",
+          "value": "fuzz"
+        },
+        {
+          "content": {
+            "name": "_string_literal",
+            "type": "SYMBOL"
+          },
+          "name": "name",
+          "type": "FIELD"
+        },
+        {
+          "type": "STRING",
+          "value": "with"
+        },
+        {
+          "content": {
+            "name": "parameter_list",
+            "type": "SYMBOL"
+          },
+          "name": "params",
+          "type": "FIELD"
+        },
+        {
+          "content": {
+            "name": "block",
+            "type": "SYMBOL"
+          },
+          "name": "body",
+          "type": "FIELD"
+        }
+      ],
+      "type": "SEQ"
+    },
     "eventually_block": {
       "members": [
         {
@@ -9282,6 +9511,10 @@
     [
       "_statement",
       "property_block"
+    ],
+    [
+      "_statement",
+      "fuzz_block"
     ],
     [
       "_statement",
