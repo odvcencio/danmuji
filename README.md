@@ -130,6 +130,9 @@ expect err == nil              // require.NoError(t, err)
 expect result is_nil           // assert.Nil(t, result)
 expect result not_nil          // assert.NotNil(t, result)
 expect items contains "apple"  // assert.Contains(t, items, "apple")
+expect items unordered_equal []int{3, 2, 1}
+expect err is context.DeadlineExceeded
+expect err message contains "quota"
 reject ok                      // assert.False(t, ok)
 ```
 
@@ -151,6 +154,38 @@ unit "auth" {
 }
 ```
 
+Partial matching works for structs and maps:
+
+```dmj
+then "user payload is right" {
+	expect user matches {
+		Role: "admin",
+		Email: contains "@example.com",
+		DeletedAt: is_nil
+	}
+}
+```
+
+### Factories
+
+```dmj
+factory User {
+	defaults { Name: "alice", Role: "member" }
+	trait admin { Role: "admin" }
+}
+
+unit "authorization" {
+	user := build User with admin { Name: "root" }
+
+	then "applies traits and overrides" {
+		expect user.Name == "root"
+		expect user.Role == "admin"
+	}
+}
+```
+
+Factories stay DSL-only. `build` emits normal Go composite literals, so the generated tests stay readable.
+
 ### Eventual and consistent assertions
 
 ```dmj
@@ -169,6 +204,18 @@ unit "retries" {
 Duration shorthand literals are supported: `5s`, `2.5m`, `30ms`, `100us`, `1h`. You can also use full Go expressions like `5 * time.Second`. The `within` and `for` clauses are optional — omit them to use defaults.
 
 These compile into polling loops so you can express temporal behavior without writing custom helper goroutine scaffolding.
+
+When you want a one-shot channel receive with timeout, use `await`:
+
+```dmj
+unit "worker completion" {
+	await <-jobs within 2s as job
+
+	then "receives the completed job" {
+		expect job.Status == "done"
+	}
+}
+```
 
 ### Mocks
 
@@ -307,6 +354,33 @@ unit "users handler" {
 Available methods: `Request`, `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, and `Serve`.
 String bodies become plain text, `[]byte` bodies stay binary, `io.Reader` passes through, and other body values are JSON-marshaled automatically with `Content-Type: application/json`.
 
+### WebSocket test helpers
+
+When a `.dmj` file references `danmujiWS.`, danmuji injects a small helper set around `github.com/gorilla/websocket`:
+
+```dmj
+unit "theatre sync" {
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	ws := danmujiWS.Dial(server, "/api/theatre/ABC123/ws")
+	defer ws.Close()
+
+	then "receives heartbeat" {
+		msg := ws.ReadBinary(2 * time.Second)
+		expect msg[0] == byte(0x01)
+	}
+
+	ws.SendBinary(driftBytes)
+
+	then "records the last message" {
+		expect ws.LastMessage() not_nil
+	}
+}
+```
+
+Available methods: `Dial`, `Close`, `SendBinary`, `SendText`, `ReadBinary`, `ReadText`, and `LastMessage`.
+
 ### Matrix tests
 
 ```dmj
@@ -324,6 +398,27 @@ unit "API compatibility" {
 ```
 
 Cartesian product of all dimensions. Each combination runs as a subtest.
+Each dimension is also bound as a local alias inside the generated loop, so nested blocks can reference names like `method` or `auth` directly.
+
+### gRPC test helpers
+
+When a `.dmj` file references `danmujiGRPC.`, danmuji injects a small helper set for `grpc/test/bufconn`:
+
+```dmj
+unit "worker rpc" {
+	conn := danmujiGRPC.Bufconn(func(s *grpc.Server) {
+		pb.RegisterWorkerServer(s, fakeWorker)
+	})
+	defer conn.Close()
+
+	then "invokes unary grpc" {
+		err := conn.Conn().Invoke(ctx, "/pkg.Worker/Ping", req, resp)
+		expect err == nil
+	}
+}
+```
+
+Available methods: `Bufconn`, `Conn`, and `Close`.
 
 ### Property-based specs
 
@@ -360,16 +455,24 @@ Generates a struct per table with `col0`, `col1`, ... `interface{}` fields and i
 
 ```dmj
 integration "database round-trip" {
-    needs postgres db {}
-    needs redis cache {}
+    needs tempdir scratch
+    needs postgres db {
+        password: "test"
+        database: "app_test"
+    }
+    needs http server {
+        handler api.NewHandler(repo)
+    }
 
     given "a connected database" {
-        // db and cache containers are running
+        expect scratch != ""
+        expect dbEndpoint not_nil
+        expect server.URL not_nil
     }
 }
 ```
 
-Supported services: `postgres`, `redis`, `mysql`, `kafka`, `mongo`, `rabbitmq`, `nats`, `container` (generic). Backed by [testcontainers-go](https://github.com/testcontainers/testcontainers-go).
+Supported services: `tempdir`, `http`, `postgres`, `redis`, `mysql`, `kafka`, `mongo`, `rabbitmq`, `nats`, `container` (generic). Backed by [testcontainers-go](https://github.com/testcontainers/testcontainers-go) for containerized services.
 
 ### Benchmarks
 

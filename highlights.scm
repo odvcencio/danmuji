@@ -6,10 +6,13 @@
 "all" @keyword
 "allocs" @keyword
 "args" @keyword
+"as" @keyword
 "at" @keyword
+"await" @keyword
 "before" @keyword
 "benchmark" @keyword
 "blockprofile" @keyword
+"build" @keyword
 "called" @keyword
 "concurrency" @keyword
 "consistently" @keyword
@@ -27,20 +30,25 @@
 "eventually" @keyword
 "exec" @keyword
 "expect" @keyword
+"factory" @keyword
 "fake" @keyword
 "fake_clock" @keyword
 "fuzz" @keyword
 "get" @keyword
 "given" @keyword
+"handler" @keyword
 "http" @keyword
 "in" @keyword
 "integration" @keyword
+"is" @keyword
 "is_nil" @keyword
 "kafka" @keyword
 "load" @keyword
+"matches" @keyword
 "matrix" @keyword
 "measure" @keyword
 "mem" @keyword
+"message" @keyword
 "mock" @keyword
 "mongo" @keyword
 "mutexprofile" @keyword
@@ -79,12 +87,15 @@
 "table" @keyword
 "target" @keyword
 "tcp" @keyword
+"tempdir" @keyword
 "then" @keyword
 "timeout" @keyword
 "times" @keyword
 "to" @keyword
 "top" @keyword
+"trait" @keyword
 "unit" @keyword
+"unordered_equal" @keyword
 "up" @keyword
 "verify" @keyword
 "when" @keyword
@@ -105,6 +116,8 @@
 
 ;; then_block
 (then_block description: (_) @string)
+
+;; match_block
 
 ;; expect_statement
 (expect_statement actual: (identifier) @variable)
@@ -160,6 +173,14 @@
 (snapshot_block name: (_) @string)
 
 ;; defaults_block
+
+;; factory_overrides_block
+
+;; factory_trait_block
+(factory_trait_block name: (_) @string)
+
+;; factory_declaration
+(factory_declaration name: (identifier) @type.definition)
 
 ;; matrix_block
 (matrix_block name: (_) @string)

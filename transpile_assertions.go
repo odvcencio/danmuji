@@ -63,11 +63,31 @@ func (t *dmjTranspiler) emitExpectCondition(n *gotreesitter.Node) string {
 	actual := t.childByField(n, "actual")
 	expected := t.childByField(n, "expected")
 	matcher := t.childByField(n, "matcher")
+	matchNode := t.childByField(n, "match")
 
 	if actual == nil {
 		return "false"
 	}
 	nodeText := t.text(n)
+
+	if matchNode != nil {
+		return fmt.Sprintf("danmujiMatches(%s, %s)", t.emitMatchBlock(matchNode), t.emit(actual))
+	}
+	if strings.Contains(nodeText, "unordered_equal") && expected != nil {
+		return fmt.Sprintf("danmujiUnorderedEqual(%s, %s)", t.emit(expected), t.emit(actual))
+	}
+	if strings.Contains(nodeText, " message contains ") && expected != nil {
+		actualText := t.emit(actual)
+		expectedText := t.emit(expected)
+		t.addImport("strings")
+		return fmt.Sprintf("%s != nil && strings.Contains(%s.Error(), %s)", actualText, actualText, expectedText)
+	}
+	if strings.Contains(nodeText, " is ") && expected != nil {
+		actualText := t.emit(actual)
+		expectedText := t.emit(expected)
+		t.addImport("errors")
+		return fmt.Sprintf("errors.Is(%s, %s)", actualText, expectedText)
+	}
 
 	if matcher != nil {
 		actualText := t.emit(actual)
@@ -160,6 +180,7 @@ func (t *dmjTranspiler) emitExpectAssertion(n *gotreesitter.Node) string {
 	actual := t.childByField(n, "actual")
 	expected := t.childByField(n, "expected")
 	matcher := t.childByField(n, "matcher")
+	matchNode := t.childByField(n, "match")
 
 	if actual == nil {
 		return t.text(n)
@@ -168,6 +189,45 @@ func (t *dmjTranspiler) emitExpectAssertion(n *gotreesitter.Node) string {
 	ld := t.lineDirective(n)
 	nodeText := t.text(n)
 	msg := t.expectFailureContext("expect", strings.TrimSpace(nodeText), n)
+
+	if matchNode != nil {
+		t.addImport("github.com/stretchr/testify/assert")
+		actualText := t.emit(actual)
+		matchText := t.emitMatchBlock(matchNode)
+		var b strings.Builder
+		b.WriteString(ld)
+		b.WriteString("{\n")
+		fmt.Fprintf(&b, "if _ok, _diff := danmujiPartialMatch(%s, %s); !_ok {\n", matchText, actualText)
+		fmt.Fprintf(&b, "\tassert.Fail(%s, %s, _diff)\n", t.testVar, msg)
+		b.WriteString("}\n")
+		b.WriteString("}")
+		return b.String()
+	}
+	if strings.Contains(nodeText, "unordered_equal") && expected != nil {
+		t.addImport("github.com/stretchr/testify/assert")
+		actualText := t.emit(actual)
+		expectedText := t.emit(expected)
+		var b strings.Builder
+		b.WriteString(ld)
+		b.WriteString("{\n")
+		fmt.Fprintf(&b, "if _ok, _diff := danmujiUnorderedEqualDetail(%s, %s); !_ok {\n", expectedText, actualText)
+		fmt.Fprintf(&b, "\tassert.Fail(%s, %s, _diff)\n", t.testVar, msg)
+		b.WriteString("}\n")
+		b.WriteString("}")
+		return b.String()
+	}
+	if strings.Contains(nodeText, " message contains ") && expected != nil {
+		t.addImport("github.com/stretchr/testify/assert")
+		actualText := t.emit(actual)
+		expectedText := t.emit(expected)
+		return ld + fmt.Sprintf("assert.ErrorContains(%s, %s, %s, %s)", t.testVar, actualText, expectedText, msg)
+	}
+	if strings.Contains(nodeText, " is ") && expected != nil {
+		t.addImport("github.com/stretchr/testify/assert")
+		actualText := t.emit(actual)
+		expectedText := t.emit(expected)
+		return ld + fmt.Sprintf("assert.ErrorIs(%s, %s, %s, %s)", t.testVar, actualText, expectedText, msg)
+	}
 
 	if matcher != nil {
 		actualText := t.emit(actual)
@@ -287,6 +347,48 @@ func (t *dmjTranspiler) emitReject(n *gotreesitter.Node) string {
 	t.addImport("github.com/stretchr/testify/assert")
 	actualText := t.emit(actual)
 	return t.lineDirective(n) + fmt.Sprintf("assert.False(%s, %s, %s)", t.testVar, actualText, msg)
+}
+
+func (t *dmjTranspiler) emitMatchBlock(n *gotreesitter.Node) string {
+	var parts []string
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		field := n.NamedChild(i)
+		if t.nodeType(field) != "match_field" {
+			continue
+		}
+		keyNode := t.childByField(field, "key")
+		valueNode := t.childByField(field, "value")
+		if keyNode == nil || valueNode == nil {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%q: %s", t.text(keyNode), t.emitMatchValue(valueNode)))
+	}
+	return fmt.Sprintf("map[string]interface{}{%s}", strings.Join(parts, ", "))
+}
+
+func (t *dmjTranspiler) emitMatchValue(n *gotreesitter.Node) string {
+	if n == nil {
+		return "nil"
+	}
+
+	nodeText := strings.TrimSpace(t.text(n))
+	expectedNode := t.childByField(n, "expected")
+	switch {
+	case strings.HasPrefix(nodeText, "contains ") && expectedNode != nil:
+		return fmt.Sprintf("danmujiMatchContains(%s)", t.emit(expectedNode))
+	case nodeText == "is_nil":
+		return "danmujiMatchNil()"
+	case nodeText == "not_nil":
+		return "danmujiMatchNotNil()"
+	}
+
+	if t.nodeType(n) == "match_value" {
+		for i := 0; i < int(n.NamedChildCount()); i++ {
+			return t.emit(n.NamedChild(i))
+		}
+	}
+
+	return t.emit(n)
 }
 
 // ---------------------------------------------------------------------------

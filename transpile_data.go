@@ -2,8 +2,8 @@ package danmuji
 
 import (
 	"fmt"
-	"strings"
 	gotreesitter "github.com/odvcencio/gotreesitter"
+	"strings"
 )
 
 // ---------------------------------------------------------------------------
@@ -102,6 +102,13 @@ func (t *dmjTranspiler) emitEachDo(n *gotreesitter.Node) string {
 	fmt.Fprintf(&b, "\t_scenarioName := fmt.Sprintf(\"%%v\", scenario.name)\n")
 	fmt.Fprintf(&b, "\t%s.Run(_scenarioName, func(%s *testing.T) {\n", tv, tv)
 	fmt.Fprintf(&b, "\t\t%s.Parallel()\n", tv)
+	for _, f := range allFields {
+		if f == "name" {
+			continue
+		}
+		fmt.Fprintf(&b, "\t\t%s := scenario.%s\n", f, f)
+		fmt.Fprintf(&b, "\t\t_ = %s\n", f)
+	}
 
 	// Emit the body
 	if bodyNode != nil {
@@ -257,6 +264,10 @@ func (t *dmjTranspiler) emitMatrix(n *gotreesitter.Node) string {
 
 	fmt.Fprintf(&b, "\t%s.Run(name, func(%s *testing.T) {\n", tv, tv)
 	fmt.Fprintf(&b, "\t\t%s.Parallel()\n", tv)
+	for _, dim := range dims {
+		fmt.Fprintf(&b, "\t\t%s := scenario.%s\n", dim.key, dim.key)
+		fmt.Fprintf(&b, "\t\t_ = %s\n", dim.key)
+	}
 
 	// Emit the body
 	if bodyNode != nil {
@@ -278,7 +289,6 @@ func (t *dmjTranspiler) emitMatrix(n *gotreesitter.Node) string {
 // ---------------------------------------------------------------------------
 
 func (t *dmjTranspiler) emitTable(n *gotreesitter.Node) string {
-	t.addImport("fmt")
 	nameNode := t.childByField(n, "name")
 	tableName := "cases"
 	if nameNode != nil {

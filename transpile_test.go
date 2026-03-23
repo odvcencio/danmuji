@@ -183,7 +183,7 @@ integration "with database" {
 	if !strings.Contains(goCode, `ExposedPorts: []string{"5432/tcp"}`) {
 		t.Error("expected service port to be exposed")
 	}
-	if !strings.Contains(goCode, `dbContainer.Endpoint(ctx, "5432/tcp")`) {
+	if !strings.Contains(goCode, `dbContainer.Endpoint(dbCtx, "5432/tcp")`) {
 		t.Error("expected Endpoint to use a string port argument")
 	}
 	if !strings.Contains(goCode, "require.NoError") {
@@ -194,6 +194,346 @@ integration "with database" {
 	}
 	if !strings.Contains(goCode, `"github.com/stretchr/testify/require"`) {
 		t.Error("expected testify require import")
+	}
+}
+
+func TestTranspileDanmujiNeedsPostgresEnvAndScope(t *testing.T) {
+	source := []byte(`package myservice_test
+
+import "testing"
+
+integration "with database" {
+	needs postgres db {
+		password: "test"
+		database: "goetrope_test"
+	}
+	then "endpoint is available" {
+		expect dbEndpoint not_nil
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if !strings.Contains(goCode, `dbReq.Env = map[string]string{"POSTGRES_PASSWORD": fmt.Sprint("test"), "POSTGRES_DB": fmt.Sprint("goetrope_test")}`) &&
+		!strings.Contains(goCode, `dbReq.Env = map[string]string{"POSTGRES_DB": fmt.Sprint("goetrope_test"), "POSTGRES_PASSWORD": fmt.Sprint("test")}`) {
+		t.Error("expected postgres env vars in generated request")
+	}
+	if !strings.Contains(goCode, "dbEndpoint, dbErr := dbContainer.Endpoint") {
+		t.Error("expected dbEndpoint to be lifted to test scope")
+	}
+	if strings.Contains(goCode, "{\n\tctx := context.Background()") {
+		t.Error("expected needs block setup to avoid an extra local wrapper scope")
+	}
+}
+
+func TestTranspileDanmujiNeedsTempdir(t *testing.T) {
+	source := []byte(`package main_test
+
+import "testing"
+
+unit "tempdir fixture" {
+	needs tempdir dir
+	then "provides a directory" {
+		expect dir != ""
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if !strings.Contains(goCode, "dir := t.TempDir()") {
+		t.Error("expected tempdir fixture to use t.TempDir")
+	}
+
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "main_test.go", goCode)
+
+	cmd := exec.Command("go", "test", "-v", "./...")
+	cmd.Dir = tmpDir
+	out, err := cmd.CombinedOutput()
+	t.Logf("go test output:\n%s", string(out))
+	if err != nil {
+		t.Fatalf("go test failed: %v\n%s", err, out)
+	}
+}
+
+func TestTranspileDanmujiNeedsHTTPServer(t *testing.T) {
+	source := []byte(`package main_test
+
+import (
+	"net/http"
+	"testing"
+)
+
+unit "http fixture" {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	needs http server {
+		handler handler
+	}
+
+	then "serves requests" {
+		resp, err := http.Get(server.URL + "/ping")
+		expect err == nil
+		expect resp.StatusCode == http.StatusNoContent
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if !strings.Contains(goCode, "server := httptest.NewServer(handler)") {
+		t.Error("expected httptest server fixture in generated code")
+	}
+
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "main_test.go", goCode)
+
+	cmd := exec.Command("go", "test", "-v", "./...")
+	cmd.Dir = tmpDir
+	out, err := cmd.CombinedOutput()
+	t.Logf("go test output:\n%s", string(out))
+	if err != nil {
+		t.Fatalf("go test failed: %v\n%s", err, out)
+	}
+}
+
+func TestTranspileDanmujiFactoryBuild(t *testing.T) {
+	source := []byte(`package main_test
+
+import "testing"
+
+type User struct {
+	Name string
+	Role string
+}
+
+factory User {
+	defaults { Name: "alice", Role: "member" }
+	trait admin { Role: "admin" }
+}
+
+unit "factory build" {
+	user := build User with admin { Name: "bob" }
+	then "applies defaults traits and overrides" {
+		expect user.Name == "bob"
+		expect user.Role == "admin"
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if strings.Contains(goCode, "factory User") {
+		t.Error("expected factory declaration to stay DSL-only")
+	}
+	if !strings.Contains(goCode, `User{Name: "bob", Role: "admin"}`) {
+		t.Error("expected build expression to emit a Go composite literal with overrides applied")
+	}
+
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "main_test.go", goCode)
+
+	cmd := exec.Command("go", "test", "-v", "./...")
+	cmd.Dir = tmpDir
+	out, err := cmd.CombinedOutput()
+	t.Logf("go test output:\n%s", string(out))
+	if err != nil {
+		t.Fatalf("go test failed: %v\n%s", err, out)
+	}
+}
+
+func TestTranspileDanmujiFactoryUnknownTrait(t *testing.T) {
+	source := []byte(`package main_test
+
+factory User {
+	defaults { Name: "alice" }
+}
+
+unit "bad build" {
+	_ = build User with admin
+}
+`)
+
+	_, err := TranspileDanmuji(source, TranspileOptions{SourceFile: "bad_test.dmj"})
+	if err == nil {
+		t.Fatal("expected semantic error for unknown factory trait")
+	}
+	if !strings.Contains(err.Error(), "does not define trait admin") {
+		t.Fatalf("expected unknown trait diagnostic, got: %v", err)
+	}
+}
+
+func TestTranspileDanmujiStructLiteralInsideThen(t *testing.T) {
+	source := []byte(`package main_test
+
+import "testing"
+
+type DriftReport struct {
+	Drift float64
+}
+
+unit "struct literals" {
+	then "stay Go" {
+		msg := DriftReport{Drift: 0.05}
+		expect msg.Drift == 0.05
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if !strings.Contains(goCode, `DriftReport{Drift: 0.05}`) {
+		t.Error("expected struct literal to survive transpilation")
+	}
+
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "main_test.go", goCode)
+
+	cmd := exec.Command("go", "test", "-v", "./...")
+	cmd.Dir = tmpDir
+	out, err := cmd.CombinedOutput()
+	t.Logf("go test output:\n%s", string(out))
+	if err != nil {
+		t.Fatalf("go test failed: %v\n%s", err, out)
+	}
+}
+
+func TestTranspileDanmujiRichAssertions(t *testing.T) {
+	source := []byte(`package main_test
+
+import (
+	"context"
+	"fmt"
+	"testing"
+)
+
+type User struct {
+	Name  string
+	Role  string
+	Email string
+}
+
+unit "rich assertions" {
+	user := User{Name: "alice", Role: "admin", Email: "alice@example.com"}
+	items := []int{3, 1, 2}
+	err := fmt.Errorf("wrapped: %w", context.DeadlineExceeded)
+
+	then "matches partial struct" {
+		expect user matches { Role: "admin", Email: contains "@example.com", Name: not_nil }
+	}
+
+	then "compares unordered slices" {
+		expect items unordered_equal []int{1, 2, 3}
+	}
+
+	then "checks wrapped errors" {
+		expect err is context.DeadlineExceeded
+		expect err message contains "wrapped"
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if !strings.Contains(goCode, "danmujiPartialMatch") {
+		t.Error("expected partial match helper call in output")
+	}
+	if !strings.Contains(goCode, "danmujiUnorderedEqualDetail") {
+		t.Error("expected unordered equality helper call in output")
+	}
+	if !strings.Contains(goCode, "assert.ErrorIs") {
+		t.Error("expected ErrorIs assertion in output")
+	}
+	if !strings.Contains(goCode, "assert.ErrorContains") {
+		t.Error("expected ErrorContains assertion in output")
+	}
+
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "main_test.go", goCode)
+
+	cmd := exec.Command("go", "test", "-v", "./...")
+	cmd.Dir = tmpDir
+	out, err := cmd.CombinedOutput()
+	t.Logf("go test output:\n%s", string(out))
+	if err != nil {
+		t.Fatalf("go test failed: %v\n%s", err, out)
+	}
+}
+
+func TestTranspileDanmujiAwait(t *testing.T) {
+	source := []byte(`package main_test
+
+import (
+	"testing"
+	"time"
+)
+
+unit "await channel values" {
+	jobs := make(chan string, 1)
+	jobs <- "ready"
+
+	await <-jobs within 2s as job
+
+	then "binds the received value" {
+		expect job == "ready"
+	}
+
+	then "times out through the helper signature" {
+		other := make(chan int, 1)
+		other <- 7
+		await <-other within 2 * time.Second as value
+		expect value == 7
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if !strings.Contains(goCode, "danmujiAwait(") {
+		t.Error("expected await helper call in output")
+	}
+
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "main_test.go", goCode)
+
+	cmd := exec.Command("go", "test", "-v", "./...")
+	cmd.Dir = tmpDir
+	out, err := cmd.CombinedOutput()
+	t.Logf("go test output:\n%s", string(out))
+	if err != nil {
+		t.Fatalf("go test failed: %v\n%s", err, out)
 	}
 }
 
@@ -581,6 +921,32 @@ unit "table driven" {
 	}
 }
 
+func TestTranspileDanmujiTableDoesNotInjectUnusedFmt(t *testing.T) {
+	source := []byte(`package table_test
+
+import "testing"
+
+unit "table only" {
+	table sums {
+		| 1 | 2 |
+	}
+	then "still compiles" {
+		expect true
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if strings.Contains(goCode, "\n\t\"fmt\"\n") || strings.Contains(goCode, "import \"fmt\"") {
+		t.Error("expected fmt import to be omitted when generated table code does not use it")
+	}
+}
+
 func TestTranspileDanmujiNoLeaks(t *testing.T) {
 	source := []byte(`package noleak_test
 
@@ -957,6 +1323,51 @@ unit "combinations" {
 	}
 }
 
+func TestTranspileDanmujiMatrixAliasesAcrossNestedBlocks(t *testing.T) {
+	source := []byte(`package matrix_test
+
+import "testing"
+
+unit "matrix aliases" {
+	matrix "codec x audio" {
+		codec: { "h264" }
+		hasAudio: { true }
+	} do {
+		given "nested blocks" {
+			then "can see aliases" {
+				expect codec == "h264"
+				expect hasAudio == true
+			}
+		}
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if !strings.Contains(goCode, "codec := scenario.codec") {
+		t.Error("expected codec alias local in generated matrix loop")
+	}
+	if !strings.Contains(goCode, "hasAudio := scenario.hasAudio") {
+		t.Error("expected hasAudio alias local in generated matrix loop")
+	}
+
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "main_test.go", goCode)
+
+	cmd := exec.Command("go", "test", "-v", "./...")
+	cmd.Dir = tmpDir
+	out, err := cmd.CombinedOutput()
+	t.Logf("go test output:\n%s", string(out))
+	if err != nil {
+		t.Fatalf("go test failed: %v\n%s", err, out)
+	}
+}
+
 func TestTranspileDanmujiProperty(t *testing.T) {
 	source := []byte(`package property_test
 
@@ -1137,6 +1548,171 @@ unit "handler helpers" {
 	}
 	if !strings.Contains(string(out), "PASS") {
 		t.Error("expected PASS in go test output")
+	}
+}
+
+func TestTranspileDanmujiWebSocketHelpers(t *testing.T) {
+	source := []byte(`package wshelper_test
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/gorilla/websocket"
+)
+
+var upgrader = websocket.Upgrader{}
+
+unit "websocket helpers" {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		_ = conn.WriteMessage(websocket.BinaryMessage, []byte{0x01, 0x02})
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		_ = conn.WriteMessage(websocket.BinaryMessage, payload)
+	}))
+	defer server.Close()
+
+	ws := danmujiWS.Dial(server, "/ws")
+	defer ws.Close()
+
+	then "receives heartbeat" {
+		msg := ws.ReadBinary(2 * time.Second)
+		expect msg[0] == byte(0x01)
+	}
+
+	ws.SendBinary([]byte{0x09})
+
+	then "echoes payload" {
+		msg := ws.ReadBinary(2 * time.Second)
+		expect msg[0] == byte(0x09)
+		expect ws.LastMessage() not_nil
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if !strings.Contains(goCode, "var danmujiWS danmujiWSHelperSet") {
+		t.Error("expected danmujiWS helper declaration in generated code")
+	}
+	if !strings.Contains(goCode, "websocket.DefaultDialer.Dial") {
+		t.Error("expected websocket dial helper in generated code")
+	}
+	if !strings.Contains(goCode, "ReadBinary") {
+		t.Error("expected websocket read helper in generated code")
+	}
+
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "ws_helper_test.go", goCode)
+
+	runCmd := exec.Command("go", "test", "-v", "./...")
+	runCmd.Dir = tmpDir
+	out, err := runCmd.CombinedOutput()
+	t.Logf("go test output:\n%s", string(out))
+	if err != nil {
+		t.Fatalf("go test failed: %v\n%s", err, out)
+	}
+}
+
+func TestTranspileDanmujiGRPCHelpers(t *testing.T) {
+	source := []byte(`package grpchelper_test
+
+import (
+	"context"
+	"testing"
+
+	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/wrapperspb"
+)
+
+type pingServer interface {
+	Ping(context.Context, *wrapperspb.StringValue) (*wrapperspb.StringValue, error)
+}
+
+type pingImpl struct{}
+
+func (pingImpl) Ping(ctx context.Context, in *wrapperspb.StringValue) (*wrapperspb.StringValue, error) {
+	return wrapperspb.String("pong:" + in.Value), nil
+}
+
+var pingServiceDesc = grpc.ServiceDesc{
+	ServiceName: "test.PingService",
+	HandlerType: (*pingServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Ping",
+			Handler: func(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+				in := new(wrapperspb.StringValue)
+				if err := dec(in); err != nil {
+					return nil, err
+				}
+				if interceptor == nil {
+					return srv.(pingServer).Ping(ctx, in)
+				}
+				info := &grpc.UnaryServerInfo{
+					Server: srv,
+					FullMethod: "/test.PingService/Ping",
+				}
+				handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+					return srv.(pingServer).Ping(ctx, req.(*wrapperspb.StringValue))
+				}
+				return interceptor(ctx, in, info, handler)
+			},
+		},
+	},
+}
+
+unit "grpc helpers" {
+	conn := danmujiGRPC.Bufconn(func(s *grpc.Server) {
+		s.RegisterService(&pingServiceDesc, pingImpl{})
+	})
+	defer conn.Close()
+
+	then "invokes unary grpc calls" {
+		out := new(wrapperspb.StringValue)
+		err := conn.Conn().Invoke(context.Background(), "/test.PingService/Ping", wrapperspb.String("ping"), out)
+		expect err == nil
+		expect out.Value == "pong:ping"
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if !strings.Contains(goCode, "var danmujiGRPC danmujiGRPCHelperSet") {
+		t.Error("expected danmujiGRPC helper declaration in generated code")
+	}
+	if !strings.Contains(goCode, "bufconn.Listen") {
+		t.Error("expected bufconn helper in generated code")
+	}
+
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "grpc_helper_test.go", goCode)
+
+	runCmd := exec.Command("go", "test", "-v", "./...")
+	runCmd.Dir = tmpDir
+	out, err := runCmd.CombinedOutput()
+	t.Logf("go test output:\n%s", string(out))
+	if err != nil {
+		t.Fatalf("go test failed: %v\n%s", err, out)
 	}
 }
 

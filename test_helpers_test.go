@@ -39,6 +39,8 @@ func prepareSharedTestModule() (string, error) {
 go 1.24.0
 
 require github.com/stretchr/testify v1.9.0
+require github.com/gorilla/websocket v1.5.3
+require google.golang.org/grpc v1.76.0
 `
 	if err := os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte(goMod), 0644); err != nil {
 		return "", err
@@ -47,6 +49,8 @@ require github.com/stretchr/testify v1.9.0
 	placeholder := `package testmod_test
 
 import _ "github.com/stretchr/testify/assert"
+import _ "github.com/gorilla/websocket"
+import _ "google.golang.org/grpc"
 `
 	placeholderPath := filepath.Join(tmpDir, "placeholder_test.go")
 	if err := os.WriteFile(placeholderPath, []byte(placeholder), 0644); err != nil {

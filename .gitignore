@@ -1,3 +1,4 @@
 .gts/
 grammar.bin
 grammar.json
+!testdata/grammar.json

@@ -162,6 +162,10 @@ func TestDanmujiExpect(t *testing.T) {
 func f() {
 	expect x == 1
 	expect err != nil
+	expect user matches { role: "admin", email: contains "@" }
+	expect items unordered_equal expected
+	expect err is context.DeadlineExceeded
+	expect err message contains "timeout"
 	expect user to_have_role "admin"
 	expect order to_be_paid
 }
@@ -170,6 +174,64 @@ func f() {
 	t.Logf("SExpr: %s", sexp)
 	if !strings.Contains(sexp, "expect_statement") {
 		t.Error("expected expect_statement node")
+	}
+	if strings.Contains(sexp, "ERROR") {
+		t.Errorf("unexpected ERROR: %s", sexp)
+	}
+}
+
+func TestDanmujiFactoryAndBuild(t *testing.T) {
+	input := `package main
+
+factory User {
+	defaults { Name: "alice", Role: "member" }
+	trait admin { Role: "admin" }
+}
+
+func f() {
+	user := build User with admin { Name: "bob" }
+	_ = user
+}
+`
+	sexp := parseDanmuji(t, input)
+	t.Logf("SExpr: %s", sexp)
+	if !strings.Contains(sexp, "factory_declaration") {
+		t.Error("expected factory_declaration node")
+	}
+	if !strings.Contains(sexp, "factory_trait_block") {
+		t.Error("expected factory_trait_block node")
+	}
+	if !strings.Contains(sexp, "build_expression") {
+		t.Error("expected build_expression node")
+	}
+	if strings.Contains(sexp, "ERROR") {
+		t.Errorf("unexpected ERROR: %s", sexp)
+	}
+}
+
+func TestDanmujiStructLiteralInsideBlock(t *testing.T) {
+	input := `package main
+
+import "testing"
+
+type DriftReport struct {
+	Drift float64
+}
+
+unit "struct literals" {
+	then "stay Go" {
+		msg := DriftReport{Drift: 0.05}
+		_ = msg
+	}
+}
+`
+	sexp := parseDanmuji(t, input)
+	t.Logf("SExpr: %s", sexp)
+	if !strings.Contains(sexp, "composite_literal") {
+		t.Error("expected composite_literal node")
+	}
+	if strings.Contains(sexp, "scenario_field") {
+		t.Error("struct literal field should not parse as danmuji scenario_field")
 	}
 	if strings.Contains(sexp, "ERROR") {
 		t.Errorf("unexpected ERROR: %s", sexp)
@@ -194,6 +256,22 @@ func f() {
 	}
 	if !strings.Contains(sexp, "consistently_block") {
 		t.Error("expected consistently_block node")
+	}
+	if strings.Contains(sexp, "ERROR") {
+		t.Errorf("unexpected ERROR: %s", sexp)
+	}
+}
+
+func TestDanmujiAwait(t *testing.T) {
+	input := `package main
+func f() {
+	await <-jobs within 2s as job
+}
+`
+	sexp := parseDanmuji(t, input)
+	t.Logf("SExpr: %s", sexp)
+	if !strings.Contains(sexp, "await_statement") {
+		t.Error("expected await_statement node")
 	}
 	if strings.Contains(sexp, "ERROR") {
 		t.Errorf("unexpected ERROR: %s", sexp)
@@ -320,6 +398,10 @@ func TestDanmujiNeedsBlock(t *testing.T) {
 func f() {
 	needs postgres db {
 		port = 5432
+	}
+	needs tempdir dir
+	needs http server {
+		handler handler
 	}
 }
 `

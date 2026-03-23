@@ -67,11 +67,14 @@ func TranspileDanmuji(source []byte, opts TranspileOptions) (string, error) {
 		lang:                     lang,
 		testVar:                  "t",
 		httpTestHelpersRequested: strings.Contains(string(source), "danmujiHTTP."),
+		wsTestHelpersRequested:   strings.Contains(string(source), "danmujiWS."),
+		grpcTestHelpersRequested: strings.Contains(string(source), "danmujiGRPC."),
 		sourceFile:               opts.SourceFile,
 		emitLineDirectives:       opts.SourceFile != "" && !opts.Debug,
 	}
 	// First pass: collect package-level declarations (mocks)
 	tr.collectTopLevel(root)
+	tr.validateFactoryUsage()
 	if err := tr.semanticError(); err != nil {
 		return "", err
 	}
@@ -101,6 +104,10 @@ type dmjTranspiler struct {
 	testVar string // "t" for tests, "b" for benchmarks
 	// Whether the source references danmujiHTTP helper methods.
 	httpTestHelpersRequested bool
+	// Whether the source references danmujiWS helper methods.
+	wsTestHelpersRequested bool
+	// Whether the source references danmujiGRPC helper methods.
+	grpcTestHelpersRequested bool
 	// Source file path for //line directives.
 	sourceFile string
 	// Whether to emit //line directives (true when sourceFile != "" && !Debug).
@@ -110,9 +117,16 @@ type dmjTranspiler struct {
 	mockDecls []string
 	// Set of package-level declaration bodies already collected for this file.
 	packageDeclSeen map[string]bool
+	// DSL-only factory declarations collected during the first pass.
+	factories map[string]*factoryDefinition
 	// Set of mock_declaration nodes (by start byte) that have been collected
 	// so emit() can skip emitting them inline.
 	collectedMockStarts map[uint32]bool
+	// Set of factory_declaration nodes (by start byte) that have been collected
+	// so emit() can skip emitting them inline.
+	collectedFactoryStarts map[uint32]bool
+	// build expressions to validate after all factories have been collected.
+	pendingBuilds []*gotreesitter.Node
 	// Collected imports (deduped by package path).
 	neededImports map[string]bool
 	// Whether we are inside an exec block (for special identifier translation).
@@ -131,10 +145,16 @@ type dmjTranspiler struct {
 	fakeClockTypeDecl string
 	// One-time package-level helpers for polling assertions.
 	pollingHelpersEmitted bool
+	// One-time package-level helpers for await statements.
+	awaitHelpersEmitted bool
 	// Whether the syncBuffer type has been collected for package-level emission.
 	syncBufferEmitted bool
 	// Whether the danmujiHTTP helper set has been collected for package-level emission.
 	httpTestHelpersEmitted bool
+	// Whether the danmujiWS helper set has been collected for package-level emission.
+	wsTestHelpersEmitted bool
+	// Whether the danmujiGRPC helper set has been collected for package-level emission.
+	grpcTestHelpersEmitted bool
 	// Semantic diagnostics discovered during transpilation.
 	semanticErrors []transpileDiagnostic
 	// Test categories encountered in this file.
@@ -277,6 +297,9 @@ func (t *dmjTranspiler) collectTopLevel(n *gotreesitter.Node) {
 	if t.collectedMockStarts == nil {
 		t.collectedMockStarts = make(map[uint32]bool)
 	}
+	if t.collectedFactoryStarts == nil {
+		t.collectedFactoryStarts = make(map[uint32]bool)
+	}
 	nt := t.nodeType(n)
 	if nt == "test_block" {
 		if categoryNode := t.childByField(n, "category"); categoryNode != nil {
@@ -302,8 +325,35 @@ func (t *dmjTranspiler) collectTopLevel(n *gotreesitter.Node) {
 		t.addImport("strings")
 		t.appendPackageDecl(httpTestHelpers)
 	}
+	if nt == "source_file" && t.wsTestHelpersRequested && !t.wsTestHelpersEmitted {
+		t.wsTestHelpersEmitted = true
+		t.addImport("fmt")
+		t.addImport("net/http/httptest")
+		t.addImport("strings")
+		t.addImport("time")
+		t.addImport("github.com/gorilla/websocket")
+		t.appendPackageDecl(wsTestHelpers)
+	}
+	if nt == "source_file" && t.grpcTestHelpersRequested && !t.grpcTestHelpersEmitted {
+		t.grpcTestHelpersEmitted = true
+		t.addImport("context")
+		t.addImport("fmt")
+		t.addImport("net")
+		t.addImport("google.golang.org/grpc")
+		t.addImport("google.golang.org/grpc/credentials/insecure")
+		t.addImport("google.golang.org/grpc/test/bufconn")
+		t.appendPackageDecl(grpcTestHelpers)
+	}
 	if nt == "fuzz_block" {
 		t.validateFuzzBlock(n)
+	}
+	if nt == "factory_declaration" {
+		t.collectFactoryDecl(n)
+		t.collectedFactoryStarts[n.StartByte()] = true
+		return
+	}
+	if nt == "build_expression" {
+		t.pendingBuilds = append(t.pendingBuilds, n)
 	}
 	if nt == "mock_declaration" {
 		t.appendPackageDecl(t.buildMockDecl(n))
@@ -394,9 +444,12 @@ func (c *fakeClock) SetLocation(loc *time.Location) {
 		// Don't return — continue recursion to find nested mocks
 	}
 	if (nt == "eventually_block" || nt == "consistently_block" || nt == "property_block" ||
-		(nt == "verify_statement" && strings.Contains(t.text(n), "called") && strings.Contains(t.text(n), "with"))) && !t.pollingHelpersEmitted {
+		(nt == "verify_statement" && strings.Contains(t.text(n), "called") && strings.Contains(t.text(n), "with")) ||
+		(nt == "expect_statement" && (strings.Contains(t.text(n), " matches ") || strings.Contains(t.text(n), "unordered_equal")))) && !t.pollingHelpersEmitted {
 		t.pollingHelpersEmitted = true
+		t.addImport("fmt")
 		t.addImport("reflect")
+		t.addImport("sort")
 		t.addImport("strings")
 		t.appendPackageDecl(pollingAssertionHelpers)
 	}
@@ -406,6 +459,11 @@ func (c *fakeClock) SetLocation(loc *time.Location) {
 		t.addImport("bytes")
 		t.appendPackageDecl(syncBufferHelper)
 		// Don't return — continue recursion to find nested mocks
+	}
+	if nt == "await_statement" && !t.awaitHelpersEmitted {
+		t.awaitHelpersEmitted = true
+		t.addImport("time")
+		t.appendPackageDecl(awaitHelpers)
 	}
 	for i := 0; i < int(n.ChildCount()); i++ {
 		t.collectTopLevel(n.Child(i))
@@ -418,6 +476,11 @@ func (c *fakeClock) SetLocation(loc *time.Location) {
 
 func (t *dmjTranspiler) emit(n *gotreesitter.Node) string {
 	switch t.nodeType(n) {
+	case "factory_declaration":
+		if t.collectedFactoryStarts[n.StartByte()] {
+			return ""
+		}
+		return t.text(n)
 	case "test_block":
 		return t.emitTestBlock(n)
 	case "given_block":
@@ -431,6 +494,8 @@ func (t *dmjTranspiler) emit(n *gotreesitter.Node) string {
 			return t.emitExecExpect(n)
 		}
 		return t.emitExpect(n)
+	case "build_expression":
+		return t.emitBuildExpression(n)
 	case "reject_statement":
 		if t.inExecBlock {
 			return t.emitExecReject(n)
@@ -489,6 +554,8 @@ func (t *dmjTranspiler) emit(n *gotreesitter.Node) string {
 		return t.emitEventually(n)
 	case "consistently_block":
 		return t.emitConsistently(n)
+	case "await_statement":
+		return t.emitAwait(n)
 	case "property_block":
 		return t.emitProperty(n)
 	case "fuzz_block":

@@ -81,6 +81,31 @@ func DanmujiGrammar() *Grammar {
 		// ---------------------------------------------------------------
 		// Assertions
 		// ---------------------------------------------------------------
+		g.Define("match_value",
+			Choice(
+				Seq(Str("contains"), Field("expected", Sym("_expression"))),
+				Str("is_nil"),
+				Str("not_nil"),
+				Sym("_expression"),
+			))
+
+		g.Define("match_field",
+			Seq(
+				Field("key", Sym("identifier")),
+				Str(":"),
+				Field("value", Sym("match_value")),
+			))
+
+		g.Define("match_block",
+			Seq(
+				Str("{"),
+				Choice(
+					CommaSep1(Sym("match_field")),
+					Repeat1(Sym("match_field")),
+				),
+				Str("}"),
+			))
+
 		g.Define("expect_statement",
 			Seq(
 				Str("expect"),
@@ -90,13 +115,17 @@ func DanmujiGrammar() *Grammar {
 						Seq(Str("=="), Field("expected", Sym("_expression"))),
 						Seq(Str("!="), Field("expected", Sym("_expression"))),
 						Seq(Str("contains"), Field("expected", Sym("_expression"))),
+						Seq(Str("matches"), Field("match", Sym("match_block"))),
+						Seq(Str("unordered_equal"), Field("expected", Sym("_expression"))),
+						Seq(Str("is"), Field("expected", Sym("_expression"))),
+						Seq(Str("message"), Str("contains"), Field("expected", Sym("_expression"))),
 						Str("is_nil"),
 						Str("not_nil"),
 						// Domain matcher style: expect user to_have_role "admin"
-						Seq(
+						PrecDynamic(-1, Seq(
 							Field("matcher", Sym("identifier")),
 							Optional(Field("expected", Sym("_expression"))),
-						),
+						)),
 					),
 				),
 			))
@@ -237,7 +266,15 @@ func DanmujiGrammar() *Grammar {
 				Str("mongo"),
 				Str("rabbitmq"),
 				Str("nats"),
+				Str("tempdir"),
+				Str("http"),
 				Str("container"),
+			))
+
+		g.Define("handler_directive",
+			Seq(
+				Str("handler"),
+				Field("value", Sym("_expression")),
 			))
 
 		g.Define("needs_block",
@@ -245,7 +282,7 @@ func DanmujiGrammar() *Grammar {
 				Str("needs"),
 				Field("service", Sym("service_type")),
 				Field("name", Sym("identifier")),
-				Sym("block"),
+				Optional(Field("body", Sym("block"))),
 			))
 
 		// ---------------------------------------------------------------
@@ -399,6 +436,45 @@ func DanmujiGrammar() *Grammar {
 			Str("}"),
 		))
 
+		// ---------------------------------------------------------------
+		// Factories and build expressions
+		// ---------------------------------------------------------------
+		g.Define("factory_overrides_block", Seq(
+			Str("{"),
+			CommaSep1(Sym("scenario_field")),
+			Str("}"),
+		))
+
+		g.Define("factory_trait_block", Seq(
+			Str("trait"),
+			Field("name", Sym("identifier")),
+			Field("body", Sym("factory_overrides_block")),
+		))
+
+		g.Define("factory_declaration", Seq(
+			Str("factory"),
+			Field("name", Sym("identifier")),
+			Field("body", Sym("block")),
+		))
+
+		g.Define("trait_list", Seq(
+			Field("trait", Sym("identifier")),
+			Repeat(Seq(
+				Str(","),
+				Field("trait", Sym("identifier")),
+			)),
+		))
+
+		g.Define("build_expression", PrecDynamic(20, Seq(
+			Str("build"),
+			Field("name", Sym("identifier")),
+			Optional(Seq(
+				Str("with"),
+				Field("traits", Sym("trait_list")),
+			)),
+			Optional(Field("overrides", Sym("factory_overrides_block"))),
+		)))
+
 		// each_do_block: "each" string block "do" block
 		// The first block contains defaults_block and scenario_entry statements.
 		// Using Sym("block") for the scenario list because Go's grammar requires
@@ -495,6 +571,18 @@ func DanmujiGrammar() *Grammar {
 			Field("body", Sym("block")),
 		))
 
+		g.Define("await_statement", Seq(
+			Str("await"),
+			Field("target", Sym("_expression")),
+			Str("within"),
+			Field("duration", Choice(
+				Sym("duration_literal"),
+				Sym("_expression"),
+			)),
+			Str("as"),
+			Field("name", Sym("identifier")),
+		))
+
 		// ---------------------------------------------------------------
 		// Process blocks: opaque-box testing
 		// ---------------------------------------------------------------
@@ -566,12 +654,18 @@ func DanmujiGrammar() *Grammar {
 		}
 
 		AppendChoice(g, "_top_level_declaration", Choice(
+			Sym("factory_declaration"),
 			Sym("test_block"),
 			Sym("benchmark_block"),
 			Sym("load_block"),
 		))
 
+		AppendChoice(g, "_expression", Choice(
+			Sym("build_expression"),
+		))
+
 		AppendChoice(g, "_statement", Choice(
+			dslStatement("factory_declaration"),
 			dslStatement("given_block"),
 			dslStatement("when_block"),
 			dslStatement("then_block"),
@@ -587,6 +681,7 @@ func DanmujiGrammar() *Grammar {
 			Sym("mock_method"),
 			Sym("fake_method"),
 			dslStatement("needs_block"),
+			dslStatement("handler_directive"),
 			dslStatement("setup_block"),
 			dslStatement("measure_block"),
 			dslStatement("parallel_measure_block"),
@@ -601,10 +696,12 @@ func DanmujiGrammar() *Grammar {
 			dslStatement("snapshot_block"),
 			dslStatement("each_do_block"),
 			dslStatement("matrix_block"),
+			dslStatement("factory_trait_block"),
 			dslStatement("property_block"),
 			dslStatement("fuzz_block"),
 			dslStatement("eventually_block"),
 			dslStatement("consistently_block"),
+			dslStatement("await_statement"),
 			dslStatement("defaults_block"),
 			Sym("scenario_entry"),
 			Sym("scenario_field"),
@@ -629,6 +726,7 @@ func DanmujiGrammar() *Grammar {
 		AddConflict(g, "_statement", "expect_statement")
 		AddConflict(g, "_statement", "reject_statement")
 		AddConflict(g, "_statement", "verify_statement")
+		AddConflict(g, "_statement", "factory_declaration")
 		AddConflict(g, "_statement", "mock_declaration")
 		AddConflict(g, "_statement", "fake_declaration")
 		AddConflict(g, "_statement", "spy_declaration")
@@ -636,6 +734,7 @@ func DanmujiGrammar() *Grammar {
 		AddConflict(g, "_statement", "mock_method")
 		AddConflict(g, "_statement", "fake_method")
 		AddConflict(g, "_statement", "needs_block")
+		AddConflict(g, "_statement", "handler_directive")
 		AddConflict(g, "_statement", "setup_block")
 		AddConflict(g, "_statement", "measure_block")
 		AddConflict(g, "_statement", "report_directive")
@@ -653,11 +752,13 @@ func DanmujiGrammar() *Grammar {
 		AddConflict(g, "_statement", "property_block")
 		AddConflict(g, "_statement", "fuzz_block")
 		AddConflict(g, "_statement", "defaults_block")
+		AddConflict(g, "_statement", "factory_trait_block")
 		AddConflict(g, "_statement", "scenario_entry")
 		AddConflict(g, "_statement", "scenario_field")
 		AddConflict(g, "_statement", "matrix_field")
 		AddConflict(g, "_statement", "eventually_block")
 		AddConflict(g, "_statement", "consistently_block")
+		AddConflict(g, "_statement", "await_statement")
 		AddConflict(g, "_statement", "process_block")
 		AddConflict(g, "_statement", "process_args")
 		AddConflict(g, "_statement", "process_env")
@@ -665,6 +766,9 @@ func DanmujiGrammar() *Grammar {
 		AddConflict(g, "_statement", "stop_block")
 		AddConflict(g, "_statement", "signal_directive")
 		AddConflict(g, "_statement", "timeout_directive")
+		AddConflict(g, "_expression", "build_expression")
+		AddConflict(g, "scenario_field", "keyed_element")
+		AddConflict(g, "match_field", "keyed_element")
 
 		g.EnableLRSplitting = true
 	})

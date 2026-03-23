@@ -196,12 +196,6 @@ func (t *dmjTranspiler) emitVerify(n *gotreesitter.Node) string {
 // ---------------------------------------------------------------------------
 
 func (t *dmjTranspiler) emitNeedsBlock(n *gotreesitter.Node) string {
-	t.addImport("context")
-	t.addImport("github.com/docker/go-connections/nat")
-	t.addImport("github.com/stretchr/testify/require")
-	t.addImport("github.com/testcontainers/testcontainers-go")
-	t.addImport("github.com/testcontainers/testcontainers-go/wait")
-
 	serviceNode := t.childByField(n, "service")
 	nameNode := t.childByField(n, "name")
 	if serviceNode == nil || nameNode == nil {
@@ -209,10 +203,51 @@ func (t *dmjTranspiler) emitNeedsBlock(n *gotreesitter.Node) string {
 	}
 	serviceType := strings.TrimSpace(t.text(serviceNode))
 	varName := strings.TrimSpace(t.text(nameNode))
+	tv := t.testVar
+
+	if serviceType == "tempdir" {
+		return fmt.Sprintf("%s := %s.TempDir()\n_ = %s\n", varName, tv, varName)
+	}
+
+	if serviceType == "http" {
+		bodyNode := t.childByField(n, "body")
+		handlerExpr := ""
+		if bodyNode != nil {
+			t.walkChildren(bodyNode, func(child *gotreesitter.Node) {
+				if handlerExpr != "" || t.nodeType(child) != "handler_directive" {
+					return
+				}
+				if valueNode := t.childByField(child, "value"); valueNode != nil {
+					handlerExpr = t.emit(valueNode)
+				}
+			})
+		}
+		if handlerExpr == "" {
+			return "// needs http requires a handler directive\n"
+		}
+		t.addImport("net/http/httptest")
+		var b strings.Builder
+		fmt.Fprintf(&b, "%s := httptest.NewServer(%s)\n", varName, handlerExpr)
+		fmt.Fprintf(&b, "%s.Cleanup(%s.Close)\n", tv, varName)
+		fmt.Fprintf(&b, "_ = %s\n", varName)
+		return b.String()
+	}
+
+	t.addImport("context")
+	t.addImport("github.com/docker/go-connections/nat")
+	t.addImport("github.com/stretchr/testify/require")
+	t.addImport("github.com/testcontainers/testcontainers-go")
+	t.addImport("github.com/testcontainers/testcontainers-go/wait")
 
 	serviceImage := ""
 	servicePort := ""
 	waitForPort := true
+	config := map[string]string{}
+	if bodyNode := t.childByField(n, "body"); bodyNode != nil {
+		t.extractScenarioFields(bodyNode, func(key, val string) {
+			config[key] = val
+		})
+	}
 
 	switch serviceType {
 	case "postgres":
@@ -243,33 +278,52 @@ func (t *dmjTranspiler) emitNeedsBlock(n *gotreesitter.Node) string {
 		return fmt.Sprintf("// unsupported needs service type: %s", serviceType)
 	}
 
-	tv := t.testVar
 	var b strings.Builder
-	fmt.Fprintf(&b, "{\n")
-	fmt.Fprintf(&b, "\tctx := context.Background()\n")
-	fmt.Fprintf(&b, "\t%sReq := testcontainers.ContainerRequest{\n", varName)
-	fmt.Fprintf(&b, "\t\tImage:  %q,\n", serviceImage)
+	ctxName := varName + "Ctx"
+	reqName := varName + "Req"
+	errName := varName + "Err"
+	containerName := varName + "Container"
+	endpointName := varName + "Endpoint"
+	fmt.Fprintf(&b, "%s := context.Background()\n", ctxName)
+	fmt.Fprintf(&b, "%s := testcontainers.ContainerRequest{\n", reqName)
+	fmt.Fprintf(&b, "\tImage: %q,\n", serviceImage)
 	if waitForPort {
-		fmt.Fprintf(&b, "\t\tExposedPorts: []string{%q},\n", servicePort)
+		fmt.Fprintf(&b, "\tExposedPorts: []string{%q},\n", servicePort)
 	} else {
-		fmt.Fprintf(&b, "\t\tExposedPorts: []string{},\n")
+		fmt.Fprintf(&b, "\tExposedPorts: []string{},\n")
 	}
 	if waitForPort {
-		fmt.Fprintf(&b, "\t\tWaitingFor:   wait.ForListeningPort(nat.Port(%q)),\n", servicePort)
-	}
-	fmt.Fprintf(&b, "\t}\n")
-	fmt.Fprintf(&b, "\t%sContainer, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{\n", varName)
-	fmt.Fprintf(&b, "\t\tContainerRequest: %sReq,\n", varName)
-	fmt.Fprintf(&b, "\t\tStarted:        true,\n")
-	fmt.Fprintf(&b, "\t})\n")
-	fmt.Fprintf(&b, "\trequire.NoError(%s, err)\n", tv)
-	fmt.Fprintf(&b, "\t%s.Cleanup(func() { _ = %sContainer.Terminate(ctx) })\n", tv, varName)
-	if waitForPort {
-		fmt.Fprintf(&b, "\t%sEndpoint, err := %sContainer.Endpoint(ctx, %q)\n", varName, varName, servicePort)
-		fmt.Fprintf(&b, "\trequire.NoError(%s, err)\n", tv)
-		fmt.Fprintf(&b, "\t_ = %sEndpoint\n", varName)
+		fmt.Fprintf(&b, "\tWaitingFor: wait.ForListeningPort(nat.Port(%q)),\n", servicePort)
 	}
 	fmt.Fprintf(&b, "}\n")
+	if serviceType == "postgres" {
+		var envEntries []string
+		if password, ok := config["password"]; ok {
+			envEntries = append(envEntries, fmt.Sprintf(`"POSTGRES_PASSWORD": fmt.Sprint(%s)`, password))
+		}
+		if database, ok := config["database"]; ok {
+			envEntries = append(envEntries, fmt.Sprintf(`"POSTGRES_DB": fmt.Sprint(%s)`, database))
+		}
+		if user, ok := config["user"]; ok {
+			envEntries = append(envEntries, fmt.Sprintf(`"POSTGRES_USER": fmt.Sprint(%s)`, user))
+		}
+		if len(envEntries) > 0 {
+			t.addImport("fmt")
+			fmt.Fprintf(&b, "%s.Env = map[string]string{%s}\n", reqName, strings.Join(envEntries, ", "))
+		}
+	}
+	fmt.Fprintf(&b, "%s, %s := testcontainers.GenericContainer(%s, testcontainers.GenericContainerRequest{\n", containerName, errName, ctxName)
+	fmt.Fprintf(&b, "\tContainerRequest: %s,\n", reqName)
+	fmt.Fprintf(&b, "\tStarted: true,\n")
+	fmt.Fprintf(&b, "})\n")
+	fmt.Fprintf(&b, "require.NoError(%s, %s)\n", tv, errName)
+	fmt.Fprintf(&b, "%s.Cleanup(func() { _ = %s.Terminate(%s) })\n", tv, containerName, ctxName)
+	fmt.Fprintf(&b, "_ = %s\n", containerName)
+	if waitForPort {
+		fmt.Fprintf(&b, "%s, %s := %s.Endpoint(%s, %q)\n", endpointName, errName, containerName, ctxName, servicePort)
+		fmt.Fprintf(&b, "require.NoError(%s, %s)\n", tv, errName)
+		fmt.Fprintf(&b, "_ = %s\n", endpointName)
+	}
 
 	return b.String()
 }
@@ -508,6 +562,184 @@ func danmujiHTTPBody(body interface{}) (io.Reader, string) {
 }
 `
 
+const wsTestHelpers = `
+type danmujiWSHelperSet struct{}
+
+var danmujiWS danmujiWSHelperSet
+
+type danmujiWSConn struct {
+	conn        *websocket.Conn
+	lastMessage []byte
+}
+
+func (danmujiWSHelperSet) Dial(target interface{}, path string) *danmujiWSConn {
+	url := danmujiWSURL(target, path)
+	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	if err != nil {
+		panic(fmt.Sprintf("danmujiWS.Dial(%s): %v", url, err))
+	}
+	return &danmujiWSConn{conn: conn}
+}
+
+func (c *danmujiWSConn) Close() {
+	if c == nil || c.conn == nil {
+		return
+	}
+	_ = c.conn.Close()
+}
+
+func (c *danmujiWSConn) SendBinary(payload []byte) {
+	if err := c.conn.WriteMessage(websocket.BinaryMessage, payload); err != nil {
+		panic(fmt.Sprintf("danmujiWS.SendBinary: %v", err))
+	}
+}
+
+func (c *danmujiWSConn) SendText(payload string) {
+	if err := c.conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
+		panic(fmt.Sprintf("danmujiWS.SendText: %v", err))
+	}
+}
+
+func (c *danmujiWSConn) ReadBinary(timeout time.Duration) []byte {
+	return c.readMessage(websocket.BinaryMessage, timeout)
+}
+
+func (c *danmujiWSConn) ReadText(timeout time.Duration) string {
+	return string(c.readMessage(websocket.TextMessage, timeout))
+}
+
+func (c *danmujiWSConn) LastMessage() []byte {
+	if c == nil || len(c.lastMessage) == 0 {
+		return nil
+	}
+	return append([]byte(nil), c.lastMessage...)
+}
+
+func (c *danmujiWSConn) readMessage(expectedType int, timeout time.Duration) []byte {
+	if c == nil || c.conn == nil {
+		panic("danmujiWS connection is nil")
+	}
+	if err := c.conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		panic(fmt.Sprintf("danmujiWS.SetReadDeadline: %v", err))
+	}
+	messageType, payload, err := c.conn.ReadMessage()
+	if err != nil {
+		panic(fmt.Sprintf("danmujiWS.ReadMessage: %v", err))
+	}
+	if messageType != expectedType {
+		panic(fmt.Sprintf("danmujiWS expected message type %d, got %d", expectedType, messageType))
+	}
+	c.lastMessage = append([]byte(nil), payload...)
+	return append([]byte(nil), payload...)
+}
+
+func danmujiWSURL(target interface{}, path string) string {
+	var base string
+	switch v := target.(type) {
+	case string:
+		base = v
+	case *httptest.Server:
+		base = v.URL
+	default:
+		panic(fmt.Sprintf("danmujiWS target %T is unsupported", target))
+	}
+
+	if strings.HasPrefix(base, "http://") {
+		base = "ws://" + strings.TrimPrefix(base, "http://")
+	} else if strings.HasPrefix(base, "https://") {
+		base = "wss://" + strings.TrimPrefix(base, "https://")
+	}
+
+	if path == "" {
+		return base
+	}
+	if strings.HasPrefix(path, "ws://") || strings.HasPrefix(path, "wss://") {
+		return path
+	}
+	if strings.HasSuffix(base, "/") && strings.HasPrefix(path, "/") {
+		return base + path[1:]
+	}
+	if !strings.HasSuffix(base, "/") && !strings.HasPrefix(path, "/") {
+		return base + "/" + path
+	}
+	return base + path
+}
+`
+
+const awaitHelpers = `
+func danmujiAwait[T any](ch <-chan T, timeout time.Duration, t testing.TB) T {
+	select {
+	case value := <-ch:
+		return value
+	case <-time.After(timeout):
+		var zero T
+		t.Fatalf("await timed out after %s", timeout)
+		return zero
+	}
+}
+`
+
+const grpcTestHelpers = `
+type danmujiGRPCHelperSet struct{}
+
+var danmujiGRPC danmujiGRPCHelperSet
+
+type danmujiGRPCConn struct {
+	conn     *grpc.ClientConn
+	server   *grpc.Server
+	listener *bufconn.Listener
+}
+
+func (danmujiGRPCHelperSet) Bufconn(register func(*grpc.Server)) *danmujiGRPCConn {
+	listener := bufconn.Listen(1024 * 1024)
+	server := grpc.NewServer()
+	register(server)
+
+	go func() {
+		if err := server.Serve(listener); err != nil {
+			// Serve returns a non-nil error on normal shutdown.
+		}
+	}()
+
+	conn, err := grpc.DialContext(
+		context.Background(),
+		"bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return listener.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		panic(fmt.Sprintf("danmujiGRPC.Bufconn: %v", err))
+	}
+
+	return &danmujiGRPCConn{
+		conn:     conn,
+		server:   server,
+		listener: listener,
+	}
+}
+
+func (c *danmujiGRPCConn) Conn() *grpc.ClientConn {
+	return c.conn
+}
+
+func (c *danmujiGRPCConn) Close() {
+	if c == nil {
+		return
+	}
+	if c.conn != nil {
+		_ = c.conn.Close()
+	}
+	if c.server != nil {
+		c.server.Stop()
+	}
+	if c.listener != nil {
+		_ = c.listener.Close()
+	}
+}
+`
+
 var pollingAssertionHelpers = `
 func danmujiDeepEqual(expected, actual interface{}) bool {
 	if reflect.DeepEqual(expected, actual) {
@@ -624,6 +856,166 @@ func danmujiContains(actual, expected interface{}) (found bool) {
 		}
 	}
 	return false
+}
+
+type danmujiMatcher struct {
+	kind     string
+	expected interface{}
+}
+
+func danmujiMatchContains(expected interface{}) danmujiMatcher {
+	return danmujiMatcher{kind: "contains", expected: expected}
+}
+
+func danmujiMatchNil() danmujiMatcher {
+	return danmujiMatcher{kind: "nil"}
+}
+
+func danmujiMatchNotNil() danmujiMatcher {
+	return danmujiMatcher{kind: "not_nil"}
+}
+
+func danmujiMatches(expected map[string]interface{}, actual interface{}) bool {
+	ok, _ := danmujiPartialMatch(expected, actual)
+	return ok
+}
+
+func danmujiPartialMatch(expected map[string]interface{}, actual interface{}) (bool, string) {
+	actualValue := reflect.ValueOf(actual)
+	if !actualValue.IsValid() {
+		return false, "actual value is nil"
+	}
+	for actualValue.Kind() == reflect.Pointer {
+		if actualValue.IsNil() {
+			return false, "actual value is nil"
+		}
+		actualValue = actualValue.Elem()
+	}
+
+	keys := make([]string, 0, len(expected))
+	for key := range expected {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		fieldValue, ok := danmujiLookupMatchField(actualValue, key)
+		if !ok {
+			return false, fmt.Sprintf("missing field %q", key)
+		}
+		if ok, detail := danmujiMatchValue(expected[key], fieldValue.Interface()); !ok {
+			return false, fmt.Sprintf("%s: %s", key, detail)
+		}
+	}
+
+	return true, ""
+}
+
+func danmujiLookupMatchField(actual reflect.Value, key string) (reflect.Value, bool) {
+	switch actual.Kind() {
+	case reflect.Struct:
+		field := actual.FieldByName(key)
+		if !field.IsValid() {
+			return reflect.Value{}, false
+		}
+		return field, true
+	case reflect.Map:
+		if actual.Type().Key().Kind() != reflect.String {
+			return reflect.Value{}, false
+		}
+		field := actual.MapIndex(reflect.ValueOf(key))
+		if !field.IsValid() {
+			return reflect.Value{}, false
+		}
+		return field, true
+	}
+	return reflect.Value{}, false
+}
+
+func danmujiMatchValue(expected, actual interface{}) (bool, string) {
+	switch spec := expected.(type) {
+	case danmujiMatcher:
+		switch spec.kind {
+		case "contains":
+			if danmujiContains(actual, spec.expected) {
+				return true, ""
+			}
+			return false, fmt.Sprintf("expected %v to contain %v", actual, spec.expected)
+		case "nil":
+			if danmujiIsNilish(actual) {
+				return true, ""
+			}
+			return false, fmt.Sprintf("expected nil, got %v", actual)
+		case "not_nil":
+			if !danmujiIsNilish(actual) {
+				return true, ""
+			}
+			return false, "expected non-nil value"
+		}
+	}
+
+	if danmujiDeepEqual(expected, actual) {
+		return true, ""
+	}
+	return false, fmt.Sprintf("expected %v, got %v", expected, actual)
+}
+
+func danmujiIsNilish(value interface{}) bool {
+	if value == nil {
+		return true
+	}
+	rv := reflect.ValueOf(value)
+	switch rv.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return rv.IsNil()
+	}
+	return false
+}
+
+func danmujiUnorderedEqual(expected, actual interface{}) bool {
+	ok, _ := danmujiUnorderedEqualDetail(expected, actual)
+	return ok
+}
+
+func danmujiUnorderedEqualDetail(expected, actual interface{}) (bool, string) {
+	expectedValue := reflect.ValueOf(expected)
+	actualValue := reflect.ValueOf(actual)
+	if !expectedValue.IsValid() || !actualValue.IsValid() {
+		if !expectedValue.IsValid() && !actualValue.IsValid() {
+			return true, ""
+		}
+		return false, "one side is nil"
+	}
+
+	if (expectedValue.Kind() != reflect.Slice && expectedValue.Kind() != reflect.Array) ||
+		(actualValue.Kind() != reflect.Slice && actualValue.Kind() != reflect.Array) {
+		return false, "unordered_equal requires slices or arrays"
+	}
+
+	if expectedValue.Len() != actualValue.Len() {
+		return false, fmt.Sprintf("length mismatch: expected %d, got %d", expectedValue.Len(), actualValue.Len())
+	}
+
+	used := make([]bool, actualValue.Len())
+	for i := 0; i < expectedValue.Len(); i++ {
+		expectedElem := expectedValue.Index(i).Interface()
+		found := false
+		for j := 0; j < actualValue.Len(); j++ {
+			if used[j] {
+				continue
+			}
+			if danmujiDeepEqual(expectedElem, actualValue.Index(j).Interface()) {
+				used[j] = true
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false, fmt.Sprintf("missing element %v in actual value %v", expectedElem, actual)
+		}
+	}
+
+	return true, ""
 }
 `
 
