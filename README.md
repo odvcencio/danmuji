@@ -304,7 +304,9 @@ unit "database tests" {
 integration "heavy test" { ... }
 ```
 
-`@slow` adds `if testing.Short() { t.Skip() }`. `@skip` skips unconditionally. `@parallel` adds `t.Parallel()`. Any `@identifier` is a valid tag.
+Danmuji test blocks run in parallel by default. Use `@serial` to opt out when a test must stay sequential. `process`-backed tests also stay sequential automatically.
+
+`@slow` adds `if testing.Short() { t.Skip() }`. `@skip` skips unconditionally. `@parallel` is accepted for compatibility and readability, but is redundant now that parallel is the default. Any `@identifier` is a valid tag.
 
 ### Scenario-driven tests
 
@@ -330,7 +332,7 @@ unit "AuthMiddleware" {
 }
 ```
 
-Each entry inherits from `defaults` and only specifies what changes. Generates a scenario struct, slice, and `for...range` with parallel subtests.
+Each entry inherits from `defaults` and only specifies what changes. Generates a scenario struct, slice, and `for...range` with subtests that follow the enclosing test's parallel policy.
 
 ### HTTP test helpers
 
@@ -397,7 +399,7 @@ unit "API compatibility" {
 }
 ```
 
-Cartesian product of all dimensions. Each combination runs as a subtest.
+Cartesian product of all dimensions. Each combination runs as a subtest and follows the enclosing test's parallel policy.
 Each dimension is also bound as a local alias inside the generated loop, so nested blocks can reference names like `method` or `auth` directly.
 
 ### gRPC test helpers
@@ -449,7 +451,7 @@ unit "addition" {
 }
 ```
 
-Generates a struct per table with `col0`, `col1`, ... `interface{}` fields and iterates with `for...range`.
+Generates a struct per table with `col0`, `col1`, ... `interface{}` fields and iterates with `for...range`. Generated row subtests follow the enclosing test's parallel policy.
 
 ### Containers (testcontainers-go)
 

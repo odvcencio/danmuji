@@ -45,6 +45,61 @@ unit "arithmetic" {
 	if !strings.Contains(goCode, `"github.com/stretchr/testify/assert"`) {
 		t.Error("expected testify assert import")
 	}
+	if !strings.Contains(goCode, "t.Parallel()") {
+		t.Error("expected top-level tests to run in parallel by default")
+	}
+}
+
+func TestTranspileDanmujiSerialOptOut(t *testing.T) {
+	source := []byte(`package serial_test
+
+import "testing"
+
+@serial
+unit "serialized" {
+	each "cases" {
+		defaults { value: 1 }
+		{ name: "one" }
+	} do {
+		then "stays sequential" {
+			expect scenario.value == 1
+		}
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if strings.Contains(goCode, "t.Parallel()") {
+		t.Error("expected @serial to disable auto-parallel top-level and generated subtests")
+	}
+}
+
+func TestTranspileDanmujiProcessRemainsSequential(t *testing.T) {
+	source := []byte(`package process_test
+
+import "testing"
+
+e2e "server process" {
+	process run "./bin/server" {
+		ready http "http://localhost:8080/health"
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if strings.Contains(goCode, "t.Parallel()") {
+		t.Error("expected process-backed tests to remain sequential by default")
+	}
 }
 
 func TestTranspileDanmujiCompileAndRun(t *testing.T) {

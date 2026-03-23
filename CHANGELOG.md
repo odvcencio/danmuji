@@ -6,6 +6,23 @@ All notable changes to danmuji are documented in this file.
 
 - No unreleased changes yet.
 
+## [v0.3.1] - 2026-03-23
+
+### Changed
+
+- Danmuji test blocks now run in parallel by default.
+- Generated `each/do`, `matrix`, and `each row` subtests now follow the enclosing test's parallel policy instead of hardcoding parallel execution.
+- `@parallel` remains accepted for readability, but is now redundant in normal tests.
+
+### Added
+
+- `@serial` as an explicit opt-out for tests that must stay sequential.
+
+### Fixed
+
+- `process`-backed tests stay sequential automatically instead of inheriting the new default parallel behavior.
+- Added and backfilled a checked-in `CHANGELOG.md` so release history lives in the repo as well as GitHub releases.
+
 ## [v0.3.0] - 2026-03-23
 
 ### Added

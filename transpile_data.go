@@ -101,7 +101,9 @@ func (t *dmjTranspiler) emitEachDo(n *gotreesitter.Node) string {
 	fmt.Fprintf(&b, "for _, scenario := range scenarios {\n")
 	fmt.Fprintf(&b, "\t_scenarioName := fmt.Sprintf(\"%%v\", scenario.name)\n")
 	fmt.Fprintf(&b, "\t%s.Run(_scenarioName, func(%s *testing.T) {\n", tv, tv)
-	fmt.Fprintf(&b, "\t\t%s.Parallel()\n", tv)
+	if t.parallelizeSubtests {
+		fmt.Fprintf(&b, "\t\t%s.Parallel()\n", tv)
+	}
 	for _, f := range allFields {
 		if f == "name" {
 			continue
@@ -263,7 +265,9 @@ func (t *dmjTranspiler) emitMatrix(n *gotreesitter.Node) string {
 	fmt.Fprintf(&b, "\tname := fmt.Sprintf(%q, %s)\n", nameFormat, nameArgs)
 
 	fmt.Fprintf(&b, "\t%s.Run(name, func(%s *testing.T) {\n", tv, tv)
-	fmt.Fprintf(&b, "\t\t%s.Parallel()\n", tv)
+	if t.parallelizeSubtests {
+		fmt.Fprintf(&b, "\t\t%s.Parallel()\n", tv)
+	}
 	for _, dim := range dims {
 		fmt.Fprintf(&b, "\t\t%s := scenario.%s\n", dim.key, dim.key)
 		fmt.Fprintf(&b, "\t\t_ = %s\n", dim.key)
@@ -468,6 +472,9 @@ func (t *dmjTranspiler) emitEachRow(n *gotreesitter.Node) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "for _, row := range %s {\n", tableName)
 	fmt.Fprintf(&b, "\t%s.Run(fmt.Sprintf(\"row_%%v\", row), func(%s *testing.T) {\n", t.testVar, t.testVar)
+	if t.parallelizeSubtests {
+		fmt.Fprintf(&b, "\t\t%s.Parallel()\n", t.testVar)
+	}
 
 	// Find and emit the block body
 	for i := 0; i < int(n.NamedChildCount()); i++ {

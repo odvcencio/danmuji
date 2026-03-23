@@ -131,6 +131,8 @@ type dmjTranspiler struct {
 	neededImports map[string]bool
 	// Whether we are inside an exec block (for special identifier translation).
 	inExecBlock bool
+	// Whether generated subtests should auto-call t.Parallel().
+	parallelizeSubtests bool
 	// Whether we are emitting an eventually/consistently body where expect/reject
 	// should be rendered as boolean conditions.
 	inPollingBlock bool
@@ -677,6 +679,10 @@ func (t *dmjTranspiler) emitTestBlock(n *gotreesitter.Node) string {
 	fmt.Fprintf(&b, "func Test%s(%s *testing.T) ", name, t.testVar)
 
 	// Emit body block with inline directives from tags.
+	oldParallelizeSubtests := t.parallelizeSubtests
+	parallelize := t.shouldParallelizeTest(n, tags)
+	t.parallelizeSubtests = parallelize
+	defer func() { t.parallelizeSubtests = oldParallelizeSubtests }()
 	for i := 0; i < int(n.NamedChildCount()); i++ {
 		c := n.NamedChild(i)
 		if t.nodeType(c) == "block" {
@@ -685,6 +691,9 @@ func (t *dmjTranspiler) emitTestBlock(n *gotreesitter.Node) string {
 			b.WriteString(t.lineDirective(n))
 			if len(typeTagLines) > 0 {
 				b.WriteString(typeTagLines)
+			}
+			if parallelize {
+				fmt.Fprintf(&b, "\t%s.Parallel()\n", t.testVar)
 			}
 			b.WriteString(t.emitBlockInner(c, "\t"))
 			b.WriteString("}")
@@ -712,10 +721,43 @@ func (t *dmjTranspiler) emitTagDirectives(tags []string, testVar string) string 
 		case "slow":
 			t.addImport("testing")
 			fmt.Fprintf(&b, "\tif testing.Short() {\n\t\t%s.Skip(\"skipping @slow in short mode\")\n\t}\n", testVar)
-		case "parallel":
-			fmt.Fprintf(&b, "\t%s.Parallel()\n", testVar)
 		}
 	}
 
 	return b.String()
+}
+
+func (t *dmjTranspiler) shouldParallelizeTest(n *gotreesitter.Node, tags []string) bool {
+	if t.hasTag(tags, "serial") || t.hasTag(tags, "sequential") {
+		return false
+	}
+	if t.containsNodeType(n, "process_block") {
+		return false
+	}
+	return true
+}
+
+func (t *dmjTranspiler) hasTag(tags []string, target string) bool {
+	for _, tag := range tags {
+		label := strings.TrimSpace(strings.TrimPrefix(tag, "@"))
+		if label == target {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *dmjTranspiler) containsNodeType(n *gotreesitter.Node, target string) bool {
+	if n == nil {
+		return false
+	}
+	if t.nodeType(n) == target {
+		return true
+	}
+	for i := 0; i < int(n.ChildCount()); i++ {
+		if t.containsNodeType(n.Child(i), target) {
+			return true
+		}
+	}
+	return false
 }
