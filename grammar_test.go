@@ -534,6 +534,59 @@ func f() {
 	}
 }
 
+func TestDanmujiSnapshotKeywordCanStartMultiAssignment(t *testing.T) {
+	input := `package main
+func f() {
+	var snapshot int
+	var err error
+	snapshot, err = load()
+	then "keeps assignment" {
+		_ = snapshot
+		_ = err
+	}
+}
+`
+	sexp := parseDanmuji(t, input)
+	t.Logf("SExpr: %s", sexp)
+	if strings.Contains(sexp, "ERROR") {
+		t.Fatalf("unexpected ERROR: %s", sexp)
+	}
+	if strings.Contains(sexp, "snapshot_block") {
+		t.Fatalf("expected multi-assignment using snapshot identifier to remain Go code, got: %s", sexp)
+	}
+	if !strings.Contains(sexp, "assignment_statement") {
+		t.Fatalf("expected assignment_statement for snapshot multi-assignment, got: %s", sexp)
+	}
+}
+
+func TestDanmujiSnapshotKeywordCanStartSequentialAssignments(t *testing.T) {
+	input := `package main
+func f() {
+	var snapshot int
+	var values []int
+	var err error
+	snapshot, err = loadOne()
+	values, err = loadMany()
+	then "keeps both assignments" {
+		_ = snapshot
+		_ = values
+		_ = err
+	}
+}
+`
+	sexp := parseDanmuji(t, input)
+	t.Logf("SExpr: %s", sexp)
+	if strings.Contains(sexp, "ERROR") {
+		t.Fatalf("unexpected ERROR: %s", sexp)
+	}
+	if strings.Contains(sexp, "snapshot_block") {
+		t.Fatalf("expected sequential assignments using snapshot identifier to remain Go code, got: %s", sexp)
+	}
+	if count := strings.Count(sexp, "assignment_statement"); count < 2 {
+		t.Fatalf("expected at least two assignment_statement nodes, got %d in: %s", count, sexp)
+	}
+}
+
 // TestDanmujiSpyWithBody tests spy declaration with a method body.
 func TestDanmujiSpyWithBody(t *testing.T) {
 	input := `package main

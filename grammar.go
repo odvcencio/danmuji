@@ -28,6 +28,7 @@ func DanmujiGrammar() *Grammar {
 				softKeywordIdentifier("args"),
 				softKeywordIdentifier("exec"),
 				softKeywordIdentifier("profile"),
+				softKeywordIdentifier("snapshot"),
 			))
 
 		// ---------------------------------------------------------------

@@ -1203,6 +1203,115 @@ unit "API output" {
 	}
 }
 
+func TestTranspileDanmujiSnapshotKeywordCanBeIdentifier(t *testing.T) {
+	source := []byte(`package snapid_test
+
+import "testing"
+
+unit "snapshot identifier stays go" {
+	var snapshot string
+	when "assigned" {
+		snapshot = "ok"
+		then "does not become a snapshot block" {
+			expect snapshot == "ok"
+		}
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if strings.Contains(goCode, "snapshot_does not become a snapshot block") {
+		t.Fatal("expected snapshot identifier assignment to remain Go code, not emit a snapshot subtest")
+	}
+	if !strings.Contains(goCode, `snapshot = "ok"`) {
+		t.Fatal("expected snapshot assignment to be preserved")
+	}
+	if !strings.Contains(goCode, `assert.Equal(t, "ok", snapshot`) {
+		t.Fatal("expected then block to assert on the snapshot variable")
+	}
+}
+
+func TestTranspileDanmujiSnapshotKeywordCanStartMultiAssignment(t *testing.T) {
+	source := []byte(`package snapidmulti_test
+
+import "testing"
+
+unit "snapshot identifier multi assignment stays go" {
+	var snapshot string
+	var queryErr error
+	when "assigned" {
+		snapshot, queryErr = load()
+		then "does not become a snapshot block" {
+			expect queryErr == nil
+			expect snapshot == "ok"
+		}
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if strings.Contains(goCode, "snapshot_does not become a snapshot block") {
+		t.Fatal("expected snapshot multi-assignment to remain Go code, not emit a snapshot subtest")
+	}
+	if !strings.Contains(goCode, `snapshot, queryErr = load()`) {
+		t.Fatal("expected snapshot multi-assignment to be preserved")
+	}
+	if !strings.Contains(goCode, `assert.Equal(t, "ok", snapshot`) {
+		t.Fatal("expected then block to assert on the snapshot variable after multi-assignment")
+	}
+}
+
+func TestTranspileDanmujiSnapshotKeywordCanStartSequentialAssignments(t *testing.T) {
+	source := []byte(`package snapidseq_test
+
+import "testing"
+
+unit "snapshot identifier sequential assignments stay go" {
+	var snapshot string
+	var values []string
+	var queryErr error
+	when "assigned" {
+		snapshot, queryErr = loadOne()
+		values, queryErr = loadMany()
+		then "does not become a snapshot block" {
+			expect queryErr == nil
+			expect snapshot == "ok"
+			expect len(values) >= 1
+		}
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if strings.Contains(goCode, "snapshot_does not become a snapshot block") {
+		t.Fatal("expected sequential snapshot assignments to remain Go code, not emit a snapshot subtest")
+	}
+	if !strings.Contains(goCode, `snapshot, queryErr = loadOne()`) {
+		t.Fatal("expected first sequential assignment to be preserved")
+	}
+	if !strings.Contains(goCode, `values, queryErr = loadMany()`) {
+		t.Fatal("expected second sequential assignment to be preserved")
+	}
+	if !strings.Contains(goCode, `assert.True(t, len(values) >= 1`) {
+		t.Fatal("expected then block to assert on the values variable after sequential assignments")
+	}
+}
+
 func TestTranspileDanmujiSpyReal(t *testing.T) {
 	source := []byte(`package spy_test
 

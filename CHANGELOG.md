@@ -6,6 +6,13 @@ All notable changes to danmuji are documented in this file.
 
 - No unreleased changes yet.
 
+## [v0.3.2] - 2026-03-23
+
+### Fixed
+
+- Treated `snapshot` as a soft keyword/ordinary identifier in Go contexts, so assignments like `snapshot = ...` and `snapshot, err = ...` no longer misparse as danmuji snapshot blocks.
+- Added parser and transpiler regressions for identifier, multi-assignment, and sequential-assignment forms so the soft-keyword fix stays covered.
+
 ## [v0.3.1] - 2026-03-23
 
 ### Changed

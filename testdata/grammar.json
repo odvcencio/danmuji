@@ -5014,6 +5014,15 @@
           "named": true,
           "type": "ALIAS",
           "value": "identifier"
+        },
+        {
+          "content": {
+            "type": "STRING",
+            "value": "snapshot"
+          },
+          "named": true,
+          "type": "ALIAS",
+          "value": "identifier"
         }
       ],
       "type": "CHOICE"
