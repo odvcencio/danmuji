@@ -1,3 +1,5 @@
+//go:generate go run ./cmd/genblob
+
 package danmuji
 
 import (
@@ -22,18 +24,13 @@ func getDanmujiLanguage() (*gotreesitter.Language, error) {
 		g := DanmujiGrammar()
 		danmujiExpectationsCached = buildExpectationMap(g)
 
-		if blob, err := loadCachedDanmujiLanguageBlob(g); err == nil && len(blob) > 0 {
-			if lang, err := LoadLanguageBlob(blob); err == nil {
-				danmujiLangCached = lang
-				return
-			}
+		blob, err := loadEmbeddedLanguageBlob(g)
+		if err != nil {
+			danmujiLangErr = fmt.Errorf("load embedded language blob: %w", err)
+			return
 		}
 
-		var blob []byte
-		danmujiLangCached, blob, danmujiLangErr = GenerateLanguageAndBlob(g)
-		if danmujiLangErr == nil {
-			_ = storeCachedDanmujiLanguageBlob(g, blob)
-		}
+		danmujiLangCached, danmujiLangErr = LoadLanguageBlob(blob)
 	})
 	return danmujiLangCached, danmujiLangErr
 }
@@ -48,7 +45,7 @@ type TranspileOptions struct {
 func TranspileDanmuji(source []byte, opts TranspileOptions) (string, error) {
 	lang, err := getDanmujiLanguage()
 	if err != nil {
-		return "", fmt.Errorf("generate danmuji language: %w", err)
+		return "", fmt.Errorf("load danmuji language: %w", err)
 	}
 
 	parser := gotreesitter.NewParser(lang)
