@@ -659,6 +659,7 @@ func DanmujiGrammar() *Grammar {
 			Sym("test_block"),
 			Sym("benchmark_block"),
 			Sym("load_block"),
+			Sym("fuzz_block"),
 		))
 
 		AppendChoice(g, "_expression", Choice(

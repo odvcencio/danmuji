@@ -114,6 +114,10 @@
             {
               "name": "load_block",
               "type": "SYMBOL"
+            },
+            {
+              "name": "fuzz_block",
+              "type": "SYMBOL"
             }
           ],
           "type": "CHOICE"
