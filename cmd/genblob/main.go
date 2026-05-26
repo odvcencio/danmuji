@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/odvcencio/danmuji"
+	"m31labs.dev/danmuji"
 )
 
 func main() {
