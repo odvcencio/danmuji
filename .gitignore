@@ -2,3 +2,9 @@
 grammar.bin
 grammar.json
 !testdata/grammar.json
+
+# Private working notes
+.claude/
+docs/blog-outlines/
+docs/plans/
+docs/superpowers/
