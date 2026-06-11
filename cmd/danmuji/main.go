@@ -49,7 +49,11 @@ func main() {
 		code := runTest(os.Args[2:])
 		os.Exit(code)
 	case "init":
-		if err := initProject(); err != nil {
+		dir := "."
+		if len(os.Args) >= 3 {
+			dir = os.Args[2]
+		}
+		if err := initProject(dir); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
@@ -242,11 +246,21 @@ func runTest(args []string) int {
 		return 1
 	}
 
+	// Record which generated output paths already exist on disk before this
+	// invocation so that we do not delete committed in-tree generated files.
+	preExisting := map[string]bool{}
+	for _, dmjPath := range dmjFiles {
+		outPath := generatedPathFor(dmjPath)
+		if _, statErr := os.Stat(outPath); statErr == nil {
+			preExisting[outPath] = true
+		}
+	}
+
 	// Transpile all .dmj files, collecting generated paths for cleanup.
 	generated, err := transpileFiles(dmjFiles, danmuji.TranspileOptions{})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		cleanup(generated)
+		cleanupNew(generated, preExisting)
 		return 1
 	}
 
@@ -279,8 +293,9 @@ func runTest(args []string) int {
 		}
 	}
 
-	// Clean up generated files regardless of pass/fail.
-	cleanup(generated)
+	// Clean up only the files that were newly created by this invocation.
+	// Pre-existing committed generated files are left in place.
+	cleanupNew(generated, preExisting)
 	return exitCode
 }
 
@@ -395,23 +410,49 @@ func cleanup(files []string) {
 	}
 }
 
-// initProject adds testify to the current module.
-func initProject() error {
+// cleanupNew removes generated files that were NOT present on disk before this
+// invocation (i.e. not in preExisting). Files that existed before are left
+// untouched so that committed in-tree generated files survive `danmuji test`.
+func cleanupNew(files []string, preExisting map[string]bool) {
+	for _, f := range files {
+		if preExisting[f] {
+			continue // leave pre-existing committed file intact
+		}
+		if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "warning: failed to clean up %s: %v\n", f, err)
+		}
+	}
+}
+
+// generatedPathFor returns the output path that transpileFile would produce for
+// the given .dmj source path. Mirrors the naming logic in transpileFile.
+func generatedPathFor(dmjPath string) string {
+	base := strings.TrimSuffix(filepath.Base(dmjPath), ".dmj")
+	if strings.HasSuffix(base, "_test") {
+		base = strings.TrimSuffix(base, "_test")
+	}
+	return filepath.Join(filepath.Dir(dmjPath), base+"_danmuji_test.go")
+}
+
+// initProject adds testify to the module rooted at dir.
+// dir defaults to "." when the user omits the argument.
+// go mod tidy is intentionally NOT run here: the module has no .dmj-generated
+// source that imports testify yet, so tidy would immediately remove the dep.
+func initProject(dir string) error {
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return fmt.Errorf("resolve path %s: %w", dir, err)
+	}
+
 	get := exec.Command("go", "get", "github.com/stretchr/testify@latest")
+	get.Dir = absDir
 	get.Stdout = os.Stdout
 	get.Stderr = os.Stderr
 	if err := get.Run(); err != nil {
-		return fmt.Errorf("go get testify: %w", err)
+		return fmt.Errorf("go get testify in %s: %w", absDir, err)
 	}
 
-	tidy := exec.Command("go", "mod", "tidy")
-	tidy.Stdout = os.Stdout
-	tidy.Stderr = os.Stderr
-	if err := tidy.Run(); err != nil {
-		return fmt.Errorf("go mod tidy: %w", err)
-	}
-
-	fmt.Println("danmuji: testify added. You're ready to write .dmj files.")
+	fmt.Printf("danmuji: testify added to %s. You're ready to write .dmj files.\n", absDir)
 	return nil
 }
 

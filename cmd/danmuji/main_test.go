@@ -281,6 +281,114 @@ unit "debug" {
 	}
 }
 
+// TestInitProjectAddsTestify creates a bare Go module in a temp dir, calls
+// initProject, and asserts that testify is present in go.mod afterwards.
+func TestInitProjectAddsTestify(t *testing.T) {
+	tmpDir := t.TempDir()
+	goMod := "module initpkgtest\n\ngo 1.24.0\n"
+	if err := os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte(goMod), 0644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+
+	if err := initProject(tmpDir); err != nil {
+		t.Fatalf("initProject: %v", err)
+	}
+
+	modBytes, err := os.ReadFile(filepath.Join(tmpDir, "go.mod"))
+	if err != nil {
+		t.Fatalf("read go.mod after init: %v", err)
+	}
+	if !strings.Contains(string(modBytes), "github.com/stretchr/testify") {
+		t.Fatalf("expected testify in go.mod after init, got:\n%s", modBytes)
+	}
+
+	sumBytes, err := os.ReadFile(filepath.Join(tmpDir, "go.sum"))
+	if err != nil {
+		t.Fatalf("read go.sum after init: %v", err)
+	}
+	if len(strings.TrimSpace(string(sumBytes))) == 0 {
+		t.Fatal("expected go.sum to be non-empty after init")
+	}
+}
+
+// TestInitProjectFailsLoudlyOnBadDir checks that initProject returns a non-nil
+// error (not silently ignoring it) when the target directory does not contain
+// a go.mod (so `go get` fails).
+func TestInitProjectFailsLoudlyOnBadDir(t *testing.T) {
+	// A directory with no go.mod — go get should fail.
+	tmpDir := t.TempDir()
+	err := initProject(tmpDir)
+	if err == nil {
+		t.Fatal("expected initProject to return an error for a dir without go.mod")
+	}
+}
+
+// TestRunTestPreservesPreExistingGeneratedFile verifies that a committed
+// in-tree _danmuji_test.go is NOT deleted after `danmuji test` completes,
+// regardless of whether the test run itself passes or fails.
+func TestRunTestPreservesPreExistingGeneratedFile(t *testing.T) {
+	tmpDir := newTestModule(t)
+
+	dmjPath := filepath.Join(tmpDir, "keep.dmj")
+	writeFile(t, dmjPath, `package testpkg_test
+
+import "testing"
+
+unit "keep" {
+	then "works" {
+		expect 1 == 1
+	}
+}
+`)
+
+	// Pre-create the generated file (simulating a committed in-tree generated file).
+	generatedPath := filepath.Join(tmpDir, "keep_danmuji_test.go")
+	sentinel := "// pre-existing sentinel content\n"
+	if err := os.WriteFile(generatedPath, []byte(sentinel), 0644); err != nil {
+		t.Fatalf("write pre-existing generated file: %v", err)
+	}
+
+	// We call runTest and intentionally ignore the exit code — the grammar may
+	// be stale in some envs (causing a go test compile error), but the cleanup
+	// semantics must hold regardless of whether the tests pass.
+	runTest([]string{dmjPath})
+
+	// The generated file must still exist after the run.
+	if _, err := os.Stat(generatedPath); os.IsNotExist(err) {
+		t.Fatal("pre-existing generated file was deleted by danmuji test — it should be preserved")
+	}
+}
+
+// TestRunTestCleansUpNewGeneratedFile ensures that a generated file that did
+// NOT exist before the invocation is removed after `danmuji test`,
+// regardless of whether the test run itself passes or fails.
+func TestRunTestCleansUpNewGeneratedFile(t *testing.T) {
+	tmpDir := newTestModule(t)
+
+	dmjPath := filepath.Join(tmpDir, "new.dmj")
+	writeFile(t, dmjPath, `package testpkg_test
+
+import "testing"
+
+unit "new" {
+	then "works" {
+		expect 2 == 2
+	}
+}
+`)
+
+	generatedPath := filepath.Join(tmpDir, "new_danmuji_test.go")
+	// Ensure it does NOT exist before the run.
+	os.Remove(generatedPath)
+
+	// We call runTest and intentionally ignore the exit code (see above).
+	runTest([]string{dmjPath})
+
+	if _, err := os.Stat(generatedPath); !os.IsNotExist(err) {
+		t.Fatal("newly-created generated file should have been cleaned up but still exists")
+	}
+}
+
 func TestFmtDanmujiRecursive(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "nested", "format_test.dmj")

@@ -731,6 +731,14 @@ func (t *dmjTranspiler) shouldParallelizeTest(n *gotreesitter.Node, tags []strin
 	if t.containsNodeType(n, "process_block") {
 		return false
 	}
+	// Go forbids combining t.Parallel() with t.Setenv() — detect the pattern in
+	// the raw source text of the test block and skip parallelization automatically.
+	// os.Setenv is also incompatible; flag it with a comment but still suppress
+	// t.Parallel() because the race is just as real.
+	blockText := t.text(n)
+	if strings.Contains(blockText, "t.Setenv(") || strings.Contains(blockText, "os.Setenv(") {
+		return false
+	}
 	return true
 }
 
