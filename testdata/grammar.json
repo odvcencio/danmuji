@@ -4989,8 +4989,8 @@
     "identifier": {
       "members": [
         {
-          "type": "PATTERN",
-          "value": "[_\\p{XID_Start}][_\\p{XID_Continue}]*"
+          "name": "_danmuji_base_identifier",
+          "type": "SYMBOL"
         },
         {
           "content": {
@@ -7459,6 +7459,10 @@
       ],
       "type": "CHOICE"
     },
+    "_danmuji_base_identifier": {
+      "type": "PATTERN",
+      "value": "[_\\p{XID_Start}][_\\p{XID_Continue}]*"
+    },
     "tag": {
       "members": [
         {
@@ -9819,8 +9823,13 @@
       "type": "SEQ"
     },
     "signal_name": {
-      "type": "PATTERN",
-      "value": "SIG[A-Z0-9]+"
+      "members": [
+        {
+          "name": "identifier",
+          "type": "SYMBOL"
+        }
+      ],
+      "type": "SEQ"
     },
     "signal_directive": {
       "members": [

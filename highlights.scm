@@ -203,6 +203,15 @@
 
 ;; Manual danmuji highlight additions
 (tag) @attribute
+[
+  (test_category)
+  (service_type)
+  (http_method)
+  (profile_type)
+  (ready_mode)
+  (no_leaks_directive)
+  (report_directive)
+] @keyword
 ((identifier) @keyword (#any-of? @keyword "exit_code" "stderr"))
 (signal_name) @constant
 (each_row_block table: (identifier) @variable)

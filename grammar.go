@@ -16,6 +16,7 @@ func DanmujiGrammar() *Grammar {
 			))
 
 		baseIdentifier := g.Rules["identifier"]
+		g.Define("_danmuji_base_identifier", baseIdentifier)
 		softKeywordIdentifier := func(keyword string) *Rule {
 			return Alias(Str(keyword), "identifier", true)
 		}
@@ -24,7 +25,7 @@ func DanmujiGrammar() *Grammar {
 		// they appear in Go syntax like `exec := ...` or `profile := ...`.
 		g.Define("identifier",
 			Choice(
-				baseIdentifier,
+				Sym("_danmuji_base_identifier"),
 				softKeywordIdentifier("args"),
 				softKeywordIdentifier("exec"),
 				softKeywordIdentifier("profile"),
@@ -630,7 +631,7 @@ func DanmujiGrammar() *Grammar {
 			Field("body", Sym("block")),
 		))
 
-		g.Define("signal_name", Pat(`SIG[A-Z0-9]+`))
+		g.Define("signal_name", Seq(Sym("identifier")))
 
 		g.Define("signal_directive", Seq(
 			Str("signal"),

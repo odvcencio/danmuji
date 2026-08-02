@@ -2206,6 +2206,26 @@ e2e "server sigint" {
 	}
 }
 
+func TestTranspileDanmujiRejectsInvalidSignalName(t *testing.T) {
+	source := []byte(`package server_test
+
+import "testing"
+
+e2e "invalid signal" {
+	stop {
+		signal term
+	}
+}
+`)
+	_, err := TranspileDanmuji(source, TranspileOptions{})
+	if err == nil {
+		t.Fatal("expected invalid signal name to fail semantic validation")
+	}
+	if !strings.Contains(err.Error(), `invalid signal name "term"`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestTranspileDanmujiImplicitCleanup(t *testing.T) {
 	source := []byte(`package server_test
 

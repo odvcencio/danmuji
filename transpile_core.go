@@ -91,6 +91,8 @@ func TranspileDanmuji(source []byte, opts TranspileOptions) (string, error) {
 	return output, nil
 }
 
+var signalNamePattern = regexp.MustCompile(`^SIG[A-Z0-9]+$`)
+
 // ---------------------------------------------------------------------------
 // Transpiler state
 // ---------------------------------------------------------------------------
@@ -345,6 +347,12 @@ func (t *dmjTranspiler) collectTopLevel(n *gotreesitter.Node) {
 	}
 	if nt == "fuzz_block" {
 		t.validateFuzzBlock(n)
+	}
+	if nt == "signal_name" {
+		name := t.text(n)
+		if !signalNamePattern.MatchString(name) {
+			t.addSemanticError(n, fmt.Sprintf("invalid signal name %q", name), "signal SIGTERM")
+		}
 	}
 	if nt == "factory_declaration" {
 		t.collectFactoryDecl(n)

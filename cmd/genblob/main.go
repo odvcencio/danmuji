@@ -39,5 +39,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("wrote language.bin (%d bytes) and language.hash (%s)\n", len(blob), hash[:24]+"...")
+	snapshot := append([]byte(nil), jsonData...)
+	if len(snapshot) == 0 || snapshot[len(snapshot)-1] != '\n' {
+		snapshot = append(snapshot, '\n')
+	}
+	if err := os.WriteFile("testdata/grammar.json", snapshot, 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "write testdata/grammar.json: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("wrote language.bin (%d bytes), language.hash (%s), and testdata/grammar.json\n", len(blob), hash[:24]+"...")
 }
