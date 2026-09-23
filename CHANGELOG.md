@@ -4,6 +4,8 @@ All notable changes to danmuji are documented in this file.
 
 ## [Unreleased]
 
+## [v0.6.0] - 2026-09-23
+
 ### Added
 
 - `danmuji check <path>...` transpiles every `.dmj` file under one or more paths and runs every validation `danmuji build` does (parse errors, the `CheckTreeCoversSource` silent-drop/byte-coverage check, unknown `@tag` rejection) without writing any `_danmuji_test.go` output. It exits non-zero and prints `file:line` diagnostics on the first problem, aggregating across every file the way `danmuji build` already does. Intended for CI and pre-commit hooks that only need pass/fail, not generated code.
