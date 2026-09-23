@@ -85,6 +85,19 @@ danmuji build --debug ./mypackage/
 
 When a test fails, errors reference your `.dmj` source file and line number directly.
 
+### CI validation without generated output
+
+```bash
+# Transpile every .dmj file under one or more paths and run every
+# validation (parse errors, the silent-drop/byte-coverage check, unknown
+# @tags), without writing any _danmuji_test.go anywhere. Exits non-zero
+# and prints file:line diagnostics on the first problem it finds.
+danmuji check ./mypackage/
+danmuji check ./service/user_test.dmj ./service/order_test.dmj
+```
+
+Use `danmuji check` in CI to catch malformed `.dmj` files before `danmuji build`/`danmuji test` run, or in a pre-commit hook, without leaving generated files behind.
+
 ## Features
 
 ### Test categories
