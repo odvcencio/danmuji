@@ -254,14 +254,25 @@ func (t *dmjTranspiler) emitBDDBlock(n *gotreesitter.Node, keyword string) strin
 	for i := 0; i < int(n.NamedChildCount()); i++ {
 		c := n.NamedChild(i)
 		if t.nodeType(c) == "block" {
-			if t.blockHasDirectLifecycleHook(c) {
-				// This block declares its own before/after each with no
+			if t.blockHasDirectLifecycleHook(c) && t.blockHasNestedBDD(c) {
+				// This block declares its own before/after each AND has
+				// nested given/when/then to distribute it to, with no
 				// hooks inherited from an ancestor. Route through the
 				// hook-aware body writer (with no inherited hooks) so the
 				// locally declared hook still reaches every nested
 				// given/when/then instead of running once via the
 				// source-preserving, hook-blind emitTestBody/emitDefault
 				// path used below.
+				//
+				// If there is no nested given/when/then (this block is
+				// itself a leaf), emitBlockInnerWithHooks has nothing to
+				// attach the hook to — a hook is only ever consumed by
+				// emitStatementWithHooks's given/when/then/each_do/matrix
+				// cases, never by a plain statement — so it would collect
+				// the hook and then silently never emit it. Stay on the
+				// emitTestBody/emitDefault path below instead, which
+				// inlines the hook's body exactly where it appears in
+				// source, same as a `before all`/`after all`.
 				fmt.Fprintf(&b, "%s.Run(%s, func(%s *testing.T) {\n", t.testVar, descText, t.testVar)
 				b.WriteString(t.emitSubtestBodyWithHooks(c, "\t", nil, nil))
 				b.WriteString("})")

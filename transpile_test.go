@@ -3269,3 +3269,53 @@ unit "deeply nested hook distribution" {
 		t.Errorf("before each: want %d executions (once per then, two when levels deep), got %d", leafCount, got)
 	}
 }
+
+// TestTranspileDanmujiLeafHookHasNoNestedBDDToDistributeTo is a regression
+// test for a bug introduced and caught while fixing the two tests above: a
+// `before each`/`after each` declared inside a `then` (or `given`/`when`)
+// that has no nested given/when/then of its own has nothing to distribute
+// the hook to — emitStatementWithHooks only attaches hooks to given/when/
+// then/each_do/matrix/each_row statements, never to plain ones — so an
+// early version of the fix silently dropped the hook body entirely instead
+// of inlining it in place (the correct behavior for a leaf, matching
+// `before all`/`after all`).
+func TestTranspileDanmujiLeafHookHasNoNestedBDDToDistributeTo(t *testing.T) {
+	source := []byte(`package main_test
+
+import "testing"
+
+unit "leaf hook" {
+	then "no nested given/when/then" {
+		x := 1
+
+		before each {
+			x = x + 1
+		}
+
+		expect x == 2
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if !strings.Contains(goCode, "x = x + 1") {
+		t.Fatalf("expected the before each body to be inlined, got:\n%s", goCode)
+	}
+
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "main_test.go", goCode)
+
+	cmd := exec.Command("go", "test", "-v", "./...")
+	cmd.Dir = tmpDir
+	cmd.Env = goEnv()
+	out, err := cmd.CombinedOutput()
+	t.Logf("go test output:\n%s", string(out))
+	if err != nil {
+		t.Fatalf("go test failed: %v\n%s", err, out)
+	}
+}
