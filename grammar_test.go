@@ -262,6 +262,40 @@ func f() {
 	}
 }
 
+// TestDanmujiDurationLiteralWinsLongestMatch proves duration_literal beats a
+// bare int_literal at the grammar level for a unit-suffixed duration like
+// "200ms", including mid-block (not just as a block's last statement, the
+// one position that already worked before the gotreesitter v0.53.0 upgrade
+// -- see the duration_literal comment in grammar.go). Before that upgrade
+// switched duration_literal from ImmToken to Token, "duration 200ms" here
+// lexed as int_literal "200" with the "ms" suffix either dropped silently
+// (load_config, mid-block) or rejected outright with an ERROR (every other
+// call site, after the upgrade but before this fix).
+func TestDanmujiDurationLiteralWinsLongestMatch(t *testing.T) {
+	input := `package main
+load "x" {
+	rate 10
+	duration 200ms
+	rampup 1s
+	target get "http://localhost"
+}
+`
+	sexp := parseDanmuji(t, input)
+	t.Logf("SExpr: %s", sexp)
+	// "rate 10" is legitimately an int_literal (rate is a plain _expression
+	// field, not a duration field); "200ms" and "1s" must each resolve to
+	// duration_literal, not to a truncated int_literal that dropped the unit.
+	if strings.Count(sexp, "duration_literal") != 2 {
+		t.Errorf("expected duration_literal for both \"200ms\" and \"1s\", got: %s", sexp)
+	}
+	if strings.Count(sexp, "int_literal") != 1 {
+		t.Errorf("expected exactly one int_literal (rate's \"10\"), got: %s", sexp)
+	}
+	if strings.Contains(sexp, "ERROR") {
+		t.Errorf("unexpected ERROR: %s", sexp)
+	}
+}
+
 func TestDanmujiAwait(t *testing.T) {
 	input := `package main
 func f() {
