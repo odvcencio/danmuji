@@ -1,0 +1,143 @@
+package subtitle_test
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/container/subtitle"
+)
+
+unit "CanConvertBitmapToWebVTT" {
+	then "accepts PGS by codec" {
+		expect subtitle.CanConvertBitmapToWebVTT("hdmv_pgs_subtitle", "")
+	}
+	then "accepts PGS by codec tag" {
+		expect subtitle.CanConvertBitmapToWebVTT("", "pgs")
+	}
+	then "accepts pgssub" {
+		expect subtitle.CanConvertBitmapToWebVTT("pgssub", "")
+	}
+	then "accepts dvd_subtitle" {
+		expect subtitle.CanConvertBitmapToWebVTT("dvd_subtitle", "")
+	}
+	then "accepts dvdsub" {
+		expect subtitle.CanConvertBitmapToWebVTT("dvdsub", "")
+	}
+	then "accepts vobsub" {
+		expect subtitle.CanConvertBitmapToWebVTT("vobsub", "")
+	}
+	then "rejects text codecs subrip" {
+		reject subtitle.CanConvertBitmapToWebVTT("subrip", "")
+	}
+	then "rejects text codecs ass" {
+		reject subtitle.CanConvertBitmapToWebVTT("ass", "")
+	}
+	then "rejects mov_text" {
+		reject subtitle.CanConvertBitmapToWebVTT("mov_text", "")
+	}
+	then "rejects empty strings" {
+		reject subtitle.CanConvertBitmapToWebVTT("", "")
+	}
+	then "codec tag takes precedence over codec" {
+		expect subtitle.CanConvertBitmapToWebVTT("subrip", "pgs")
+	}
+}
+
+unit "CanConvertEmbeddedToWebVTT" {
+	then "accepts subrip" {
+		expect subtitle.CanConvertEmbeddedToWebVTT("subrip", "")
+	}
+	then "accepts ass" {
+		expect subtitle.CanConvertEmbeddedToWebVTT("ass", "")
+	}
+	then "accepts ssa" {
+		expect subtitle.CanConvertEmbeddedToWebVTT("ssa", "")
+	}
+	then "accepts webvtt" {
+		expect subtitle.CanConvertEmbeddedToWebVTT("webvtt", "")
+	}
+	then "accepts ttml" {
+		expect subtitle.CanConvertEmbeddedToWebVTT("ttml", "")
+	}
+	then "accepts mov_text by codec tag" {
+		expect subtitle.CanConvertEmbeddedToWebVTT("", "mov_text")
+	}
+	then "accepts srt alias" {
+		expect subtitle.CanConvertEmbeddedToWebVTT("srt", "")
+	}
+	then "rejects bitmap codec hdmv_pgs_subtitle" {
+		reject subtitle.CanConvertEmbeddedToWebVTT("hdmv_pgs_subtitle", "")
+	}
+	then "rejects dvd_subtitle" {
+		reject subtitle.CanConvertEmbeddedToWebVTT("dvd_subtitle", "")
+	}
+	then "rejects empty" {
+		reject subtitle.CanConvertEmbeddedToWebVTT("", "")
+	}
+}
+
+unit "GenerateBitmapWebVTT" {
+	then "nil track returns WEBVTT header only" {
+		out := subtitle.GenerateBitmapWebVTT(1, 0, nil)
+		expect strings.HasPrefix(string(out), "WEBVTT")
+	}
+	then "empty cues track returns WEBVTT header only" {
+		track := &subtitle.BitmapTrack{}
+		out := subtitle.GenerateBitmapWebVTT(1, 0, track)
+		expect strings.HasPrefix(string(out), "WEBVTT")
+	}
+	given "a track with cues" {
+		track := &subtitle.BitmapTrack{
+			CanvasWidth:  1920,
+			CanvasHeight: 1080,
+			Cues: []subtitle.BitmapCue{
+				{
+					Index:   0,
+					StartMS: 1000,
+					EndMS:   3000,
+					X:       100,
+					Y:       900,
+					Width:   800,
+					Height:  60,
+				},
+			},
+		}
+
+		when "generating WebVTT" {
+			out := string(subtitle.GenerateBitmapWebVTT(42, 2, track))
+
+			then "starts with WEBVTT header" {
+				expect strings.HasPrefix(out, "WEBVTT")
+			}
+			then "contains correct timestamps" {
+				expect strings.Contains(out, "00:00:01.000 --> 00:00:03.000")
+			}
+			then "contains stream path with media ID and track index" {
+				expect strings.Contains(out, "/stream/42/subtitles/bitmap/2-00000.png")
+			}
+			then "contains xywh fragment" {
+				expect strings.Contains(out, "#xywh=100,900,800,60")
+			}
+			then "contains canvas dimensions" {
+				expect strings.Contains(out, "canvas=1920,1080")
+			}
+		}
+	}
+	given "a cue with zero end time" {
+		track := &subtitle.BitmapTrack{
+			CanvasWidth:  1280,
+			CanvasHeight: 720,
+			Cues: []subtitle.BitmapCue{
+				{Index: 0, StartMS: 5000, EndMS: 0},
+			},
+		}
+
+		when "generating WebVTT with zero EndMS" {
+			out := string(subtitle.GenerateBitmapWebVTT(1, 0, track))
+
+			then "uses 4 second fallback duration" {
+				expect strings.Contains(out, "00:00:05.000 --> 00:00:09.000")
+			}
+		}
+	}
+}

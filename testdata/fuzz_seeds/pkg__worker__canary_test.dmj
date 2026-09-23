@@ -1,0 +1,80 @@
+package worker
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+@serial
+unit "worker media canary and cache probes" {
+	then "accepts a regular relative sentinel and rejects unsafe path forms" {
+		root := t.TempDir()
+		nested := filepath.Join(root, "stable", "sentinel")
+		expect os.MkdirAll(filepath.Dir(nested), 0o755) == nil
+		expect os.WriteFile(nested, []byte("stable"), 0o400) == nil
+		expect ValidateMediaRootCanary(root, "stable/sentinel") == nil
+
+		err := ValidateMediaRootCanary(root, filepath.Join(root, "stable", "sentinel"))
+		expect errors.Is(err, ErrCanaryInvalid)
+		err = ValidateMediaRootCanary(root, "../stable/sentinel")
+		expect errors.Is(err, ErrCanaryInvalid)
+		err = ValidateMediaRootCanary(root, "stable/../sentinel")
+		expect errors.Is(err, ErrCanaryInvalid)
+	}
+
+	then "rejects missing, symlink, and non-regular sentinels without path disclosure" {
+		rootMarker := filepath.Join(t.TempDir(), "canary-root-private-marker")
+		expect os.Mkdir(rootMarker, 0o755) == nil
+		missing := ValidateMediaRootCanary(rootMarker, "missing-private-marker")
+		expect errors.Is(missing, ErrCanaryMissing)
+		reject strings.Contains(missing.Error(), "canary-root-private-marker")
+		reject strings.Contains(missing.Error(), "missing-private-marker")
+
+		outside := filepath.Join(t.TempDir(), "outside")
+		expect os.WriteFile(outside, []byte("outside"), 0o400) == nil
+		link := filepath.Join(rootMarker, "link")
+		expect os.Symlink(outside, link) == nil
+		symlinkErr := ValidateMediaRootCanary(rootMarker, "link")
+		expect errors.Is(symlinkErr, ErrCanarySymlink)
+		reject strings.Contains(symlinkErr.Error(), "outside")
+
+		directory := filepath.Join(rootMarker, "directory")
+		expect os.Mkdir(directory, 0o755) == nil
+		nonRegular := ValidateMediaRootCanary(rootMarker, "directory")
+		expect errors.Is(nonRegular, ErrCanaryNotRegular)
+
+		outsideNested := t.TempDir()
+		expect os.WriteFile(filepath.Join(outsideNested, "sentinel"), []byte("outside"), 0o400) == nil
+		parentLink := filepath.Join(rootMarker, "parent-link")
+		expect os.Symlink(outsideNested, parentLink) == nil
+		parentSymlink := ValidateMediaRootCanary(rootMarker, "parent-link/sentinel")
+		expect errors.Is(parentSymlink, ErrCanarySymlink)
+	}
+
+	then "probes cache writeability with stable redacted categories" {
+		root := t.TempDir()
+		expect ProbeCacheRoot(root) == nil
+
+		missingPath := filepath.Join(t.TempDir(), "cache-private-marker")
+		missing := ProbeCacheRoot(missingPath)
+		expect errors.Is(missing, ErrCacheUnavailable)
+		reject strings.Contains(missing.Error(), "cache-private-marker")
+
+		fileRoot := filepath.Join(t.TempDir(), "cache-file")
+		expect os.WriteFile(fileRoot, []byte("not-a-directory"), 0o600) == nil
+		expect errors.Is(ProbeCacheRoot(fileRoot), ErrCacheUnavailable)
+
+		readOnly := filepath.Join(t.TempDir(), "cache-read-only")
+		expect os.Mkdir(readOnly, 0o755) == nil
+		expect os.Chmod(readOnly, 0o500) == nil
+		err := ProbeCacheRoot(readOnly)
+		if err == nil {
+			t.Skip("filesystem permissions permit writes for this test user")
+		}
+		expect errors.Is(err, ErrCacheNotWritable)
+		reject strings.Contains(err.Error(), "cache-read-only")
+	}
+}

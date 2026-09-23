@@ -1,0 +1,228 @@
+package decision_test
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/odvcencio/goetrope/pkg/decision"
+)
+
+unit "Engine concurrent Evaluate and reload" {
+	// BUG CHECK: The decision engine's WatchAndReload writes to the rulesets
+	// map while Evaluate reads from it. If the lock isn't held properly during
+	// the load-compile-store sequence, concurrent Evaluate calls can see
+	// a partially loaded state or panic on map access.
+
+	given "real policies from the policies directory" {
+		// Copy the real stream policy to a temp dir for safe reload testing
+		tmpDir, err := os.MkdirTemp("", "engine-race-*")
+		expect err == nil
+		defer os.RemoveAll(tmpDir)
+
+		policy, err := os.ReadFile("../../policies/stream.arb")
+		expect err == nil
+		err = os.WriteFile(filepath.Join(tmpDir, "stream.arb"), policy, 0o644)
+		expect err == nil
+
+		engine, loadErr := decision.NewEngine(tmpDir)
+		expect loadErr == nil
+
+		when "evaluating and reloading concurrently" {
+			done := make(chan struct{})
+			defer close(done)
+			go engine.WatchAndReload(done)
+
+			var wg sync.WaitGroup
+
+			for i := 0; i < 10; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for j := 0; j < 100; j++ {
+						facts := map[string]any{"codec": "h264", "bitrate": 5000000}
+						_, _ = engine.Evaluate("stream", facts)
+					}
+				}()
+			}
+
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for j := 0; j < 20; j++ {
+					_ = os.WriteFile(filepath.Join(tmpDir, "stream.arb"), policy, 0o644)
+					time.Sleep(time.Millisecond)
+				}
+			}()
+
+			wg.Wait()
+
+			then "no panic occurred" {
+				expect true
+			}
+		}
+	}
+}
+
+unit "Engine evaluates known policies" {
+	given "stream policy loaded from policies dir" {
+		engine, err := decision.NewEngine("../../policies")
+
+		when "engine loads" {
+			then "succeeds" {
+				expect err == nil
+			}
+		}
+
+		when "evaluating h264 stream" {
+			facts := map[string]any{
+				"media.codec":           "h264",
+				"media.bitrate":         5000000,
+				"media.direct_playable": true,
+			}
+			results, err := engine.Evaluate("stream", facts)
+
+			then "succeeds without error" {
+				expect err == nil
+			}
+			then "returns at least one matched rule" {
+				expect len(results) > 0
+			}
+		}
+
+		when "evaluating hevc stream without client support" {
+			facts := map[string]any{
+				"media.codec":           "hevc",
+				"media.bitrate":         20000000,
+				"media.direct_playable": true,
+				"client.supports_hevc":  false,
+			}
+			results, err := engine.Evaluate("stream", facts)
+
+			then "succeeds without error" {
+				expect err == nil
+			}
+			then "returns at least one matched rule" {
+				expect len(results) > 0
+			}
+		}
+	}
+}
+
+unit "Engine missing domain" {
+	given "a valid engine" {
+		tmpDir, err := os.MkdirTemp("", "engine-missing-*")
+		expect err == nil
+		defer os.RemoveAll(tmpDir)
+
+		engine, _ := decision.NewEngine(tmpDir)
+
+		when "evaluating a nonexistent domain" {
+			results, err := engine.Evaluate("nonexistent", map[string]any{})
+
+			then "returns an error" {
+				expect err != nil
+			}
+			then "returns no results" {
+				expect len(results) == 0
+			}
+		}
+	}
+}
+
+unit "Engine evaluates strategy decisions" {
+	given "a policy with a strategy fixture" {
+		tmpDir, err := os.MkdirTemp("", "engine-strategy-*")
+		expect err == nil
+		defer os.RemoveAll(tmpDir)
+
+		policy := `
+outcome CheckoutPath {
+	target: string
+	reason: string
+}
+
+strategy CheckoutRouting returns CheckoutPath {
+	when {
+		user.country == "US"
+	}
+	then Domestic {
+		target: "domestic",
+		reason: "local",
+	}
+
+	else Global {
+		target: "global",
+		reason: "fallback",
+	}
+}
+`
+		err = os.WriteFile(filepath.Join(tmpDir, "routing.arb"), []byte(policy), 0o644)
+		expect err == nil
+
+		engine, loadErr := decision.NewEngine(tmpDir)
+		expect loadErr == nil
+
+		when "evaluating a matching arm with flat keys" {
+			result, evalErr := engine.EvaluateStrategy("routing", "CheckoutRouting", map[string]any{
+				"user.country": "US",
+			})
+
+			then "succeeds" {
+				expect evalErr == nil
+			}
+			then "returns the selected strategy arm" {
+				expect result.Strategy == "CheckoutRouting"
+				expect result.Outcome == "CheckoutPath"
+				expect result.Selected == "Domestic"
+			}
+			then "returns outcome params" {
+				expect result.Params["target"] == "domestic"
+				expect result.Params["reason"] == "local"
+			}
+		}
+
+		when "falling back" {
+			result, evalErr := engine.EvaluateStrategy("routing", "CheckoutRouting", map[string]any{
+				"user.country": "DE",
+			})
+
+			then "succeeds" {
+				expect evalErr == nil
+			}
+			then "selects the else arm" {
+				expect result.Selected == "Global"
+				expect result.Params["target"] == "global"
+			}
+		}
+
+		when "evaluating a missing strategy" {
+			result, evalErr := engine.EvaluateStrategy("routing", "MissingStrategy", map[string]any{})
+
+			then "returns an explicit error" {
+				expect evalErr != nil
+				expect strings.Contains(evalErr.Error(), `strategy "MissingStrategy" not found in domain "routing"`)
+			}
+			then "returns an empty strategy result" {
+				expect result.Strategy == ""
+				expect result.Selected == ""
+			}
+		}
+
+		when "evaluating a missing domain" {
+			result, evalErr := engine.EvaluateStrategy("missing", "CheckoutRouting", map[string]any{})
+
+			then "returns an explicit domain error" {
+				expect evalErr != nil
+				expect strings.Contains(evalErr.Error(), `no policy loaded for domain "missing"`)
+			}
+			then "returns an empty strategy result" {
+				expect result.Strategy == ""
+				expect result.Selected == ""
+			}
+		}
+	}
+}

@@ -1,0 +1,71 @@
+package mkv_test
+
+import (
+	"bytes"
+	"encoding/binary"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/container/mkv"
+)
+
+unit "MKV Probe" {
+	given "an empty reader" {
+		reader := bytes.NewReader(nil)
+
+		when "probing" {
+			_, err := mkv.Probe(reader)
+
+			then "returns error" {
+				expect err != nil
+			}
+		}
+	}
+
+	given "invalid EBML magic" {
+		data := []byte{0xFF, 0xFF, 0xFF, 0xFF}
+		reader := bytes.NewReader(data)
+
+		when "probing" {
+			_, err := mkv.Probe(reader)
+
+			then "returns error" {
+				expect err != nil
+			}
+		}
+	}
+}
+
+benchmark "MKV Probe synthetic" {
+	setup {
+		data := buildMinimalMKV()
+		reader := bytes.NewReader(data)
+	}
+	measure {
+		reader.Seek(0, 0)
+		mkv.Probe(reader)
+	}
+	report_allocs
+}
+
+// buildMinimalMKV creates a minimal EBML header for benchmarking.
+// This won't be a fully valid MKV but exercises the parser entry path.
+func buildMinimalMKV() []byte {
+	var buf bytes.Buffer
+	// EBML header element ID
+	buf.Write([]byte{0x1A, 0x45, 0xDF, 0xA3})
+	// EBML header size (small)
+	buf.WriteByte(0x93) // 19 bytes
+	// EBMLVersion
+	buf.Write([]byte{0x42, 0x86, 0x81, 0x01})
+	// EBMLReadVersion
+	buf.Write([]byte{0x42, 0xF7, 0x81, 0x01})
+	// EBMLMaxIDLength
+	buf.Write([]byte{0x42, 0xF2, 0x81, 0x04})
+	// EBMLMaxSizeLength
+	buf.Write([]byte{0x42, 0xF3, 0x81, 0x08})
+	// DocType = "matroska"
+	buf.Write([]byte{0x42, 0x82})
+	_ = binary.Write(&buf, binary.BigEndian, byte(0x88))
+	buf.WriteString("matroska")
+	return buf.Bytes()
+}

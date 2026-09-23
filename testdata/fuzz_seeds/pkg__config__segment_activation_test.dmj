@@ -1,0 +1,49 @@
+package config
+
+import (
+	"strings"
+	"testing"
+)
+
+func assertSegmentActivationRejected(t *testing.T, cfg Config) {
+	t.Helper()
+	err := ValidateActivation(cfg)
+	if err == nil || !strings.Contains(err.Error(), "segment") || !strings.Contains(err.Error(), "signed transport") {
+		t.Fatalf("activation error = %v", err)
+	}
+}
+
+unit "segment egress activation fence" {
+	then "every non-empty S3-compatible setting fails activation" {
+		endpoint := Defaults()
+		endpoint.Security.Runtime = RuntimeDevelopment
+		endpoint.Segment.BucketEndpoint = "https://s3.example"
+		assertSegmentActivationRejected(t, endpoint)
+
+		access := Defaults()
+		access.Security.Runtime = RuntimeDevelopment
+		access.Segment.BucketAccessKeySource = "env:S3_ACCESS"
+		assertSegmentActivationRejected(t, access)
+
+		secret := Defaults()
+		secret.Security.Runtime = RuntimeDevelopment
+		secret.Segment.BucketSecretKeySource = "env:S3_SECRET"
+		assertSegmentActivationRejected(t, secret)
+
+		bucket := Defaults()
+		bucket.Security.Runtime = RuntimeDevelopment
+		bucket.Segment.BucketName = "segments"
+		assertSegmentActivationRejected(t, bucket)
+
+		cdn := Defaults()
+		cdn.Security.Runtime = RuntimeDevelopment
+		cdn.Segment.CDNPrefix = "https://cdn.example"
+		assertSegmentActivationRejected(t, cdn)
+	}
+
+	then "the empty segment configuration remains inactive and valid" {
+		cfg := Defaults()
+		cfg.Security.Runtime = RuntimeDevelopment
+		expect ValidateActivation(cfg) == nil
+	}
+}

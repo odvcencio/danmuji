@@ -1,0 +1,54 @@
+package library
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+@serial
+unit "LoadChapters cache evicts least recently used entries at its cap" {
+	oldSource := chapterProbeSource
+	oldCache := chapterCache
+	defer func() {
+		chapterProbeSource = oldSource
+		chapterCache = oldCache
+	}()
+
+	probeCalls := 0
+	chapterProbeSource = func(path string) ([]Chapter, error) {
+		probeCalls++
+		return []Chapter{{Title: filepath.Base(path), StartMS: 0, EndMS: 1000}}, nil
+	}
+	chapterCache = newBoundedTTLCache[chapterCacheKey, []Chapter](1, time.Hour, time.Now)
+
+	tmpDir := t.TempDir()
+	firstPath := filepath.Join(tmpDir, "first.mkv")
+	secondPath := filepath.Join(tmpDir, "second.mkv")
+	err := os.WriteFile(firstPath, []byte("first"), 0o644)
+	expect err == nil
+	err = os.WriteFile(secondPath, []byte("second"), 0o644)
+	expect err == nil
+
+	when "loading chapters for two files through a one-entry cache" {
+		first, firstErr := LoadChapters(firstPath)
+		second, secondErr := LoadChapters(secondPath)
+		repeated, repeatedErr := LoadChapters(firstPath)
+		stats := ChapterCacheStats()
+
+		then "all loads succeed" {
+			expect firstErr == nil
+			expect secondErr == nil
+			expect repeatedErr == nil
+		}
+		then "the first file is re-probed after eviction" {
+			expect probeCalls == 3
+			expect len(first) == 1
+			expect len(second) == 1
+			expect len(repeated) == 1
+			expect stats.Entries == 1
+			expect stats.MaxEntries == 1
+		}
+	}
+}

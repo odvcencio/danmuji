@@ -1,0 +1,166 @@
+package games_test
+
+import (
+    "testing"
+
+    "github.com/odvcencio/goetrope/pkg/games"
+)
+
+unit "Chess game creation" {
+    given "a new chess game" {
+        g := games.NewChessGame("alice", "bob", false)
+
+        then "move number is 1" {
+            expect g.MoveNumber() == 1
+        }
+        then "it is white's turn" {
+            expect g.Turn() == "white"
+        }
+        then "game is not over" {
+            expect !g.IsOver()
+        }
+        then "result is in progress" {
+            expect g.Result() == "*"
+        }
+    }
+}
+
+unit "Chess moves" {
+    given "a new chess game" {
+        g := games.NewChessGame("alice", "bob", false)
+
+        when "white plays e2e4" {
+            err := g.Move("alice", "e2e4")
+
+            then "move succeeds" {
+                expect err == nil
+            }
+            then "it is now black's turn" {
+                expect g.Turn() == "black"
+            }
+        }
+    }
+
+    given "a new chess game with multiple moves" {
+        g := games.NewChessGame("alice", "bob", false)
+        _ = g.Move("alice", "e2e4")
+        _ = g.Move("bob", "e7e5")
+        err := g.Move("alice", "g1f3")
+
+        then "third move succeeds" {
+            expect err == nil
+        }
+        then "move history has three entries" {
+            expect len(g.MoveHistory) == 3
+        }
+        then "it is black's turn again" {
+            expect g.Turn() == "black"
+        }
+    }
+}
+
+unit "Chess vs CPU" {
+    given "a vs-CPU game where CPU plays black" {
+        g := games.NewChessGame("alice", "", true)
+
+        then "CPU side is black" {
+            expect g.CPUSide == "black"
+        }
+        then "it is not CPU's turn initially" {
+            expect !g.IsCPUTurn()
+        }
+
+        when "white makes a move" {
+            err := g.Move("alice", "e2e4")
+
+            then "white move succeeds" {
+                expect err == nil
+            }
+            then "it is now CPU's turn" {
+                expect g.IsCPUTurn()
+            }
+        }
+    }
+
+    given "a vs-CPU game after white moves" {
+        g := games.NewChessGame("alice", "", true)
+        _ = g.Move("alice", "e2e4")
+
+        when "CPU plays e7e5" {
+            err := g.ApplyCPUMove("e7e5")
+
+            then "CPU move succeeds" {
+                expect err == nil
+            }
+            then "it is white's turn again" {
+                expect g.Turn() == "white"
+            }
+            then "it is no longer CPU's turn" {
+                expect !g.IsCPUTurn()
+            }
+        }
+    }
+}
+
+unit "Chess validation" {
+    given "a new chess game" {
+        g := games.NewChessGame("alice", "bob", false)
+
+        when "white tries an illegal move" {
+            err := g.Move("alice", "e2e5")
+
+            then "illegal move returns error" {
+                expect err != nil
+            }
+        }
+
+        when "black tries to move on white's turn" {
+            err := g.Move("bob", "e7e5")
+
+            then "wrong player returns error" {
+                expect err != nil
+            }
+        }
+    }
+
+    given "a finished game (fool's mate)" {
+        g := games.NewChessGame("alice", "bob", false)
+        _ = g.Move("alice", "f2f3")
+        _ = g.Move("bob", "e7e5")
+        _ = g.Move("alice", "g2g4")
+        _ = g.Move("bob", "d8h4")
+
+        then "game is over" {
+            expect g.IsOver()
+        }
+
+        when "alice tries to move after game over" {
+            err := g.Move("alice", "e2e4")
+
+            then "move after game over returns error" {
+                expect err != nil
+            }
+        }
+    }
+}
+
+unit "Chess material balance" {
+    given "a new chess game at start position" {
+        g := games.NewChessGame("alice", "bob", false)
+
+        then "material balance is 0" {
+            expect g.MaterialBalance() == 0
+        }
+    }
+
+    given "a game where white captures a pawn" {
+        g := games.NewChessGame("alice", "bob", false)
+        _ = g.Move("alice", "e2e4")
+        _ = g.Move("bob", "d7d5")
+        _ = g.Move("alice", "e4d5")
+
+        then "white has a material advantage of 1" {
+            expect g.MaterialBalance() == 1
+        }
+    }
+}

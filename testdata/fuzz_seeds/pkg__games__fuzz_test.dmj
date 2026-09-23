@@ -1,0 +1,24 @@
+package games_test
+
+import (
+    "testing"
+
+    "github.com/odvcencio/goetrope/pkg/games"
+)
+
+fuzz "chess move parsing does not panic" with (uci string) {
+    g := games.NewChessGame("w", "b", false)
+    g.Move("w", uci)
+    expect true
+}
+
+fuzz "yahtzee scoring does not panic" with (cat string, d0 byte, d1 byte, d2 byte, d3 byte, d4 byte) {
+    dice := []int{int(d0%6) + 1, int(d1%6) + 1, int(d2%6) + 1, int(d3%6) + 1, int(d4%6) + 1}
+    games.ScoreCategory(dice, cat)
+    expect true
+}
+
+fuzz "game protocol parse does not panic" with (data []byte) {
+    games.ParseGameMessage(data)
+    expect true
+}

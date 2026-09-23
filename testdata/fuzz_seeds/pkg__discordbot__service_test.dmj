@@ -1,0 +1,186 @@
+package discordbot_test
+
+import (
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/hex"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/discordbot"
+	"github.com/odvcencio/goetrope/pkg/randomchannel"
+)
+
+func signedDiscordRequest(body string, private ed25519.PrivateKey) *http.Request {
+	timestamp := "1710600000"
+	signature := ed25519.Sign(private, append([]byte(timestamp), []byte(body)...))
+	req := httptest.NewRequest("POST", "/api/discord/interactions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Signature-Ed25519", hex.EncodeToString(signature))
+	req.Header.Set("X-Signature-Timestamp", timestamp)
+	return req
+}
+
+type stubRandomChannel struct{}
+
+func (stubRandomChannel) Summary(context.Context) (*randomchannel.Summary, error) {
+	return &randomchannel.Summary{
+		Alias:            randomchannel.Alias,
+		Name:             randomchannel.ChannelName,
+		RoomCode:         randomchannel.RoomCode,
+		CurrentItemIndex: 0,
+		Playlist: []randomchannel.PlaylistEntry{
+			{MediaItemID: 11, Title: "Inland Empire", Year: 2006, DurationMS: 10740000},
+		},
+	}, nil
+}
+
+func (stubRandomChannel) AdvanceNext(context.Context) error { return nil }
+func (stubRandomChannel) ForceReroll(context.Context) error { return nil }
+
+type stubRandomChannelRegistry struct {
+	byAlias      map[string]*randomchannel.Summary
+	advanceAlias string
+	rerollAlias  string
+}
+
+func (s *stubRandomChannelRegistry) Summaries(context.Context) ([]*randomchannel.Summary, error) {
+	out := make([]*randomchannel.Summary, 0, len(s.byAlias))
+	for _, summary := range s.byAlias {
+		out = append(out, summary)
+	}
+	return out, nil
+}
+
+func (s *stubRandomChannelRegistry) Summary(_ context.Context, alias string) (*randomchannel.Summary, bool, error) {
+	summary, ok := s.byAlias[alias]
+	return summary, ok, nil
+}
+
+func (s *stubRandomChannelRegistry) AdvanceNext(_ context.Context, alias string) error {
+	s.advanceAlias = alias
+	return nil
+}
+
+func (s *stubRandomChannelRegistry) ForceReroll(_ context.Context, alias string) error {
+	s.rerollAlias = alias
+	return nil
+}
+
+unit "Discord interaction handler" {
+	given "a configured service" {
+		publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+		expect err == nil
+
+		token := []byte("token-1")
+		svc, err := discordbot.NewWithBotToken(discordbot.Config{
+			ApplicationID: "app-1",
+			PublicKey:     hex.EncodeToString(publicKey),
+			GuildID:       "guild-1",
+		}, token, nil, nil, nil, nil, nil)
+		defer svc.Close()
+
+		when "handling a signed ping" {
+			rec := httptest.NewRecorder()
+			req := signedDiscordRequest(`{"type":1}`, privateKey)
+			svc.ServeHTTP(rec, req)
+
+			then "returns pong" {
+				expect rec.Code == 200
+				expect strings.Contains(rec.Body.String(), "\"type\":1")
+			}
+		}
+
+		when "handling a signed command without permissions" {
+			body := `{"type":2,"guild_id":"guild-1","data":{"name":"theatre","options":[{"type":1,"name":"status","options":[{"name":"room_code","type":3,"value":"ROOM01"}]}]},"member":{"permissions":"0"}}`
+			rec := httptest.NewRecorder()
+			req := signedDiscordRequest(body, privateKey)
+			svc.ServeHTTP(rec, req)
+
+			then "returns an ephemeral permission error" {
+				expect rec.Code == 200
+				expect strings.Contains(rec.Body.String(), "Manage Server")
+				expect strings.Contains(rec.Body.String(), "\"flags\":64")
+			}
+		}
+
+		when "handling a signed command with permissions but no theatre manager" {
+			body := `{"type":2,"guild_id":"guild-1","data":{"name":"theatre","options":[{"type":1,"name":"status","options":[{"name":"room_code","type":3,"value":"ROOM01"}]}]},"member":{"permissions":"32"}}`
+			rec := httptest.NewRecorder()
+			req := signedDiscordRequest(body, privateKey)
+			svc.ServeHTTP(rec, req)
+
+			then "returns an ephemeral not-configured error" {
+				expect rec.Code == 200
+				expect strings.Contains(rec.Body.String(), "Theatre manager is not configured.")
+				expect strings.Contains(rec.Body.String(), "\"flags\":64")
+			}
+		}
+
+		when "handling a signed random channel status command" {
+			svc.SetRandomChannel(stubRandomChannel{})
+			body := `{"type":2,"guild_id":"guild-1","data":{"name":"channel","options":[{"type":1,"name":"status"}]},"member":{"permissions":"32"}}`
+			rec := httptest.NewRecorder()
+			req := signedDiscordRequest(body, privateKey)
+			svc.ServeHTTP(rec, req)
+
+			then "returns the channel summary" {
+				expect rec.Code == 200
+				expect strings.Contains(rec.Body.String(), "Channel `1` status=")
+				expect strings.Contains(rec.Body.String(), "Inland Empire")
+			}
+		}
+
+		when "handling a signed show channel next command" {
+			registry := &stubRandomChannelRegistry{byAlias: map[string]*randomchannel.Summary{
+				"1": {
+					Alias:    randomchannel.DefaultMovieAlias,
+					Name:     randomchannel.DefaultMovieChannelName,
+					RoomCode: randomchannel.DefaultMovieRoomCode,
+				},
+				"2": {
+					Alias:    randomchannel.DefaultShowAlias,
+					Name:     randomchannel.DefaultShowChannelName,
+					RoomCode: randomchannel.DefaultShowRoomCode,
+				},
+			}}
+			svc.SetRandomChannels(registry)
+			body := `{"type":2,"guild_id":"guild-1","data":{"name":"channel","options":[{"type":1,"name":"next","options":[{"name":"channel","type":3,"value":"2"}]}]},"member":{"permissions":"32"}}`
+			rec := httptest.NewRecorder()
+			req := signedDiscordRequest(body, privateKey)
+			svc.ServeHTTP(rec, req)
+
+			then "routes the mutation to the show channel alias" {
+				expect rec.Code == 200
+				expect strings.Contains(rec.Body.String(), "Advanced channel `2`")
+				expect registry.advanceAlias == "2"
+			}
+		}
+	}
+
+	given "a configured service and a bad signature" {
+		publicKey, _, err := ed25519.GenerateKey(rand.Reader)
+		expect err == nil
+
+		token := []byte("token-1")
+		svc, err := discordbot.NewWithBotToken(discordbot.Config{
+			ApplicationID: "app-1",
+			PublicKey:     hex.EncodeToString(publicKey),
+			GuildID:       "guild-1",
+		}, token, nil, nil, nil, nil, nil)
+		defer svc.Close()
+
+		when "handling an unsigned request" {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest("POST", "/api/discord/interactions", strings.NewReader(`{"type":1}`))
+			svc.ServeHTTP(rec, req)
+
+			then "rejects the request" {
+				expect rec.Code == 401
+			}
+		}
+	}
+}

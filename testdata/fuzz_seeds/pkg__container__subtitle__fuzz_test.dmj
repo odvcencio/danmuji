@@ -1,0 +1,18 @@
+package subtitle_test
+
+import (
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/container/subtitle"
+)
+
+fuzz "ConvertSRTToWebVTT does not panic" with (data []byte) {
+	result := subtitle.ConvertSRTToWebVTT(data)
+	// Output must always start with WEBVTT header
+	expect len(result) >= 6
+}
+
+fuzz "ConvertASSToWebVTT does not panic" with (data []byte) {
+	result := subtitle.ConvertASSToWebVTT(data)
+	expect len(result) >= 6
+}

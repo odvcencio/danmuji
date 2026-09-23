@@ -1,0 +1,271 @@
+package netfetch
+
+import (
+	"bufio"
+	"bytes"
+	"compress/gzip"
+	"context"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/netip"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"testing"
+)
+
+func clientForRawResponse(t *testing.T, response []byte) *Client {
+	t.Helper()
+	client, err := New(Config{})
+	if err != nil {
+		t.Fatalf("new raw response client: %v", err)
+	}
+	client.resolver = staticResolver{addresses: []netip.Addr{netip.MustParseAddr("93.184.216.34")}}
+	client.dialContext = func(context.Context, string, string) (net.Conn, error) {
+		clientConn, serverConn := net.Pipe()
+		go func() {
+			defer serverConn.Close()
+			reader := bufio.NewReader(serverConn)
+			for {
+				line, readErr := reader.ReadString('\n')
+				if readErr != nil || line == "\r\n" {
+					break
+				}
+			}
+			_, _ = serverConn.Write(response)
+		}()
+		return clientConn, nil
+	}
+	return client
+}
+
+unit "profile and destination floor" {
+	then "all profiles reject methods outside their code-owned allowlist" {
+		client := newScenarioClient(t, &scenarioPlan{})
+		for _, request := range []Request{
+			{Profile: ProfileArtwork, Method: http.MethodPost, URL: "https://example.com/image.jpg"},
+			{Profile: ProfileMetadataJSON, Method: http.MethodDelete, URL: "https://example.com/item"},
+			{Profile: ProfileDiscordREST, Method: http.MethodDelete, URL: "https://discord.com/api/v10/channels"},
+			{Profile: ProfileChessJSON, Method: http.MethodGet, URL: "https://chess-api.com/v1"},
+			{Profile: ProfileOAuthToken, Method: http.MethodGet, URL: "https://example.com/token"},
+		} {
+			_, err := client.Do(context.Background(), request)
+			expect CategoryOf(err) == CategoryInvalidDestination
+		}
+	}
+
+	then "unsafe URL syntax is rejected before resolution" {
+		client, err := New(Config{})
+		expect err == nil
+		resolver := &countingResolver{}
+		client.resolver = resolver
+		var dials atomic.Int32
+		client.dialContext = func(context.Context, string, string) (net.Conn, error) {
+			dials.Add(1)
+			return nil, fmt.Errorf("must not dial")
+		}
+		for _, rawURL := range []string{
+			"ftp://example.com/file",
+			"https://user:secret@example.com/file",
+			"https://example.com/file#fragment",
+			"https://[fe80::1%25eth0]/file",
+			"https://example.com:22/file",
+			"https://example.com/path%0aheader",
+			"https://example.com/path%0Dheader",
+			"https://example.com/path%00tail",
+			"https://example.com/path%7fdelete",
+			"https://example.com/item?ke%0ay=value",
+			"https://example.com/item?key=val%0due",
+			"https://example.com/item?key=%00",
+			"https://example.com/item?key=%7f",
+		} {
+			_, err := client.Do(context.Background(), Request{Profile: ProfileArtwork, Method: http.MethodGet, URL: rawURL})
+			expect CategoryOf(err) == CategoryInvalidDestination
+		}
+		expect resolver.calls.Load() == int32(0)
+		expect dials.Load() == int32(0)
+	}
+
+	then "safe errors never reflect destination details" {
+		client := newScenarioClient(t, &scenarioPlan{})
+		secretURL := "http://127.0.0.1:5432/private?token=do-not-reflect"
+		_, err := client.Do(context.Background(), Request{Profile: ProfileMetadataJSON, Method: http.MethodGet, URL: secretURL})
+		expect CategoryOf(err) == CategoryDestinationBlocked
+		reject strings.Contains(err.Error(), "127.0.0.1")
+		reject strings.Contains(err.Error(), "5432")
+		reject strings.Contains(err.Error(), "do-not-reflect")
+	}
+}
+
+unit "manual redirect boundary" {
+	then "a redirect is resolved again and cross-origin credentials are stripped" {
+		plan := &scenarioPlan{redirectAcrossOrigins: true}
+		client := newScenarioClient(t, plan)
+		response, err := client.Do(context.Background(), Request{
+			Profile:          ProfileMetadataJSON,
+			Method:           http.MethodGet,
+			URL:              "https://provider.example/start",
+			CredentialOrigin: "https://provider.example",
+			Credentials:      http.Header{"Authorization": {"Bearer secret"}},
+			CredentialQuery:  url.Values{"api_key": {"query-secret"}},
+		})
+		expect err == nil
+		defer response.Body.Close()
+		_, err = io.ReadAll(response.Body)
+		expect err == nil
+		expect plan.observedCredential.Load() == ""
+		expect plan.observedQuery.Load() == ""
+		expect plan.hops.Load() == int32(2)
+	}
+
+	then "an HTTPS downgrade is rejected without following it" {
+		plan := &scenarioPlan{redirectDowngrade: true}
+		client := newScenarioClient(t, plan)
+		_, err := client.Do(context.Background(), Request{
+			Profile: ProfileArtwork,
+			Method:  http.MethodGet,
+			URL:     "https://provider.example/start",
+		})
+		expect CategoryOf(err) == CategoryRedirectRejected
+		expect plan.hops.Load() == int32(1)
+	}
+}
+
+@serial
+unit "bounded response body" {
+	then "metadata accepts bounded JSON and ignores proxy environment" {
+		t.Setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+		plan := &scenarioPlan{body: []byte(`{"ok":true}`), contentType: "application/json"}
+		client := newScenarioClient(t, plan)
+		response, err := client.Do(context.Background(), Request{
+			Profile: ProfileMetadataJSON,
+			Method:  http.MethodGet,
+			URL:     "https://provider.example/item",
+		})
+		expect err == nil
+		defer response.Body.Close()
+		body, readErr := io.ReadAll(response.Body)
+		expect readErr == nil
+		expect string(body) == `{"ok":true}`
+	}
+
+	then "artwork rejects a declared non-image response" {
+		plan := &scenarioPlan{body: []byte("not an image"), contentType: "text/plain"}
+		client := newScenarioClient(t, plan)
+		_, err := client.Do(context.Background(), Request{
+			Profile: ProfileArtwork,
+			Method:  http.MethodGet,
+			URL:     "https://provider.example/image",
+		})
+		expect CategoryOf(err) == CategoryUnsupportedContent
+	}
+}
+
+unit "Discord empty response floor" {
+	then "only exact Discord PUT success statuses may be truly empty" {
+		for _, status := range []int{http.StatusOK, http.StatusNoContent} {
+			client, cleanup := clientForHandler(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(status)
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
+			}))
+			response, err := client.Do(context.Background(), Request{
+				Profile: ProfileDiscordREST, Method: http.MethodPut, URL: "http://discord.example/commands",
+			})
+			expect err == nil
+			body, readErr := io.ReadAll(response.Body)
+			expect readErr == nil
+			expect len(body) == 0
+			response.Body.Close()
+			cleanup()
+		}
+	}
+
+	then "empty POST and non-JSON PUT responses remain rejected" {
+		for _, test := range []struct{
+			method string
+			body string
+			contentType string
+		}{
+			{method: http.MethodPost},
+			{method: http.MethodPut, body: "not-json", contentType: "text/plain"},
+		} {
+			client, cleanup := clientForHandler(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if test.contentType != "" {
+					w.Header().Set("Content-Type", test.contentType)
+				}
+				w.WriteHeader(http.StatusOK)
+				if test.body != "" {
+					_, _ = w.Write([]byte(test.body))
+				}
+			}))
+			_, err := client.Do(context.Background(), Request{
+				Profile: ProfileDiscordREST, Method: test.method, URL: "http://discord.example/action",
+			})
+			expect CategoryOf(err) == CategoryUnsupportedContent
+			cleanup()
+		}
+	}
+
+	then "declared and compressed truncation cannot become empty success or valid short content" {
+		var compressed bytes.Buffer
+		gzipWriter := gzip.NewWriter(&compressed)
+		_, _ = gzipWriter.Write([]byte(`{"ok":true}`))
+		_ = gzipWriter.Close()
+		truncatedGzip := compressed.Bytes()[:compressed.Len()-4]
+		for _, test := range []struct {
+			name string
+			response []byte
+		}{
+			{
+				name: "declared empty truncation",
+				response: []byte("HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n"),
+			},
+			{
+				name: "declared nonempty valid JSON truncation",
+				response: []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 32\r\n\r\n{\"ok\":true}"),
+			},
+			{
+				name: "truncated gzip stream",
+				response: append([]byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: "+strconv.Itoa(len(truncatedGzip))+"\r\n\r\n"), truncatedGzip...),
+			},
+			{
+				name: "truncated gzip header",
+				response: []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: 3\r\n\r\n\x1f\x8b\x08"),
+			},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+			client := clientForRawResponse(t, test.response)
+			profile := ProfileDiscordREST
+			method := http.MethodPut
+			if strings.Contains(test.name, "gzip") {
+				profile = ProfileMetadataJSON
+				method = http.MethodGet
+			}
+			_, err := client.Do(context.Background(), Request{Profile: profile, Method: method, URL: "http://provider.example/response"})
+			expect CategoryOf(err) == CategoryResponseTruncated
+		})
+		}
+	}
+
+	then "only clean exact or unknown-length EOF permits an empty Discord response" {
+		for _, response := range [][]byte{
+			[]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"),
+			[]byte("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n"),
+		} {
+			client := clientForRawResponse(t, response)
+			result, err := client.Do(context.Background(), Request{
+				Profile: ProfileDiscordREST, Method: http.MethodPut, URL: "http://discord.example/commands",
+			})
+			expect err == nil
+			body, readErr := io.ReadAll(result.Body)
+			expect readErr == nil
+			expect len(body) == 0
+			result.Body.Close()
+		}
+	}
+}

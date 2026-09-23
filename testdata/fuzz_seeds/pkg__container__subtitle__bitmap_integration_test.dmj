@@ -1,0 +1,50 @@
+package subtitle_test
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/container/subtitle"
+)
+
+integration "EnsureBitmapTrack with real samples" {
+	given "sample fixtures are available" {
+		sampleDir := os.Getenv("GOETROPE_BITMAP_SAMPLE_DIR")
+		if sampleDir == "" {
+			t.Skip("GOETROPE_BITMAP_SAMPLE_DIR not set")
+		}
+		if _, err := os.Stat(filepath.Join(sampleDir, "supsample.mkv")); err != nil {
+			t.Skipf("PGS sample missing: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(sampleDir, "X.The.Movie.DVDivX-SChiZO.idx")); err != nil {
+			t.Skipf("VobSub sample missing: %v", err)
+		}
+
+		each "bitmap sample" {
+			{ name: "pgs", path: filepath.Join(sampleDir, "supsample.mkv"), codec: "pgs", codecTag: "hdmv_pgs_subtitle" }
+			{ name: "dvdsub", path: filepath.Join(sampleDir, "X.The.Movie.DVDivX-SChiZO.idx"), codec: "dvd_subtitle", codecTag: "dvdsub" }
+		} do {
+			when "ensuring the bitmap track cache" {
+				track, err := subtitle.EnsureBitmapTrack(context.Background(), scenario.path.(string), 0, scenario.codec.(string), scenario.codecTag.(string))
+
+				then "succeeds" {
+					expect err == nil
+				}
+				then "captures canvas dimensions" {
+					expect track != nil
+					expect track.CanvasWidth > 0
+					expect track.CanvasHeight > 0
+				}
+				then "extracts at least one cue" {
+					expect len(track.Cues) >= 1
+				}
+				then "stores cue bounds" {
+					expect track.Cues[0].Width > 0
+					expect track.Cues[0].Height > 0
+				}
+			}
+		}
+	}
+}

@@ -1,0 +1,137 @@
+package api
+
+import (
+"fmt"
+"net/http"
+"net/http/httptest"
+"os"
+"strings"
+"testing"
+"time"
+)
+
+unit "playback telemetry accepts only bounded same-origin diagnostics" {
+	validBody := `{"version":1,"event":"stall_end","session":"0123456789abcdef0123456789abcdef","episode":7,"context":"channel","media_id":42,"reason":"waiting","duration_ms":6200,"current_time":81.5,"buffer_ahead":4.25,"ready_state":3,"network_state":2,"media_error":0,"hls_class":"network","recovery_action":"source_reload","outcome":"source_reload_succeeded"}`
+	sourceBytes, sourceErr := os.ReadFile("playback_telemetry.go")
+	expect sourceErr == nil
+	source := string(sourceBytes)
+	then "does no channel or database work on the request path" {
+		reject strings.Contains(source, "randomChannelAdmin")
+		reject strings.Contains(source, ".Summary(")
+		reject strings.Contains(source, "server_media_id")
+		expect strings.Contains(source, "h.record(event, now)")
+	}
+	then "records a redacted operator-consumable event" {
+		var line string
+		handler := &playbackTelemetryHandler{
+			limiter: newPlaybackTelemetryLimiter(time.Now()),
+			logf: func(format string, args ...any) { line = fmt.Sprintf(format, args...) },
+		}
+		req := httptest.NewRequest(http.MethodPost, "http://goetrope.test/api/playback/telemetry", strings.NewReader(validBody))
+		req.Header.Set("Origin", "http://goetrope.test")
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		expect rec.Code == http.StatusNoContent
+		expect strings.Contains(line, "code=stall_end")
+		expect strings.Contains(line, "session=0123456789abcdef0123456789abcdef")
+		expect strings.Contains(line, "buffer_ahead=4.250")
+		reject strings.Contains(line, "title=")
+		reject strings.Contains(line, "path=")
+		reject strings.Contains(line, "server_media_id=")
+	}
+	then "rejects a foreign origin before parsing" {
+		handler := newPlaybackTelemetryHandler(RuntimeDependencies{})
+		req := httptest.NewRequest(http.MethodPost, "http://goetrope.test/api/playback/telemetry", strings.NewReader(validBody))
+		req.Header.Set("Origin", "https://attacker.example")
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		expect rec.Code == http.StatusForbidden
+	}
+	then "rejects unknown fields and invalid enums" {
+		body := strings.Replace(validBody, `"outcome":"source_reload_succeeded"`, `"outcome":"secret-path","title":"private"`, 1)
+		handler := newPlaybackTelemetryHandler(RuntimeDependencies{})
+		req := httptest.NewRequest(http.MethodPost, "http://goetrope.test/api/playback/telemetry", strings.NewReader(body))
+		req.Header.Set("Origin", "http://goetrope.test")
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		expect rec.Code == http.StatusBadRequest
+	}
+	then "accepts a valid quality_sample event with the new fields" {
+		var line string
+		handler := &playbackTelemetryHandler{
+			limiter: newPlaybackTelemetryLimiter(time.Now()),
+			logf: func(format string, args ...any) { line = fmt.Sprintf(format, args...) },
+		}
+		qualityBody := `{"version":1,"event":"quality_sample","session":"0123456789abcdef0123456789abcdef","episode":7,"context":"channel","media_id":42,"reason":"unknown","duration_ms":0,"current_time":81.5,"buffer_ahead":4.25,"ready_state":3,"network_state":2,"media_error":0,"hls_class":"none","recovery_action":"none","outcome":"pending","frames_decoded":1800,"frames_dropped":3,"interval_seconds":60,"playback_rate":1,"track_rebuilds":0,"rendition":"720p"}`
+		req := httptest.NewRequest(http.MethodPost, "http://goetrope.test/api/playback/telemetry", strings.NewReader(qualityBody))
+		req.Header.Set("Origin", "http://goetrope.test")
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		expect rec.Code == http.StatusNoContent
+		expect line == ""
+	}
+	then "aggregates quality_sample logs into capped summaries" {
+		var line string
+		now := time.Unix(100, 0)
+		handler := &playbackTelemetryHandler{
+			limiter: newPlaybackTelemetryLimiter(now),
+			logf: func(format string, args ...any) { line = fmt.Sprintf(format, args...) },
+			now: func() time.Time { return now },
+			summaryEvery: 2,
+			summaryInterval: time.Hour,
+		}
+		qualityBody := `{"version":1,"event":"quality_sample","session":"0123456789abcdef0123456789abcdef","episode":7,"context":"channel","media_id":42,"reason":"unknown","duration_ms":0,"current_time":81.5,"buffer_ahead":4.25,"ready_state":3,"network_state":2,"media_error":0,"hls_class":"none","recovery_action":"none","outcome":"pending","frames_decoded":1800,"frames_dropped":3,"interval_seconds":60,"playback_rate":1,"track_rebuilds":1,"rendition":"720p"}`
+		for i := 0; i < 2; i++ {
+			req := httptest.NewRequest(http.MethodPost, "http://goetrope.test/api/playback/telemetry", strings.NewReader(qualityBody))
+			req.Header.Set("Origin", "http://goetrope.test")
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			expect rec.Code == http.StatusNoContent
+		}
+		expect strings.Contains(line, "code=quality_summary")
+		expect strings.Contains(line, "samples=2")
+		expect strings.Contains(line, "frames_decoded=3600")
+		expect strings.Contains(line, "frames_dropped=6")
+		expect strings.Contains(line, "track_rebuilds=2")
+	}
+	then "rejects a quality_sample event with negative frames_decoded" {
+		handler := newPlaybackTelemetryHandler(RuntimeDependencies{})
+		qualityBody := `{"version":1,"event":"quality_sample","session":"0123456789abcdef0123456789abcdef","episode":7,"context":"channel","media_id":42,"reason":"unknown","duration_ms":0,"current_time":81.5,"buffer_ahead":4.25,"ready_state":3,"network_state":2,"media_error":0,"hls_class":"none","recovery_action":"none","outcome":"pending","frames_decoded":-1,"frames_dropped":0,"interval_seconds":60,"playback_rate":1,"track_rebuilds":0,"rendition":"720p"}`
+		req := httptest.NewRequest(http.MethodPost, "http://goetrope.test/api/playback/telemetry", strings.NewReader(qualityBody))
+		req.Header.Set("Origin", "http://goetrope.test")
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		expect rec.Code == http.StatusBadRequest
+	}
+	then "rejects a quality_sample event where frames_dropped exceeds frames_decoded" {
+		handler := newPlaybackTelemetryHandler(RuntimeDependencies{})
+		qualityBody := `{"version":1,"event":"quality_sample","session":"0123456789abcdef0123456789abcdef","episode":7,"context":"channel","media_id":42,"reason":"unknown","duration_ms":0,"current_time":81.5,"buffer_ahead":4.25,"ready_state":3,"network_state":2,"media_error":0,"hls_class":"none","recovery_action":"none","outcome":"pending","frames_decoded":10,"frames_dropped":11,"interval_seconds":60,"playback_rate":1,"track_rebuilds":0,"rendition":"720p"}`
+		req := httptest.NewRequest(http.MethodPost, "http://goetrope.test/api/playback/telemetry", strings.NewReader(qualityBody))
+		req.Header.Set("Origin", "http://goetrope.test")
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		expect rec.Code == http.StatusBadRequest
+	}
+	then "still accepts an existing stall_start event unchanged" {
+		var line string
+		handler := &playbackTelemetryHandler{
+			limiter: newPlaybackTelemetryLimiter(time.Now()),
+			logf: func(format string, args ...any) { line = fmt.Sprintf(format, args...) },
+		}
+		stallBody := `{"version":1,"event":"stall_start","session":"0123456789abcdef0123456789abcdef","episode":7,"context":"channel","media_id":42,"reason":"waiting","duration_ms":0,"current_time":81.5,"buffer_ahead":4.25,"ready_state":3,"network_state":2,"media_error":0,"hls_class":"none","recovery_action":"none","outcome":"pending"}`
+		req := httptest.NewRequest(http.MethodPost, "http://goetrope.test/api/playback/telemetry", strings.NewReader(stallBody))
+		req.Header.Set("Origin", "http://goetrope.test")
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		expect rec.Code == http.StatusNoContent
+		expect strings.Contains(line, "code=stall_start")
+	}
+}

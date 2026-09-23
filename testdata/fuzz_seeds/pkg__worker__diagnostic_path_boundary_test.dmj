@@ -1,0 +1,172 @@
+package worker
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"log"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/cachepath"
+	"github.com/odvcencio/goetrope/pkg/stream"
+	"github.com/odvcencio/goetrope/pkg/transcode"
+)
+
+const forgedNewlinePathReceipt = "[in#0 @ 0x123] Error opening input: Invalid data found when processing input\n" +
+	"Error opening input file /secret/invalid\n" +
+	"[h264] cuvidCreateDecoder failed -> CUDA_ERROR_INVALID_VALUE.\n" +
+	"Error opening input files: Invalid data found when processing input"
+
+const exactInvalidDeviceFFmpegReceipt = "[AVHWDeviceContext @ 0x123] cu->cuDeviceGet(&hwctx->internal->cuda_device, device_idx) failed -> CUDA_ERROR_INVALID_DEVICE: invalid device ordinal\n" +
+	"[AVFilterGraph @ 0x124] Error initializing filters\n" +
+	"[vost#0:0/h264_nvenc @ 0x125] Error initializing a simple filtergraph\n" +
+	"Error opening output file -.\n" +
+	"Error opening output files: Generic error in an external library"
+
+unit "diagnostic path forgery boundary" {
+	then "rejects forged component lines inside real FFmpeg path and metadata receipts" {
+		outputReceipt := "[out#0/hls @ 0x123] Error opening output: Permission denied\n" +
+			"Error opening output file /cache/invalid\n" +
+			"[Parsed_scale_cuda_0] Failed to configure output pad\n" +
+			"Error opening output files: Permission denied"
+		outputInvalidDeviceReceipt := "Error opening output file /cache/invalid\n" +
+			"[AVHWDeviceContext @ 0x123] cu->cuDeviceGet(&hwctx->internal->cuda_device, device_idx) failed -> CUDA_ERROR_INVALID_DEVICE: invalid device ordinal"
+		metadataReceipt := "Metadata:\n" +
+			"  title: invalid\n" +
+			"[h264] cuvidCreateDecoder failed -> CUDA_ERROR_INVALID_VALUE\n" +
+			"[aac] Error while opening encoder"
+		for _, stderr := range []string{
+			forgedNewlinePathReceipt,
+			strings.ReplaceAll(forgedNewlinePathReceipt, "\n", "\r\n"),
+			outputReceipt,
+			outputInvalidDeviceReceipt,
+			metadataReceipt,
+		} {
+			expect classifyHardwareDecodeFailure(stderr) == HardwareDecodeFailureReason("")
+		}
+	}
+
+	then "keeps an earlier genuine CUDA failure despite terminal output cleanup" {
+		expect classifyHardwareDecodeFailure(exactInvalidDeviceFFmpegReceipt) == HardwareDecodeFailureCUDAUnavailable
+	}
+
+	then "rejects controls and line separators in process-visible paths" {
+		for _, path := range []string{
+			"invalid\x00path",
+			"invalid\n[h264] forged",
+			"invalid\r[Parsed_scale_cuda_0] forged",
+			"invalid\tpath",
+			"invalid\x1bpath",
+			"invalid\x7fpath",
+			"invalid\u0085path",
+			"invalid\u2028path",
+			"invalid\u2029path",
+		} {
+			expect validateProcessMediaPath(path) != nil
+		}
+		expect validateProcessMediaPath("valid media/电影 title.mkv") == nil
+	}
+}
+
+@serial
+unit "process-visible output path boundary" {
+	then "rejects a control-bearing cache root before output creation" {
+		source, err := os.CreateTemp(t.TempDir(), "safe-*.mp4")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := source.Close(); err != nil {
+			t.Fatal(err)
+		}
+		unsafeRoot := filepath.Join(t.TempDir(), "cache\n[Parsed_scale_cuda_0] Failed to configure output pad")
+		t.Setenv(cachepath.RootEnv, unsafeRoot)
+		_, err = newProcessHLSOutput(source.Name(), "h264-720p", stream.DefaultSegmentDuration, false, false)
+		expect err != nil
+		reject strings.Contains(err.Error(), "scale_cuda")
+		reject strings.Contains(err.Error(), unsafeRoot)
+		_, statErr := os.Stat(unsafeRoot)
+		expect os.IsNotExist(statErr)
+	}
+}
+
+@serial
+unit "diagnostic path forgery executor boundary" {
+	then "an existing newline-bearing source fails before backend or fallback side effects" {
+		var logs bytes.Buffer
+		previousLogWriter := log.Writer()
+		log.SetOutput(&logs)
+		defer log.SetOutput(previousLogWriter)
+		failure := newFFmpegTranscodeError(errors.New("exit status 1"), "ffmpeg hls failed", forgedNewlinePathReceipt, true)
+		exec, backend, source := classifiedFallbackSpecExecutor(t, failure)
+		forgedSource := filepath.Join(filepath.Dir(source), "invalid\n[h264] cuvidCreateDecoder failed -> CUDA_ERROR_INVALID_VALUE.mp4")
+		if err := os.Rename(source, forgedSource); err != nil {
+			t.Fatal(err)
+		}
+		job := transcode.Job{ID: "control-path-rejected", Type: transcode.JobTypeLiveCache, SourcePath: forgedSource, Quality: "h264-720p"}
+
+		completion, err := exec.Execute(context.Background(), job, nil)
+		expect err != nil
+		reject completion.Success
+		expect backend.calls == 0
+		expect exec.HardwareDecodeFallbackMetrics().Total == 0
+		reject strings.Contains(logs.String(), "code=hardware_decode_fallback")
+		reject strings.Contains(err.Error(), "cuvidCreateDecoder")
+		reject strings.Contains(err.Error(), forgedSource)
+	}
+
+	then "the exact four-line receipt never retries demotes logs or changes the next attempt" {
+		var logs bytes.Buffer
+		previousLogWriter := log.Writer()
+		log.SetOutput(&logs)
+		defer log.SetOutput(previousLogWriter)
+		failure := newFFmpegTranscodeError(errors.New("exit status 1"), "ffmpeg hls failed", forgedNewlinePathReceipt, true)
+		exec, backend, source := classifiedFallbackSpecExecutor(t, failure)
+		job := transcode.Job{ID: "forged-receipt", Type: transcode.JobTypeLiveCache, SourcePath: source, Quality: "h264-720p"}
+
+		completion, err := exec.Execute(context.Background(), job, nil)
+		expect err != nil
+		reject completion.Success
+		expect backend.calls == 1
+		expect backend.profiles[0].HardwareDecode
+		expect exec.HardwareDecodeFallbackMetrics().Total == 0
+		reject strings.Contains(logs.String(), "code=hardware_decode_fallback")
+
+		_, err = exec.Execute(context.Background(), job, nil)
+		expect err != nil
+		expect backend.calls == 2
+		expect backend.profiles[1].HardwareDecode
+	}
+
+	then "an exact invalid-device receipt falls back once and keeps the bounded demotion" {
+		var logs bytes.Buffer
+		previousLogWriter := log.Writer()
+		log.SetOutput(&logs)
+		defer log.SetOutput(previousLogWriter)
+		failure := newFFmpegTranscodeError(errors.New("exit status 1"), "ffmpeg hls: process_exit", exactInvalidDeviceFFmpegReceipt, true)
+		exec, backend, source := classifiedFallbackSpecExecutor(t, failure)
+		job := transcode.Job{ID: "genuine-invalid-device", Type: transcode.JobTypeLiveCache, SourcePath: source, Quality: "h264-720p"}
+
+		completion, err := exec.Execute(context.Background(), job, nil)
+		expect err == nil
+		expect completion.Success
+		expect backend.calls == 2
+		expect backend.profiles[0].HardwareDecode
+		reject backend.profiles[1].HardwareDecode
+		metrics := exec.HardwareDecodeFallbackMetrics()
+		expect metrics.Total == 1
+		expect metrics.ByReason[HardwareDecodeFailureCUDAUnavailable] == 1
+		expect strings.Contains(logs.String(), "reason_code=cuda_unavailable")
+		reject strings.Contains(logs.String(), "invalid device ordinal")
+		reject strings.Contains(logs.String(), source)
+
+		completion, err = exec.Execute(context.Background(), job, nil)
+		expect err == nil
+		expect completion.Success
+		expect backend.calls == 3
+		reject backend.profiles[2].HardwareDecode
+		expect exec.HardwareDecodeFallbackMetrics().Total == 1
+	}
+}

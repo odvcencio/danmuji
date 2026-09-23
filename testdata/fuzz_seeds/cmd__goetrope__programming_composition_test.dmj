@@ -1,0 +1,195 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/odvcencio/goetrope/pkg/randomchannel"
+	"github.com/odvcencio/goetrope/pkg/theatre"
+	"github.com/odvcencio/goetrope/pkg/transcode"
+	"github.com/odvcencio/goetrope/pkg/worker"
+)
+
+@serial
+unit "random channel programming composition" {
+	then "empty programming config builds the default movie and show channels" {
+		snapshot, resolvedPath, loadErr := loadRandomChannelProgramming("", "")
+		registry, movie, buildErr := buildProgrammedRandomChannels(snapshot, nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+		movieSvc, movieOK := registry.Service(randomchannel.DefaultMovieAlias)
+		showSvc, showOK := registry.Service(randomchannel.DefaultShowAlias)
+		receivers := randomChannelFFmpegReceivers(registry)
+
+		expect loadErr == nil
+		expect resolvedPath == ""
+		expect buildErr == nil
+		expect movie not_nil
+		expect movie == movieSvc
+		expect movieOK
+		expect showOK
+		expect showSvc.ContentKind() == randomchannel.ContentKindShows
+		expect len(receivers) == 2
+	}
+
+	then "programming file paths are resolved relative to goetrope config files and can add channels" {
+		root := t.TempDir()
+		programmingPath := filepath.Join(root, "programming.toml")
+		configPath := filepath.Join(root, "goetrope.toml")
+		raw := `
+timezone = "UTC"
+
+[[programs]]
+id = "movies"
+kind = "random_movies"
+
+[[programs]]
+id = "shows"
+kind = "random_shows"
+
+[[programs]]
+id = "show-42"
+name = "Show 42 Marathon"
+kind = "series_marathon"
+series_id = 42
+
+[[channels]]
+alias = "1"
+room_code = "CHAN01"
+name = "Random Movies"
+program_id = "movies"
+
+[[channels]]
+alias = "2"
+room_code = "SHOW01"
+name = "Random Shows"
+program_id = "shows"
+
+[[channels]]
+alias = "7"
+room_code = "SHOW42"
+name = "Show 42 All Day"
+program_id = "show-42"
+`
+		expect os.WriteFile(programmingPath, []byte(raw), 0o600) == nil
+		snapshot, resolvedPath, loadErr := loadRandomChannelProgramming("programming.toml", configPath)
+		registry, movie, buildErr := buildProgrammedRandomChannels(snapshot, nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+		marathon, marathonOK := registry.Service("7")
+		receivers := randomChannelFFmpegReceivers(registry)
+
+		expect loadErr == nil
+		expect resolvedPath == programmingPath
+		expect buildErr == nil
+		expect movie.Alias() == "1"
+		expect marathonOK
+		expect marathon.RoomCode() == "SHOW42"
+		expect marathon.ContentKind() == randomchannel.ContentKindShows
+		expect len(receivers) == 3
+	}
+
+	then "startup rejects programming that omits the legacy movie alias" {
+		snapshot, snapshotErr := randomchannel.NewProgrammingSnapshot(randomchannel.ProgrammingConfig{
+			Programs: []randomchannel.ProgramConfig{{ID: "shows", Kind: randomchannel.ProgramKindRandomShows}},
+			Channels: []randomchannel.ChannelProgramConfig{{
+				Alias: "2", RoomCode: "SHOW01", Name: "Random Shows", ProgramID: "shows",
+			}},
+		})
+		_, _, buildErr := buildProgrammedRandomChannels(snapshot, nil, nil, nil, nil, nil)
+
+		expect snapshotErr == nil
+		expect buildErr != nil
+		expect strings.Contains(buildErr.Error(), `legacy movie alias "1"`)
+	}
+
+	then "startup rejects alias one when it is not a movie channel" {
+		snapshot, snapshotErr := randomchannel.NewProgrammingSnapshot(randomchannel.ProgrammingConfig{
+			Programs: []randomchannel.ProgramConfig{{ID: "shows", Kind: randomchannel.ProgramKindRandomShows}},
+			Channels: []randomchannel.ChannelProgramConfig{{
+				Alias: "1", RoomCode: "SHOW01", Name: "Random Shows", ProgramID: "shows",
+			}},
+		})
+		_, _, buildErr := buildProgrammedRandomChannels(snapshot, nil, nil, nil, nil, nil)
+
+		expect snapshotErr == nil
+		expect buildErr != nil
+		expect strings.Contains(buildErr.Error(), `alias "1" must use content kind "movies"`)
+	}
+
+	then "hot reload is active only for an explicit programming file and enabled flag" {
+		enabled := true
+		disabled := false
+
+		reject randomChannelProgrammingHotReloadEnabled("", nil)
+		expect randomChannelProgrammingHotReloadEnabled("/etc/goetrope/programming.toml", nil)
+		expect randomChannelProgrammingHotReloadEnabled("/etc/goetrope/programming.toml", &enabled)
+		reject randomChannelProgrammingHotReloadEnabled("/etc/goetrope/programming.toml", &disabled)
+	}
+
+	then "reload result logs status without echoing parse errors or config contents" {
+		read, write, pipeErr := os.Pipe()
+		expect pipeErr == nil
+		oldStdout := os.Stdout
+		os.Stdout = write
+		logRandomChannelProgrammingReload(randomchannel.ProgrammingReloadResult{
+			Path: "/etc/goetrope/programming.toml",
+			Err:  errors.New("secret-title = \"Kung Pow\""),
+		})
+		logRandomChannelProgrammingReload(randomchannel.ProgrammingReloadResult{
+			Path: "/etc/goetrope/programming.toml",
+			Err:  io.EOF,
+		})
+		logRandomChannelProgrammingReload(randomchannel.ProgrammingReloadResult{
+			Path:            "/etc/goetrope/programming.toml",
+			RestartRequired: true,
+			Err:             io.EOF,
+		})
+		logRandomChannelProgrammingReload(randomchannel.ProgrammingReloadResult{
+			Path:    "/etc/goetrope/programming.toml",
+			Applied: true,
+		})
+		expect write.Close() == nil
+		os.Stdout = oldStdout
+		data, readErr := io.ReadAll(read)
+		expect readErr == nil
+		got := string(data)
+
+		expect strings.Contains(got, "reload failed")
+		expect strings.Contains(got, "needs restart")
+		expect strings.Contains(got, "reloaded")
+		reject strings.Contains(got, "Kung Pow")
+		reject strings.Contains(got, "secret-title")
+	}
+
+	then "runtime starts programming watcher as a background loop and stops it with runtime context" {
+		coord := transcode.NewCoordinator()
+		var watcherStarts atomic.Int64
+		watcherDone := make(chan struct{})
+		components := serveRuntimeComponents{
+			startWorker: func(_ context.Context, runtimeCtx context.Context) (*worker.EmbeddedRunner, error) {
+				return worker.StartEmbedded(runtimeCtx, coord, worker.EmbeddedConfig{Label: "embedded", Executor: activationOptionalExecutor{}})
+			},
+			runProgrammingWatcher: func(ctx context.Context) {
+				watcherStarts.Add(1)
+				<-ctx.Done()
+				close(watcherDone)
+			},
+		}
+		controller, err := newApplicationRuntimeController(context.Background(), components.start)
+		expect err == nil
+		expect controller.EnsureStarted(context.Background()) == nil
+		deadline := time.Now().Add(time.Second)
+		for watcherStarts.Load() != 1 && time.Now().Before(deadline) { time.Sleep(time.Millisecond) }
+		expect watcherStarts.Load() == 1
+		controller.Close()
+		select {
+		case <-watcherDone:
+		case <-time.After(time.Second):
+			t.Fatal("programming watcher did not stop")
+		}
+	}
+}

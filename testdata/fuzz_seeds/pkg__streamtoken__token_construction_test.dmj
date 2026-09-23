@@ -1,0 +1,88 @@
+package streamtoken
+
+import (
+	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"strconv"
+	"sync"
+	"testing"
+	"time"
+)
+
+func zeroKeyForgery(itemID int64, hint string, expiresAt time.Time, keyBytes int) string {
+	hintEncoded := base64.RawURLEncoding.EncodeToString([]byte(hint))
+	mac := hmac.New(sha256.New, make([]byte, keyBytes))
+	fmt.Fprintf(mac, "%d.%d.%s", itemID, expiresAt.Unix(), hintEncoded)
+	signature := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	return strconv.FormatInt(expiresAt.Unix(), 10) + "." + hintEncoded + "." + signature
+}
+
+unit "Required stream-token keyring construction" {
+	then "a missing active key is rejected instead of disabling enforcement" {
+		minter, err := NewKeyring(nil, nil, time.Hour)
+		expect minter == nil
+		expect errors.Is(err, ErrActiveKeyRequired)
+	}
+
+	then "a non-empty active key constructs usable authority" {
+		minter, err := NewKeyring([]byte("derived-test-key-material"), nil, time.Hour)
+		expect err == nil
+		expect minter != nil
+		defer minter.Close()
+		token := minter.Mint(42, "viewer")
+		_, valid := minter.Verify(token, 42)
+		expect valid
+	}
+}
+
+unit "Explicit unsafe test constructor" {
+	then "the raw-string seam is visibly test-only and blank input stays unusable" {
+		expect NewUnsafeMinterFromRawStringForTest("", time.Hour) == nil
+	}
+}
+
+unit "Closed stream-token authority" {
+	then "close is idempotent and disables every operation including a zero-key forgery" {
+		minter, err := NewKeyring(bytes.Repeat([]byte{9}, 32), [][]byte{bytes.Repeat([]byte{8}, 32)}, time.Hour)
+		expect err == nil
+		minter.Close()
+		minter.Close()
+		reject minter.Enabled()
+		expect minter.Mint(42, "viewer") == ""
+		forged := zeroKeyForgery(42, "viewer", time.Now().Add(time.Hour), 32)
+		_, valid := minter.Verify(forged, 42)
+		reject valid
+	}
+
+	then "concurrent use and repeated close settle fail-closed" {
+		minter, err := NewKeyring(bytes.Repeat([]byte{7}, 32), [][]byte{bytes.Repeat([]byte{6}, 32)}, time.Hour)
+		expect err == nil
+		initial := minter.Mint(42, "viewer")
+		var workers sync.WaitGroup
+		for worker := 0; worker < 8; worker++ {
+			workers.Add(1)
+			go func(worker int) {
+				defer workers.Done()
+				for iteration := 0; iteration < 100; iteration++ {
+					if worker%3 == 0 {
+						minter.Close()
+						continue
+					}
+					_ = minter.Enabled()
+					_ = minter.Mint(42, "viewer")
+					_, _ = minter.Verify(initial, 42)
+				}
+			}(worker)
+		}
+		workers.Wait()
+		minter.Close()
+		reject minter.Enabled()
+		expect minter.Mint(42, "viewer") == ""
+		_, valid := minter.Verify(initial, 42)
+		reject valid
+	}
+}

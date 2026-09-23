@@ -1,0 +1,75 @@
+package ingest
+
+import (
+	"context"
+	"errors"
+	"io/fs"
+	"os"
+	"sync/atomic"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/container/mp4"
+)
+
+func assertURLIngestDisabled(t *testing.T, rawURL string) {
+	t.Helper()
+	root := t.TempDir()
+	entriesBefore, readErr := os.ReadDir(root)
+	if readErr != nil {
+		t.Fatalf("read empty root: %v", readErr)
+	}
+	pipeline := &Pipeline{}
+	item, err := pipeline.IngestURL(context.Background(), rawURL)
+	if item != nil || !errors.Is(err, ErrURLIngestUnavailable) || err.Error() != "feature_unavailable" {
+		t.Fatalf("item=%v err=%v", item, err)
+	}
+	entriesAfter, afterErr := os.ReadDir(root)
+	if afterErr != nil || len(entriesAfter) != len(entriesBefore) {
+		t.Fatalf("disk changed: before=%d after=%d err=%v", len(entriesBefore), len(entriesAfter), afterErr)
+	}
+}
+
+func assertURLLikePathDisabled(t *testing.T, path string) {
+	t.Helper()
+	var statCalls atomic.Int32
+	var probeCalls atomic.Int32
+	pipeline := &Pipeline{
+		statFile: func(string) (fs.FileInfo, error) {
+			statCalls.Add(1)
+			return nil, errors.New("PATH_MARKER_101 stat must not run")
+		},
+		probeFile: func(context.Context, string) (*mp4.MediaInfo, error) {
+			probeCalls.Add(1)
+			return nil, errors.New("PATH_MARKER_101 probe must not run")
+		},
+	}
+	item, err := pipeline.IngestPath(context.Background(), path)
+	if item != nil || !errors.Is(err, ErrURLIngestUnavailable) || err.Error() != "feature_unavailable" {
+		t.Fatalf("item=%v err=%v", item, err)
+	}
+	if statCalls.Load() != 0 || probeCalls.Load() != 0 {
+		t.Fatalf("stat_calls=%d probe_calls=%d", statCalls.Load(), probeCalls.Load())
+	}
+	snapshot := pipeline.Snapshot()
+	if snapshot.TotalIngests != 0 || snapshot.ActiveDownloads != 0 || len(snapshot.Recent) != 0 {
+		t.Fatalf("snapshot leaked rejected path: %+v", snapshot)
+	}
+}
+
+unit "URL ingest fail-closed boundary" {
+	then "every HTTP or HTTPS input is unavailable before download or disk mutation" {
+		assertURLIngestDisabled(t, "https://media.example/movie.mp4?credential=secret")
+		assertURLIngestDisabled(t, "https://media.example/movie.mkv")
+		assertURLIngestDisabled(t, "https://media.example/movie.webm")
+		assertURLIngestDisabled(t, "https://media.example/movie.mov")
+		assertURLIngestDisabled(t, "https://video.example/watch?v=private")
+		assertURLIngestDisabled(t, "http://127.0.0.1:5432/postgres")
+	}
+
+	then "URL-like path inputs are rejected before stat probe or tracking" {
+		assertURLLikePathDisabled(t, "HTTPS://user:password@private.example/media?token=PATH_MARKER_101")
+		assertURLLikePathDisabled(t, "HtTp://PRIVATE.EXAMPLE:5432/path?secret=PATH_MARKER_102")
+		assertURLLikePathDisabled(t, "hTTps:opaque-path?secret=PATH_MARKER_103")
+		assertURLLikePathDisabled(t, "HTTP://[::1]:9090/internal?key=PATH_MARKER_104")
+	}
+}

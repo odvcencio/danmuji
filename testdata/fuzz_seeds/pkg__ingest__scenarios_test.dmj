@@ -1,0 +1,165 @@
+package ingest_test
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"testing"
+
+	"github.com/docker/go-connections/nat"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
+
+	"github.com/odvcencio/goetrope/pkg/db"
+	"github.com/odvcencio/goetrope/pkg/decision"
+	"github.com/odvcencio/goetrope/pkg/ingest"
+	"github.com/odvcencio/goetrope/pkg/library"
+)
+
+integration "Ingest pipeline scenarios" {
+	before all {
+		ctx := context.Background()
+		pgReq := testcontainers.ContainerRequest{
+			Image:        "postgres:15",
+			ExposedPorts: []string{"5432/tcp"},
+			Env: map[string]string{
+				"POSTGRES_USER":     "test",
+				"POSTGRES_PASSWORD": "test",
+				"POSTGRES_DB":       "goetrope_test",
+			},
+			WaitingFor: wait.ForListeningPort(nat.Port("5432/tcp")),
+		}
+		pgContainer, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+			ContainerRequest: pgReq,
+			Started:          true,
+		})
+		if err != nil {
+			t.Fatalf("start postgres: %v", err)
+		}
+		t.Cleanup(func() { _ = pgContainer.Terminate(ctx) })
+		pgHost, err := pgContainer.Host(ctx)
+		if err != nil {
+			t.Fatalf("get host: %v", err)
+		}
+		pgPort, err := pgContainer.MappedPort(ctx, "5432/tcp")
+		if err != nil {
+			t.Fatalf("get port: %v", err)
+		}
+		connStr := fmt.Sprintf("postgres://test:test@%s:%s/goetrope_test?sslmode=disable", pgHost, pgPort.Port())
+		pool, err := pgxpool.New(ctx, connStr)
+		if err != nil {
+			t.Fatalf("connect: %v", err)
+		}
+		t.Cleanup(func() { pool.Close() })
+		if migErr := db.Migrate(ctx, pool); migErr != nil {
+			t.Fatalf("migrate: %v", migErr)
+		}
+
+		store := library.NewStore(pool)
+		engine, _ := decision.NewEngine("../../policies")
+		pipeline := ingest.NewPipeline(store, engine)
+	}
+
+	given "a synthetic MP4 file" {
+		mp4Data := buildMinimalMP4()
+		tmp, tmpErr := os.CreateTemp("", "scenario-*.mp4")
+		expect tmpErr == nil
+		tmp.Write(mp4Data)
+		tmpPath := tmp.Name()
+		tmp.Close()
+		defer os.Remove(tmpPath)
+
+		when "ingested for the first time" {
+			item1, err1 := pipeline.IngestPath(ctx, tmpPath)
+
+			then "creates a new library entry" {
+				expect err1 == nil
+				expect item1 not_nil
+				expect item1.ID > 0
+			}
+			then "extracts title from filename" {
+				expect item1.Title != ""
+			}
+			then "detects container format" {
+				expect item1.Container == "mp4"
+			}
+		}
+
+		when "ingested a second time" {
+			first, _ := pipeline.IngestPath(ctx, tmpPath)
+			second, err := pipeline.IngestPath(ctx, tmpPath)
+
+			then "upserts without error" {
+				expect err == nil
+			}
+			then "returns same ID" {
+				expect first.ID == second.ID
+			}
+		}
+
+		when "ingested then retrieved from store" {
+			item, _ := pipeline.IngestPath(ctx, tmpPath)
+			got, err := store.GetItem(ctx, item.ID)
+
+			then "store has the item" {
+				expect err == nil
+				expect got.Path == tmpPath
+			}
+			then "store has streams" {
+				foundVideo := false
+				for _, s := range got.Streams {
+					if s.StreamType == "video" {
+						foundVideo = true
+					}
+				}
+				expect foundVideo
+			}
+		}
+	}
+
+	given "various error conditions" {
+		when "ingesting a nonexistent file" {
+			_, err := pipeline.IngestPath(ctx, "/does/not/exist.mp4")
+
+			then "returns error" {
+				expect err != nil
+			}
+		}
+
+		when "ingesting an empty file" {
+			tmp, _ := os.CreateTemp("", "empty-*.mp4")
+			tmp.Close()
+			defer os.Remove(tmp.Name())
+
+			_, err := pipeline.IngestPath(ctx, tmp.Name())
+
+			then "returns error" {
+				expect err != nil
+			}
+		}
+
+		when "ingesting a non-MP4 file" {
+			tmp, _ := os.CreateTemp("", "fake-*.txt")
+			tmp.Write([]byte("not a video"))
+			tmp.Close()
+			defer os.Remove(tmp.Name())
+
+			_, err := pipeline.IngestPath(ctx, tmp.Name())
+
+			then "returns error" {
+				expect err != nil
+			}
+		}
+	}
+
+	given "the pipeline snapshot" {
+		when "checking snapshot" {
+			snap := pipeline.Snapshot()
+
+			then "has zero active downloads" {
+				expect snap.ActiveDownloads == 0
+			}
+		}
+	}
+}

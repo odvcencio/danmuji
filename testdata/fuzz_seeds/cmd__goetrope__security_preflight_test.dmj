@@ -1,0 +1,328 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/odvcencio/goetrope/pkg/config"
+	"github.com/odvcencio/goetrope/pkg/ingest"
+	"github.com/odvcencio/goetrope/pkg/transcode"
+	"github.com/odvcencio/goetrope/pkg/worker"
+	"github.com/spf13/cobra"
+)
+
+type serveEmbeddedSpecExecutor struct{}
+
+func newIngestSpecCommand() *cobra.Command {
+	cmd := &cobra.Command{}
+	cmd.Flags().String("postgres-dsn-source", "", "")
+	cmd.Flags().String("path", "", "")
+	cmd.Flags().String("url", "", "")
+	cmd.Flags().String("policies", "./policies", "")
+	return cmd
+}
+
+func (serveEmbeddedSpecExecutor) Capabilities() transcode.Capabilities {
+	return transcode.Capabilities{
+		HasFFmpeg:        true,
+		CPUAvailable:     true,
+		PreferredBackend: transcode.BackendCPU,
+		VideoEncoders:    []string{"libx264"},
+	}
+}
+
+func (serveEmbeddedSpecExecutor) Execute(context.Context, transcode.Job, worker.ProgressSink) (transcode.Completion, error) {
+	return transcode.Completion{Success: true}, nil
+}
+
+@serial
+unit "serve security preflight ordering" {
+	then "invalid security fails before any database dial" {
+		originalLoad := serveLoadConfig
+		originalConnect := serveConnectWithRetry
+		defer func() {
+			serveLoadConfig = originalLoad
+			serveConnectWithRetry = originalConnect
+		}()
+
+		cfg := config.Normalize(config.Defaults())
+		cfg.Postgres.DSNSource = "env:GOETROPE_UNUSED_TEST_DSN"
+		cfg.Security.MasterKeySource = "env:GOETROPE_UNUSED_TEST_KEY"
+		cfg.Server.Listen = "localhost:3000"
+		serveLoadConfig = func(*cobra.Command) (config.Config, string, error) {
+			return cfg, "", nil
+		}
+		dialed := false
+		serveConnectWithRetry = func(context.Context, []byte, time.Duration) (*pgxpool.Pool, error) {
+			dialed = true
+			return nil, errors.New("unexpected dial")
+		}
+
+		err := runServe(&cobra.Command{}, nil)
+		expect err != nil
+		reject dialed
+	}
+}
+
+@serial
+unit "serve DNS64 preflight ordering" {
+	then "an unknown DNS64 mode fails before credentials or database access" {
+		originalLoad := serveLoadConfig
+		originalPrepare := servePrepareRuntime
+		originalConnect := serveConnectWithRetry
+		defer func() {
+			serveLoadConfig = originalLoad
+			servePrepareRuntime = originalPrepare
+			serveConnectWithRetry = originalConnect
+		}()
+
+		cfg := config.Defaults()
+		cfg.Security.Runtime = config.RuntimeDevelopment
+		cfg.Netfetch.DNS64Mode = "discover"
+		serveLoadConfig = func(*cobra.Command) (config.Config, string, error) {
+			return cfg, "", nil
+		}
+		prepared := false
+		servePrepareRuntime = func(config.Config) (*config.PreparedRuntime, error) {
+			prepared = true
+			return nil, errors.New("unexpected credential preparation")
+		}
+		dialed := false
+		serveConnectWithRetry = func(context.Context, []byte, time.Duration) (*pgxpool.Pool, error) {
+			dialed = true
+			return nil, errors.New("unexpected dial")
+		}
+
+		err := runServe(&cobra.Command{}, nil)
+		expect err != nil
+		expect strings.Contains(err.Error(), "netfetch.dns64_mode")
+		reject prepared
+		reject dialed
+	}
+}
+
+@serial
+unit "serve segment egress preflight ordering" {
+	then "S3-compatible configuration fails before credential preparation or database access" {
+		originalLoad := serveLoadConfig
+		originalPrepare := servePrepareRuntime
+		originalConnect := serveConnectWithRetry
+		defer func() {
+			serveLoadConfig = originalLoad
+			servePrepareRuntime = originalPrepare
+			serveConnectWithRetry = originalConnect
+		}()
+
+		cfg := config.Defaults()
+		cfg.Security.Runtime = config.RuntimeDevelopment
+		cfg.Segment.BucketEndpoint = "https://s3.example"
+		cfg.Segment.BucketAccessKeySource = "env:S3_ACCESS_MARKER"
+		serveLoadConfig = func(*cobra.Command) (config.Config, string, error) {
+			return cfg, "", nil
+		}
+		prepared := false
+		servePrepareRuntime = func(config.Config) (*config.PreparedRuntime, error) {
+			prepared = true
+			return nil, errors.New("unexpected credential preparation")
+		}
+		dialed := false
+		serveConnectWithRetry = func(context.Context, []byte, time.Duration) (*pgxpool.Pool, error) {
+			dialed = true
+			return nil, errors.New("unexpected dial")
+		}
+
+		err := runServe(&cobra.Command{}, nil)
+		expect err != nil
+		expect strings.Contains(err.Error(), "segment")
+		reject prepared
+		reject dialed
+	}
+}
+
+@serial
+unit "serve runtime credential preflight ordering" {
+	then "credential preparation fails before any database dial" {
+		originalLoad := serveLoadConfig
+		originalPrepare := servePrepareRuntime
+		originalConnect := serveConnectWithRetry
+		defer func() {
+			serveLoadConfig = originalLoad
+			servePrepareRuntime = originalPrepare
+			serveConnectWithRetry = originalConnect
+		}()
+
+		cfg := config.Normalize(config.Defaults())
+		cfg.Security.Runtime = config.RuntimeDevelopment
+		cfg.Postgres.DSNSource = "env:GOETROPE_UNUSED_TEST_DSN"
+		serveLoadConfig = func(*cobra.Command) (config.Config, string, error) {
+			return cfg, "", nil
+		}
+		prepareErr := errors.New("prepared runtime unavailable")
+		servePrepareRuntime = func(config.Config) (*config.PreparedRuntime, error) {
+			return nil, prepareErr
+		}
+		dialed := false
+		serveConnectWithRetry = func(context.Context, []byte, time.Duration) (*pgxpool.Pool, error) {
+			dialed = true
+			return nil, errors.New("unexpected dial")
+		}
+
+		err := runServe(&cobra.Command{}, nil)
+		expect errors.Is(err, prepareErr)
+		reject dialed
+	}
+}
+
+@serial
+unit "serve embedded worker activation" {
+	then "the selected embedded mode starts only the direct in-process runner" {
+		originalStart := serveStartEmbeddedWorker
+		defer func() { serveStartEmbeddedWorker = originalStart }()
+		started := false
+		serveStartEmbeddedWorker = func(ctx context.Context, coord *transcode.Coordinator, cfg worker.EmbeddedConfig) (*worker.EmbeddedRunner, error) {
+			started = true
+			return worker.StartEmbedded(ctx, coord, cfg)
+		}
+		coord := transcode.NewCoordinator()
+		runner, err := startServeWorker(context.Background(), config.WorkerEmbedded, coord, []string{t.TempDir()}, serveEmbeddedSpecExecutor{})
+		expect err == nil
+		expect started
+		expect runner not_nil
+		defer runner.Close()
+		expect runner.Snapshot().Ready
+		expect len(coord.ListWorkers()) == 1
+	}
+
+	then "remote modes remain fenced before any transport starts" {
+		coord := transcode.NewCoordinator()
+		runner, err := startServeWorker(context.Background(), config.WorkerRemote, coord, []string{t.TempDir()}, serveEmbeddedSpecExecutor{})
+		expect err != nil
+		expect runner is_nil
+		expect len(coord.ListWorkers()) == 0
+
+		coord = transcode.NewCoordinator()
+		runner, err = startServeWorker(context.Background(), config.WorkerBoth, coord, []string{t.TempDir()}, serveEmbeddedSpecExecutor{})
+		expect err == nil
+		expect runner not_nil
+		expect runner.Snapshot().Ready
+		expect len(coord.ListWorkers()) == 1
+		runner.Close()
+	}
+}
+
+@serial
+unit "credential-safe CLI surface" {
+	then "serve and ingest help expose only the typed Postgres source flag" {
+		serveHelp := serveCmd.UsageString()
+		ingestHelp := ingestCmd.UsageString()
+		expect strings.Contains(serveHelp, "--postgres-dsn-source")
+		expect strings.Contains(ingestHelp, "--postgres-dsn-source")
+		expect strings.Contains(serveHelp, "Reserved gRPC address")
+		expect strings.Contains(serveHelp, "--netfetch-dns64-mode")
+		expect strings.Contains(serveHelp, "--netfetch-dns64-prefixes")
+		reject strings.Contains(serveHelp, "--db")
+		reject strings.Contains(ingestHelp, "--db")
+	}
+
+	then "URL ingest fails closed before credential resolution or database access" {
+		originalConnect := ingestNewPoolCredential
+		defer func() { ingestNewPoolCredential = originalConnect }()
+		dialed := false
+		ingestNewPoolCredential = func(_ context.Context, _ []byte) (*pgxpool.Pool, error) {
+			dialed = true
+			return nil, errors.New("unexpected dial")
+		}
+		cmd := newIngestSpecCommand()
+		marker := "https://user:secret@private.example/item?token=URL_MARKER_71"
+		err := cmd.Flags().Set("postgres-dsn-source", "inline:DB_MARKER_71")
+		expect err == nil
+		err = cmd.Flags().Set("url", marker)
+		expect err == nil
+		runErr := runIngest(cmd, nil)
+		expect errors.Is(runErr, ingest.ErrURLIngestUnavailable)
+		reject dialed
+		reject strings.Contains(runErr.Error(), marker)
+		reject strings.Contains(runErr.Error(), "private.example")
+		reject strings.Contains(runErr.Error(), "URL_MARKER_71")
+	}
+
+	then "a legacy raw db argument is unknown and its value is never reflected" {
+		marker := "RAW_ARGV_DSN_MARKER_39"
+		for _, cmd := range []*cobra.Command{serveCmd, ingestCmd} {
+			err := cmd.ParseFlags([]string{"--db=" + marker})
+			expect err != nil
+			expect strings.Contains(err.Error(), "--db")
+			reject strings.Contains(err.Error(), marker)
+		}
+	}
+
+	then "ingest resolves and erases an explicitly selected environment source before dialing" {
+		originalConnect := ingestNewPoolCredential
+		defer func() { ingestNewPoolCredential = originalConnect }()
+		marker := "postgres://INGEST_TYPED_SOURCE_MARKER"
+		t.Setenv("GOETROPE_INGEST_DSN_TEST", marker)
+		captured := ""
+		dialErr := errors.New("dial stopped")
+		ingestNewPoolCredential = func(_ context.Context, credential []byte) (*pgxpool.Pool, error) {
+			captured = string(credential)
+			return nil, dialErr
+		}
+		cmd := newIngestSpecCommand()
+		err := cmd.Flags().Set("postgres-dsn-source", "env:GOETROPE_INGEST_DSN_TEST")
+		expect err == nil
+		err = cmd.Flags().Set("path", "/media/item.mkv")
+		expect err == nil
+		runErr := runIngest(cmd, nil)
+		expect runErr != nil
+		expect captured == marker
+		reject strings.Contains(runErr.Error(), marker)
+		_, exists := os.LookupEnv("GOETROPE_INGEST_DSN_TEST")
+		reject exists
+	}
+}
+
+unit "owner and rollback credential-safe CLI surface" {
+	then "owner commands accept source references and delivery paths but no credential or password argument" {
+		owner := newOwnerCommand()
+		help := owner.Commands()[0].UsageString() + owner.Commands()[1].UsageString()
+		expect strings.Contains(help, "--postgres-dsn-source")
+		expect strings.Contains(help, "--token-file")
+		reject strings.Contains(help, "--token ")
+		reject strings.Contains(help, "--password")
+	}
+
+	then "rollback preflight requires separate restored and upgraded source references" {
+		rollback := newRollbackCommand()
+		help := rollback.Commands()[0].UsageString()
+		expect strings.Contains(help, "--restored-postgres-dsn-source")
+		expect strings.Contains(help, "--upgraded-postgres-dsn-source")
+		reject strings.Contains(help, "--postgres-dsn ")
+	}
+}
+
+@serial
+unit "owner database credential preparation" {
+	then "the typed environment source is consumed erased and never reflected by connection errors" {
+		originalConnect := identityNewPoolCredential
+		defer func() { identityNewPoolCredential = originalConnect }()
+		marker := "postgres://OWNER_TYPED_SOURCE_MARKER"
+		t.Setenv("GOETROPE_OWNER_DSN_TEST", marker)
+		captured := ""
+		identityNewPoolCredential = func(_ context.Context, credential []byte) (*pgxpool.Pool, error) {
+			captured = string(credential)
+			return nil, errors.New("dial stopped " + marker)
+		}
+		pool, err := openIdentityDatabase(context.Background(), "env:GOETROPE_OWNER_DSN_TEST")
+		expect pool is_nil
+		expect err != nil
+		expect captured == marker
+		reject strings.Contains(err.Error(), marker)
+		_, exists := os.LookupEnv("GOETROPE_OWNER_DSN_TEST")
+		reject exists
+	}
+}

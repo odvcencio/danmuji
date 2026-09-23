@@ -1,0 +1,162 @@
+package transcode
+
+import (
+	"fmt"
+	"testing"
+	"time"
+)
+
+unit "coordinator job page index walk" {
+	given "jobs with identical creation timestamps and caller supplied ids" {
+		createdAt := time.Unix(1_790_000_000, 0).UTC()
+		coord, err := newCoordinatorWithOptions(CoordinatorOptions{Now: func() time.Time { return createdAt }})
+		if err != nil { t.Fatal(err) }
+		for _, id := range []string{"job-002", "job-001", "job-003"} {
+			_, inserted := coord.Enqueue(Job{ID: id, Type: JobTypeOnDemand, SourcePath: fmt.Sprintf("/media/%s.mp4", id), Quality: "h264-720p"})
+			if !inserted { t.Fatalf("enqueue %s failed", id) }
+		}
+
+		when "the first page is listed without materializing the full history" {
+			page := coord.ListJobPage(JobPageOptions{Limit: 3})
+
+			then "the API keeps newest ordering with id descending as the timestamp tiebreaker" {
+				expect len(page.Records) == 3
+				expect page.Records[0].Job.ID == "job-003"
+				expect page.Records[1].Job.ID == "job-002"
+				expect page.Records[2].Job.ID == "job-001"
+			}
+		}
+	}
+
+	given "a churned status index and a cursor in the filtered page" {
+		now := time.Unix(1_790_100_000, 0).UTC()
+		coord, err := newCoordinatorWithOptions(CoordinatorOptions{
+			Now: func() time.Time { return now },
+			MaxQueuedJobs: 20000,
+			MaxQueuedJobsByType: map[JobType]int{JobTypeLiveCache: 20000},
+		})
+		if err != nil { t.Fatal(err) }
+		first, inserted := coord.Enqueue(Job{Type: JobTypeLiveCache, SourcePath: "/media/first.mp4", Quality: "h264-720p"})
+		if !inserted { t.Fatal("enqueue first failed") }
+		now = now.Add(time.Second)
+		second, inserted := coord.Enqueue(Job{Type: JobTypeLiveCache, SourcePath: "/media/second.mp4", Quality: "h264-720p"})
+		if !inserted { t.Fatal("enqueue second failed") }
+		now = now.Add(time.Second)
+		third, inserted := coord.Enqueue(Job{Type: JobTypeLiveCache, SourcePath: "/media/third.mp4", Quality: "h264-720p"})
+		if !inserted { t.Fatal("enqueue third failed") }
+		coord.mu.Lock()
+		record := coord.jobs[second.Job.ID]
+		coord.setJobStatusLocked(record, JobStatusDispatched)
+		coord.setJobStatusLocked(record, JobStatusRunning)
+		coord.setJobStatusLocked(record, JobStatusQueued)
+		coord.mu.Unlock()
+
+		when "queued live-cache pages are read one item at a time" {
+			page := coord.ListJobPage(JobPageOptions{Limit: 1, Types: []JobType{JobTypeLiveCache}, Statuses: []JobStatus{JobStatusQueued}})
+			next := coord.ListJobPage(JobPageOptions{Limit: 1, Cursor: page.NextCursor, Types: []JobType{JobTypeLiveCache}, Statuses: []JobStatus{JobStatusQueued}})
+			last := coord.ListJobPage(JobPageOptions{Limit: 1, Cursor: next.NextCursor, Types: []JobType{JobTypeLiveCache}, Statuses: []JobStatus{JobStatusQueued}})
+
+			then "the cursor walks each matching job exactly once in API order" {
+				expect len(page.Records) == 1
+				expect page.Records[0].Job.ID == third.Job.ID
+				expect len(next.Records) == 1
+				expect next.Records[0].Job.ID == second.Job.ID
+				expect len(last.Records) == 1
+				expect last.Records[0].Job.ID == first.Job.ID
+				expect last.NextCursor == ""
+			}
+		}
+	}
+
+	given "a raw legacy cursor job with duplicate historical status entries" {
+		now := time.Unix(1_790_150_000, 0).UTC()
+		coord, err := newCoordinatorWithOptions(CoordinatorOptions{
+			Now: func() time.Time { return now },
+			MaxQueuedJobs: 20000,
+			MaxQueuedJobsByType: map[JobType]int{JobTypeLiveCache: 20000},
+		})
+		if err != nil { t.Fatal(err) }
+		oldest, inserted := coord.Enqueue(Job{Type: JobTypeLiveCache, SourcePath: "/media/oldest.mp4", Quality: "h264-720p"})
+		if !inserted { t.Fatal("enqueue oldest failed") }
+		now = now.Add(time.Second)
+		older, inserted := coord.Enqueue(Job{Type: JobTypeLiveCache, SourcePath: "/media/older.mp4", Quality: "h264-720p"})
+		if !inserted { t.Fatal("enqueue older failed") }
+		now = now.Add(time.Second)
+		cursorJob, inserted := coord.Enqueue(Job{Type: JobTypeLiveCache, SourcePath: "/media/cursor.mp4", Quality: "h264-720p"})
+		if !inserted { t.Fatal("enqueue cursor failed") }
+		now = now.Add(time.Second)
+		_, inserted = coord.Enqueue(Job{Type: JobTypeLiveCache, SourcePath: "/media/newest.mp4", Quality: "h264-720p"})
+		if !inserted { t.Fatal("enqueue newest failed") }
+		coord.mu.Lock()
+		record := coord.jobs[cursorJob.Job.ID]
+		coord.setJobStatusLocked(record, JobStatusDispatched)
+		coord.setJobStatusLocked(record, JobStatusRunning)
+		coord.setJobStatusLocked(record, JobStatusQueued)
+		coord.setJobStatusLocked(record, JobStatusDispatched)
+		coord.setJobStatusLocked(record, JobStatusQueued)
+		coord.mu.Unlock()
+
+		when "a legacy raw job id cursor lands on the churned job" {
+			page := coord.ListJobPage(JobPageOptions{Limit: 1, Cursor: cursorJob.Job.ID, Types: []JobType{JobTypeLiveCache}, Statuses: []JobStatus{JobStatusQueued}})
+			next := coord.ListJobPage(JobPageOptions{Limit: 1, Cursor: page.NextCursor, Types: []JobType{JobTypeLiveCache}, Statuses: []JobStatus{JobStatusQueued}})
+
+			then "all duplicate cursor entries are skipped and the opaque cursor still advances" {
+				expect len(page.Records) == 1
+				expect page.Records[0].Job.ID == older.Job.ID
+				reject page.Records[0].Job.ID == cursorJob.Job.ID
+				reject page.NextCursor == ""
+				expect len(next.Records) == 1
+				expect next.Records[0].Job.ID == oldest.Job.ID
+				expect next.NextCursor == ""
+			}
+		}
+	}
+}
+
+benchmark "ListJobPage admin page over retained jobs" {
+	setup {
+		now := time.Unix(1_790_200_000, 0).UTC()
+		coord, err := newCoordinatorWithOptions(CoordinatorOptions{
+			Now: func() time.Time { return now },
+			MaxQueuedJobs: 20000,
+			MaxQueuedJobsByType: map[JobType]int{JobTypeLiveCache: 20000},
+		})
+		if err != nil { b.Fatal(err) }
+		for idx := 0; idx < 10000; idx++ {
+			typ := JobTypeOnDemand
+			if idx % 10 == 0 { typ = JobTypeLiveCache }
+			_, inserted := coord.Enqueue(Job{Type: typ, SourcePath: fmt.Sprintf("/media/movie-%05d.mp4", idx), Quality: "h264-720p"})
+			if !inserted { b.Fatalf("enqueue %d failed", idx) }
+			now = now.Add(time.Microsecond)
+		}
+	}
+	measure {
+		page := coord.ListJobPage(JobPageOptions{Limit: 8})
+		if len(page.Records) != 8 { b.Fatalf("page len = %d, want 8", len(page.Records)) }
+	}
+	report_allocs
+}
+
+benchmark "ListJobPage admin live-cache page over retained jobs" {
+	setup {
+		now := time.Unix(1_790_300_000, 0).UTC()
+		coord, err := newCoordinatorWithOptions(CoordinatorOptions{
+			Now: func() time.Time { return now },
+			MaxQueuedJobs: 20000,
+			MaxQueuedJobsByType: map[JobType]int{JobTypeLiveCache: 20000},
+		})
+		if err != nil { b.Fatal(err) }
+		for idx := 0; idx < 10000; idx++ {
+			typ := JobTypeOnDemand
+			if idx % 10 == 0 { typ = JobTypeLiveCache }
+			_, inserted := coord.Enqueue(Job{Type: typ, SourcePath: fmt.Sprintf("/media/movie-%05d.mp4", idx), Quality: "h264-720p"})
+			if !inserted { b.Fatalf("enqueue %d failed", idx) }
+			now = now.Add(time.Microsecond)
+		}
+	}
+	measure {
+		page := coord.ListJobPage(JobPageOptions{Limit: 8, Types: []JobType{JobTypeLiveCache}, Statuses: []JobStatus{JobStatusQueued, JobStatusDispatched, JobStatusRunning}})
+		if len(page.Records) != 8 { b.Fatalf("page len = %d, want 8", len(page.Records)) }
+	}
+	report_allocs
+}

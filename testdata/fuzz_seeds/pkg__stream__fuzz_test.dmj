@@ -1,0 +1,29 @@
+package stream_test
+
+import (
+	"bytes"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/stream"
+)
+
+fuzz "TSWriter does not panic on arbitrary payload" with (data []byte, pts int64) {
+	var buf bytes.Buffer
+	tw := stream.NewTSWriter(&buf)
+	_ = tw.WritePAT()
+	_ = tw.WritePMT("h264", true)
+	_ = tw.WriteVideoPacket(data, pts, true)
+	_ = tw.WriteAudioPacket(data, pts)
+
+	// Verify output is always 188-byte aligned
+	expect buf.Len() % 188 == 0
+}
+
+fuzz "ADTSHeader does not panic" with (frameLen uint16, profile byte, rateIdx byte, channels byte) {
+	fl := int(frameLen) + 1
+	p := int(profile%3) + 1
+	ri := int(rateIdx % 13)
+	ch := int(channels%8) + 1
+	hdr := stream.ADTSHeader(fl, p, ri, ch)
+	expect len(hdr) == 7
+}

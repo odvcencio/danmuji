@@ -1,0 +1,36 @@
+package worker
+
+import (
+	"context"
+	"testing"
+	"google.golang.org/grpc/metadata"
+)
+
+func admissionIncoming(ctx context.Context) context.Context {
+	md, _ := metadata.FromOutgoingContext(ctx)
+	return metadata.NewIncomingContext(context.Background(), md)
+}
+
+@serial
+unit "trusted worker admission metadata" {
+	then "keeps legacy trusted metadata backward compatible when requirements are disabled" {
+		ctx := WithTrustedMetadata(context.Background(), []byte("credential"), CurrentWorkerProtocol())
+		expect AdmissionGate(admissionIncoming(ctx), false, false)
+	}
+
+	then "requires exactly the configured canary and cache readiness facts" {
+		base := context.Background()
+		missing := WithTrustedMetadata(base, []byte("credential"), CurrentWorkerProtocol())
+		expect !AdmissionGate(admissionIncoming(missing), true, false)
+		expect !AdmissionGate(admissionIncoming(missing), false, true)
+
+		canaryOnly := WithTrustedMetadata(base, []byte("credential"), CurrentWorkerProtocol(), true, false)
+		expect AdmissionGate(admissionIncoming(canaryOnly), true, false)
+		expect !AdmissionGate(admissionIncoming(canaryOnly), false, true)
+
+		both := WithTrustedMetadata(base, []byte("credential"), CurrentWorkerProtocol(), true, true)
+		expect AdmissionGate(admissionIncoming(both), true, true)
+		falseBoth := WithTrustedMetadata(base, []byte("credential"), CurrentWorkerProtocol(), false, false)
+		expect !AdmissionGate(admissionIncoming(falseBoth), true, true)
+	}
+}

@@ -1,0 +1,286 @@
+package randomchannel
+
+import (
+	"context"
+	"slices"
+	"testing"
+	"time"
+
+	"github.com/odvcencio/goetrope/pkg/library"
+	"github.com/odvcencio/goetrope/pkg/theatre"
+)
+
+unit "Random channel runtime rehydration" {
+	given "a persisted cursor beyond the first item without a prefix anchor" {
+		room := &theatre.Room{RoomCode: RoomCode, Playlist: []int64{30}, CurrentItemIndex: 0, PersistedCurrentItemIndex: 2, PlaylistProjected: true, PlaylistCount: 4, PlaylistOverflow: true, PlaylistHash: "projected"}
+		svc := feedModelTestService(t, true)
+		svc.manager = &recoveryRoomManager{room: room}
+		svc.loadItem = func(_ context.Context, id int64) (*library.MediaItem, error) {
+			return &library.MediaItem{ID: id, Path: "/managed/item.mkv", DurationMs: 100000}, nil
+		}
+		svc.feed.resumeAnchor(250)
+
+		when "rehydrating with only current and next demand" {
+			report, err := svc.RehydrateRuntime(context.Background())
+			global, anchored := svc.feed.globalPosition()
+
+			then "it keeps the monotonic anchor and reports safe degradation" {
+				expect err == nil
+				expect anchored
+				expect global == 250
+				expect report.ReasonCodes contains "timeline_anchor_unavailable"
+				expect report.State == RecoveryDegraded
+				expect len(report.DesiredKeys) == 1
+			}
+		}
+	}
+
+	given "a flag-off restart with warm assets but no transcode planner" {
+		room := &theatre.Room{RoomCode: RoomCode, Playlist: []int64{10, 20}, CurrentItemIndex: 0}
+		svc := New(nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+		svc.manager = &recoveryRoomManager{room: room}
+		svc.now = func() time.Time { return time.Date(2026, 7, 11, 12, 0, 0, 0, time.FixedZone("PDT", -7*60*60)) }
+		svc.loadItem = func(_ context.Context, id int64) (*library.MediaItem, error) {
+			return &library.MediaItem{ID: id, Path: "/managed/item.mkv", DurationMs: 600000}, nil
+		}
+		svc.warmItem = func(context.Context, *library.MediaItem) {}
+
+		when "rehydrating without a transcode queue" {
+			report, err := svc.RehydrateRuntime(context.Background())
+
+			then "it reports worker unavailability without planned work" {
+				expect err == nil
+				expect report.Planned == 0
+				expect report.ReasonCodes contains "worker_unavailable"
+				expect report.State == RecoveryDegraded
+			}
+		}
+	}
+
+	given "a producer-mode restart with warm assets and no legacy transcode planner" {
+		room := &theatre.Room{RoomCode: RoomCode, Playlist: []int64{10, 20}, CurrentItemIndex: 0}
+		svc := New(nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+		svc.manager = &recoveryRoomManager{room: room}
+		svc.now = func() time.Time { return time.Date(2026, 7, 11, 12, 0, 0, 0, time.FixedZone("PDT", -7*60*60)) }
+		svc.loadItem = func(_ context.Context, id int64) (*library.MediaItem, error) {
+			return &library.MediaItem{ID: id, Path: "/managed/item.mkv", DurationMs: 600000}, nil
+		}
+		svc.SetChannelProducer(&fakeChannelProducer{})
+
+		when "rehydrating without the legacy live-cache queue" {
+			report, err := svc.RehydrateRuntime(context.Background())
+
+			then "producer-owned supply satisfies recovery readiness" {
+				expect err == nil
+				expect report.Planned == 2
+				reject slices.Contains(report.ReasonCodes, "worker_unavailable")
+				expect report.State == RecoveryComplete
+			}
+		}
+	}
+
+	given "a combined producer and feed-model restart with a transcode queue" {
+		room := &theatre.Room{RoomCode: RoomCode, Playlist: []int64{10, 20}, CurrentItemIndex: 0}
+		svc := feedModelTestService(t, true)
+		queue := &generationQueue{}
+		svc.manager = &recoveryRoomManager{room: room}
+		svc.now = func() time.Time { return time.Date(2026, 7, 11, 12, 0, 0, 0, time.FixedZone("PDT", -7*60*60)) }
+		svc.loadItem = func(_ context.Context, id int64) (*library.MediaItem, error) {
+			return &library.MediaItem{ID: id, Path: "/managed/item.mkv", DurationMs: 600000}, nil
+		}
+		svc.transcode = queue
+		svc.SetChannelProducer(&fakeChannelProducer{})
+
+		when "rehydrating before the producer has driven a playback tick" {
+			report, err := svc.RehydrateRuntime(context.Background())
+
+			then "producer-owned supply wins over reactive feed scheduling" {
+				expect err == nil
+				expect report.Planned == 2
+				expect queue.splitCalls == 0
+				reject slices.Contains(report.ReasonCodes, "worker_unavailable")
+				expect report.State == RecoveryComplete
+			}
+		}
+	}
+
+	given "a feed-model restart without a producer or transcode queue" {
+		room := &theatre.Room{RoomCode: RoomCode, Playlist: []int64{10, 20}, CurrentItemIndex: 0}
+		svc := feedModelTestService(t, true)
+		svc.manager = &recoveryRoomManager{room: room}
+		svc.now = func() time.Time { return time.Date(2026, 7, 11, 12, 0, 0, 0, time.FixedZone("PDT", -7*60*60)) }
+		svc.loadItem = func(_ context.Context, id int64) (*library.MediaItem, error) {
+			return &library.MediaItem{ID: id, Path: "/managed/item.mkv", DurationMs: 600000}, nil
+		}
+
+		when "rehydrating without a scheduler coordinator" {
+			report, err := svc.RehydrateRuntime(context.Background())
+
+			then "it still reports genuine worker unavailability" {
+				expect err == nil
+				expect report.Planned == 0
+				expect report.ReasonCodes contains "worker_unavailable"
+				expect report.State == RecoveryDegraded
+			}
+		}
+	}
+
+	given "a feed-model restart with live cache intentionally suppressed" {
+		room := &theatre.Room{RoomCode: RoomCode, Playlist: []int64{10, 20}, CurrentItemIndex: 0}
+		svc := feedModelTestService(t, true)
+		svc.manager = &recoveryRoomManager{room: room}
+		svc.now = func() time.Time { return time.Date(2026, 7, 11, 12, 0, 0, 0, time.FixedZone("PDT", -7*60*60)) }
+		svc.liveCacheQualities = []string{"original"}
+		svc.loadItem = func(_ context.Context, id int64) (*library.MediaItem, error) {
+			return &library.MediaItem{ID: id, Path: "/managed/item.mkv", DurationMs: 600000}, nil
+		}
+
+		when "rehydrating without a scheduler coordinator" {
+			report, err := svc.RehydrateRuntime(context.Background())
+
+			then "it reports intentional suppression without worker failure" {
+				expect err == nil
+				expect report.Planned == 0
+				expect report.ReasonCodes contains "live_cache_suppressed"
+				reject slices.Contains(report.ReasonCodes, "worker_unavailable")
+				expect report.State == RecoveryComplete
+			}
+		}
+	}
+
+	given "a persisted cursor beyond the first item with an authoritative prefix" {
+		room := &theatre.Room{RoomCode: RoomCode, Playlist: []int64{30, 40}, CurrentItemIndex: 0, PersistedCurrentItemIndex: 2, PlaylistProjected: true, PlaylistCount: 4, PlaylistOverflow: true, PlaylistHash: "projected", PersistedPrefixDurationMs: 200000}
+		svc := feedModelTestService(t, true)
+		svc.manager = &recoveryRoomManager{room: room}
+		svc.loadItem = func(_ context.Context, id int64) (*library.MediaItem, error) {
+			return &library.MediaItem{ID: id, Path: "/managed/item.mkv", DurationMs: 100000}, nil
+		}
+
+		when "rehydrating" {
+			_, err := svc.RehydrateRuntime(context.Background())
+			global, anchored := svc.feed.globalPosition()
+
+			then "it anchors at the persisted prefix plus playback position" {
+				expect err == nil
+				expect anchored
+				expect global == 200
+			}
+		}
+	}
+
+	given "a persisted current and immediate-next lineup" {
+		room := &theatre.Room{RoomCode: RoomCode, Playlist: []int64{10, 20, 30}, CurrentItemIndex: 1}
+		manager := &recoveryRoomManager{room: room}
+		svc := New(nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+		svc.manager = manager
+		svc.now = func() time.Time { return time.Date(2026, 7, 11, 12, 0, 0, 0, time.FixedZone("PDT", -7*60*60)) }
+		svc.loadItem = func(_ context.Context, id int64) (*library.MediaItem, error) {
+			return &library.MediaItem{ID: id, Path: "/managed/item.mkv", DurationMs: 600000}, nil
+		}
+		svc.warmItem = func(context.Context, *library.MediaItem) {}
+		svc.liveCacheQualities = []string{"h264-720p"}
+		svc.transcode = &generationQueue{}
+
+		when "rehydrating twice" {
+			first, firstErr := svc.RehydrateRuntime(context.Background())
+			second, secondErr := svc.RehydrateRuntime(context.Background())
+
+			then "both passes complete without replaying the old queue" {
+				expect firstErr == nil
+				expect secondErr == nil
+				expect first.State == RecoveryComplete
+				expect second.State == RecoveryComplete
+				expect first.DesiredKeys == second.DesiredKeys
+				expect second.Reused == len(second.DesiredKeys)
+				expect len(first.DesiredKeys) == 2
+			}
+		}
+	}
+
+	given "a canonical bounded recovery projection" {
+		room := &theatre.Room{RoomCode: RoomCode, Playlist: []int64{10, 20}, CurrentItemIndex: 0, PersistedCurrentItemIndex: 7, PlaylistProjected: true, PlaylistCount: 8, PlaylistOverflow: true, PlaylistHash: "projected"}
+		manager := &recoveryRoomManager{recoverable: room}
+		svc := New(nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+		svc.manager = manager
+		svc.now = func() time.Time { return time.Date(2026, 7, 11, 12, 0, 0, 0, time.FixedZone("PDT", -7*60*60)) }
+		svc.loadItem = func(_ context.Context, id int64) (*library.MediaItem, error) {
+			return &library.MediaItem{ID: id, Path: "/managed/item.mkv", DurationMs: 600000}, nil
+		}
+		svc.warmItem = func(context.Context, *library.MediaItem) {}
+
+		when "rehydrating" {
+			report, err := svc.RehydrateRuntime(context.Background())
+
+			then "it uses the bounded provider without the full-room lookup" {
+				expect err == nil
+				expect manager.ensureCalls == 0
+				expect len(report.DesiredKeys) == 2
+			}
+		}
+	}
+
+	given "an invalid projected cursor" {
+		room := &theatre.Room{RoomCode: RoomCode, Playlist: []int64{10}, CurrentItemIndex: 0, PersistedCurrentItemIndex: -1, PlaylistProjected: true, PlaylistCount: 4, PlaylistHash: "projected"}
+		manager := &recoveryRoomManager{recoverable: room}
+		svc := New(nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+		svc.manager = manager
+
+		when "rehydrating" {
+			report, err := svc.RehydrateRuntime(context.Background())
+
+			then "it degrades safely without using the corrupt cursor" {
+				expect err != nil
+				expect report.State == RecoveryDegraded
+				expect report.ReasonCodes contains "invalid_room_snapshot"
+			}
+		}
+	}
+
+	given "a recovery scheduler callback that blocks until its context expires" {
+		svc := feedModelTestService(t, true)
+		svc.liveCacheQualities = []string{"h264-720p"}
+		svc.setFeedPlaylist(PlayoutPlaylist{ItemIDs: []int64{10}, ItemDuration: []float64{600}})
+		uncachedPath := t.TempDir() + "/recovery-blocking.mkv"
+		svc.loadItem = func(_ context.Context, id int64) (*library.MediaItem, error) {
+			return &library.MediaItem{ID: id, Path: uncachedPath, DurationMs: 600000}, nil
+		}
+		queue := &blockingRecoveryQueue{block: true}
+		svc.transcode = queue
+
+		when "the bounded recovery scheduler callback runs" {
+			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+			defer cancel()
+			started := time.Now()
+			enqueueErr := (feedWindowEnqueuer{ctx: ctx, svc: svc, bounded: true}).EnqueueWindow(10, "h264-720p", 0, 90)
+			elapsed := time.Since(started)
+
+			then "it returns at the deadline without an unbounded callback" {
+				expect enqueueErr != nil
+				expect elapsed < 250*time.Millisecond
+				expect queue.calls.Load() == 1
+			}
+		}
+	}
+
+	given "a persisted lineup during scheduled off-hours" {
+		room := &theatre.Room{RoomCode: RoomCode, Playlist: []int64{10, 20}, CurrentItemIndex: 0}
+		svc := New(nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+		svc.manager = &recoveryRoomManager{room: room}
+		svc.now = func() time.Time { return time.Date(2026, 7, 10, 2, 0, 0, 0, time.FixedZone("PDT", -7*60*60)) }
+		svc.loadItem = func(_ context.Context, id int64) (*library.MediaItem, error) {
+			return &library.MediaItem{ID: id, Path: "/managed/item.mkv", DurationMs: 600000}, nil
+		}
+		svc.warmItem = func(context.Context, *library.MediaItem) {}
+
+		when "rehydrating" {
+			report, err := svc.RehydrateRuntime(context.Background())
+
+			then "it completes in a safe degraded state without planned work" {
+				expect err == nil
+				expect report.State == RecoveryDegraded
+				expect report.Planned == 0
+				expect report.ReasonCodes[0] == "scheduled_off_hours"
+			}
+		}
+	}
+}

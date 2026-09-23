@@ -1,0 +1,120 @@
+package theatre_test
+
+import (
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/odvcencio/goetrope/pkg/theatre"
+)
+
+@serial
+unit "RuntimeManager concurrent room operations" {
+	no_leaks
+
+	given "a runtime manager under concurrent load" {
+		mgr := theatre.NewRuntimeManager()
+
+		when "50 goroutines add and remove clients across 10 rooms" {
+			var wg sync.WaitGroup
+			for i := 0; i < 50; i++ {
+				wg.Add(1)
+				go func(id int) {
+					defer wg.Done()
+					room := "room-" + string(rune('A'+id%10))
+					clientID := uint64(id)
+					client := theatre.NewWsClient(room, "visitor", false)
+					mgr.AddClient(room, clientID, client)
+					time.Sleep(time.Millisecond)
+					mgr.ViewerCount(room)
+					mgr.RemoveClient(room, clientID)
+				}(i)
+			}
+			wg.Wait()
+
+			then "all rooms are cleaned up" {
+				total := 0
+				for i := 0; i < 10; i++ {
+					room := "room-" + string(rune('A'+i))
+					total += mgr.ViewerCount(room)
+				}
+				expect total == 0
+			}
+		}
+	}
+}
+
+unit "PlaybackStateManager multi-room" {
+	given "a playback state manager" {
+		mgr := theatre.NewPlaybackStateManager()
+
+		when "setting state for multiple rooms" {
+			mgr.Set("room-1", theatre.PlaybackState{Position: 1000.0, Playing: true})
+			mgr.Set("room-2", theatre.PlaybackState{Position: 2000.0, Playing: false})
+			mgr.Set("room-3", theatre.PlaybackState{Position: 3000.0, Playing: true})
+
+			then "each room has independent state" {
+				s1, ok1 := mgr.Get("room-1")
+				s2, ok2 := mgr.Get("room-2")
+				s3, ok3 := mgr.Get("room-3")
+				expect ok1
+				expect ok2
+				expect ok3
+				expect s1.Playing
+				reject s2.Playing
+				expect s3.Playing
+			}
+		}
+
+		when "getting nonexistent room" {
+			_, ok := mgr.Get("ghost")
+
+			then "returns false" {
+				reject ok
+			}
+		}
+	}
+}
+
+unit "ViewerCountWithGrace" {
+	given "a runtime manager with a recently emptied room" {
+		mgr := theatre.NewRuntimeManager()
+		client := theatre.NewWsClient("grace-room", "v1", false)
+		mgr.AddClient("grace-room", 1, client)
+		mgr.RemoveClient("grace-room", 1)
+
+		then "within grace period shows recent count" {
+			count := mgr.ViewerCountWithGrace("grace-room", 5*time.Second)
+			expect count >= 1
+		}
+	}
+
+	given "a runtime manager with a long-gone room" {
+		mgr := theatre.NewRuntimeManager()
+
+		then "outside grace shows zero" {
+			count := mgr.ViewerCountWithGrace("gone-room", 5*time.Second)
+			expect count == 0
+		}
+	}
+}
+
+unit "RuntimeSnapshot" {
+	given "a manager with mixed rooms" {
+		mgr := theatre.NewRuntimeManager()
+		mgr.AddClient("active-1", 1, theatre.NewWsClient("active-1", "v1", false))
+		mgr.AddClient("active-1", 2, theatre.NewWsClient("active-1", "v2", false))
+		mgr.AddClient("active-2", 3, theatre.NewWsClient("active-2", "v3", false))
+
+		when "taking a snapshot" {
+			snap := mgr.Snapshot(0)
+
+			then "counts rooms" {
+				expect snap.ActiveRooms == 2
+			}
+			then "counts total viewers" {
+				expect snap.TotalViewers == 3
+			}
+		}
+	}
+}

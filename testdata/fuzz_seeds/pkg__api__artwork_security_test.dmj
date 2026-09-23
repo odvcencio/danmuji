@@ -1,0 +1,62 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/netfetch"
+)
+
+type artworkFixtureFetcher struct {
+	response *netfetch.Response
+	err      error
+	request  netfetch.Request
+}
+
+func (f *artworkFixtureFetcher) Do(_ context.Context, request netfetch.Request) (*netfetch.Response, error) {
+	f.request = request
+	return f.response, f.err
+}
+
+type artworkCategoryError struct {
+	category netfetch.Category
+}
+
+func (e artworkCategoryError) Error() string { return string(e.category) }
+func (e artworkCategoryError) Category() netfetch.Category { return e.category }
+
+unit "remote artwork security boundary" {
+	then "the proxy uses the artwork profile and code-owned response headers" {
+		fetcher := &artworkFixtureFetcher{response: &netfetch.Response{
+			StatusCode: 200,
+			ContentType: "image/png",
+			Body: io.NopCloser(bytes.NewReader([]byte("png"))),
+		}}
+		handler := &libraryHandler{artworkFetcher: fetcher}
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/api/library/1/artwork", nil)
+		handler.proxyArtwork(recorder, request, "https://images.example/poster.png")
+		expect recorder.Code == http.StatusOK
+		expect recorder.Header().Get("Content-Type") == "image/png"
+		expect recorder.Header().Get("Cache-Control") == "private, max-age=3600"
+		expect fetcher.request.Profile == netfetch.ProfileArtwork
+		expect fetcher.request.Method == http.MethodGet
+	}
+
+	then "a blocked destination returns only the bounded category" {
+		fetcher := &artworkFixtureFetcher{err: artworkCategoryError{category: netfetch.CategoryDestinationBlocked}}
+		handler := &libraryHandler{artworkFetcher: fetcher}
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/api/library/1/artwork", nil)
+		handler.proxyArtwork(recorder, request, "http://169.254.169.254/latest?token=secret")
+		expect recorder.Code == http.StatusBadGateway
+		expect strings.Contains(recorder.Body.String(), "destination_blocked")
+		reject strings.Contains(recorder.Body.String(), "169.254")
+		reject strings.Contains(recorder.Body.String(), "secret")
+	}
+}

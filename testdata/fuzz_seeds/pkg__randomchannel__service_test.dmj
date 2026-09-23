@@ -1,0 +1,993 @@
+package randomchannel
+
+import (
+	"context"
+	"errors"
+	"math/rand"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/odvcencio/arbiter/vm"
+	"github.com/odvcencio/goetrope/pkg/library"
+	"github.com/odvcencio/goetrope/pkg/stream"
+	"github.com/odvcencio/goetrope/pkg/theatre"
+	"github.com/odvcencio/goetrope/pkg/transcode"
+)
+
+type fakeRoomController struct {
+	mu           sync.RWMutex
+	pauseSession string
+	pausePos     float64
+	pauseHasPos  bool
+	playSession string
+	playPos     float64
+	playHasPos  bool
+}
+
+type fakeRoomControllerState struct {
+	pauseSession string
+	pausePos     float64
+	pauseHasPos  bool
+	playSession  string
+	playPos      float64
+	playHasPos   bool
+}
+
+func (f *fakeRoomController) BroadcastText(sessionID string, payload []byte) {}
+
+func (f *fakeRoomController) PauseRoomContext(_ context.Context, sessionID string, position float64, hasPosition bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pauseSession = sessionID
+	f.pausePos = position
+	f.pauseHasPos = hasPosition
+	return nil
+}
+
+func (f *fakeRoomController) PlayRoomContext(_ context.Context, sessionID string, position float64, hasPosition bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.playSession = sessionID
+	f.playPos = position
+	f.playHasPos = hasPosition
+	return nil
+}
+
+func (f *fakeRoomController) snapshot() fakeRoomControllerState {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return fakeRoomControllerState{
+		pauseSession: f.pauseSession,
+		pausePos:     f.pausePos,
+		pauseHasPos:  f.pauseHasPos,
+		playSession:  f.playSession,
+		playPos:      f.playPos,
+		playHasPos:   f.playHasPos,
+	}
+}
+
+unit "Owner-gated random-channel capability" {
+	then "construction has no ffmpeg authority until activation installs the shared probe result" {
+		svc := New(nil, nil, nil, nil, nil)
+		expect svc.ffmpegPath == ""
+		svc.SetFFmpegPath("  /usr/bin/ffmpeg  ")
+		expect svc.ffmpegPath == "/usr/bin/ffmpeg"
+	}
+}
+
+unit "Random channel do-not-play matcher" {
+	given "a service with normalized exclusion entries" {
+		svc := New(nil, nil, nil, nil, nil)
+		svc.SetDoNotPlayList([]string{"Horse The Band We Flooded it", "resolved special"})
+
+		when "matching against the media title" {
+			item := &library.MediaItem{ID: 11, Title: "Horse The Band We Flooded it"}
+
+			then "marks the item as excluded" {
+				expect svc.isDoNotPlay(item)
+			}
+		}
+
+		when "matching against resolved metadata" {
+			item := &library.MediaItem{
+				ID:    22,
+				Title: "release-garbage",
+				Metadata: &library.Metadata{
+					ResolvedTitle: "Resolved Special",
+				},
+			}
+
+			then "marks the item as excluded" {
+				expect svc.isDoNotPlay(item)
+			}
+		}
+
+		when "matching against normalized filename fallback" {
+			item := &library.MediaItem{
+				ID:    33,
+				Title: "2001.A.Space.Odyssey.1968.576p.BluRay.x264-HANDJOB",
+				Path:  "/media/movies/2001.A.Space.Odyssey.1968.576p.BluRay.x264-HANDJOB.mkv",
+			}
+			svc.SetDoNotPlayList([]string{"2001 A Space Odyssey"})
+
+			then "marks the item as excluded" {
+				expect svc.isDoNotPlay(item)
+			}
+		}
+	}
+}
+
+unit "Random channel display year" {
+	then "prefers metadata year when available" {
+		item := &library.MediaItem{
+			Year: 2001,
+			Metadata: &library.Metadata{
+				Year: 1968,
+			},
+		}
+
+		expect displayYear(item) == 1968
+	}
+
+	then "falls back to item year when metadata year is missing" {
+		item := &library.MediaItem{Year: 1980}
+
+		expect displayYear(item) == 1980
+	}
+}
+
+unit "Random channel bounded catalog sampling" {
+	then "keeps the million-catalog sample bounded by picker policy and hard ceiling" {
+		defaultLimit := boundedCandidateSampleLimit(queueTargetSize, pickerConfig{CandidateCount: 200})
+		largePolicyLimit := boundedCandidateSampleLimit(queueTargetSize, pickerConfig{CandidateCount: 1_000_000})
+
+		expect defaultLimit == 800
+		expect largePolicyLimit == randomChannelSampleMax
+	}
+
+	then "draws deterministic one-based starts from the seeded RNG" {
+		left := New(nil, nil, nil, nil, nil)
+		right := New(nil, nil, nil, nil, nil)
+		left.rng = rand.New(rand.NewSource(42))
+		right.rng = rand.New(rand.NewSource(42))
+
+		leftStart := left.randomMediaItemStart(1_000_000)
+		rightStart := right.randomMediaItemStart(1_000_000)
+
+		expect leftStart == rightStart
+		expect leftStart >= int64(1)
+		expect leftStart <= int64(1_000_000)
+	}
+
+	then "can select a bounded sample candidate beyond the first five thousand ids" {
+		svc := New(nil, nil, nil, nil, nil)
+		svc.rng = rand.New(rand.NewSource(7))
+		var observedStart int64
+		var observedLimit int
+		svc.maxMediaItemID = func(context.Context) (int64, error) {
+			return 1_000_000, nil
+		}
+		svc.listVideoItemsRing = func(_ context.Context, startID int64, limit int) ([]*library.MediaItem, error) {
+			observedStart = startID
+			observedLimit = limit
+			return []*library.MediaItem{{
+				ID:         6001,
+				Path:       "/media/movies/far.mkv",
+				Title:      "Far Catalog Movie",
+				DurationMs: 3_600_000,
+				Streams:    []library.Stream{{StreamIndex: 2, StreamType: "subtitle", Codec: "subrip", Language: "eng", IsDefault: true}},
+			}}, nil
+		}
+		svc.listPlayHistory = func(context.Context, int) ([]library.RandomChannelPlay, error) {
+			return nil, nil
+		}
+
+		picked, err := svc.pickItems(context.Background(), nil, 1)
+
+		expect err == nil
+		expect len(picked) == 1
+		expect picked[0] == int64(6001)
+		expect observedStart >= int64(1)
+		expect observedStart <= int64(1_000_000)
+		expect observedLimit <= randomChannelSampleMax
+	}
+
+	then "bitmap subtitle sweep advances through bounded keyset pages" {
+		svc := New(nil, nil, nil, nil, nil)
+		requests := []library.ListVideoItemPageOptions{}
+		svc.listVideoItemPage = func(_ context.Context, opts library.ListVideoItemPageOptions) ([]*library.MediaItem, error) {
+			requests = append(requests, opts)
+			switch opts.AfterID {
+			case 0:
+				return []*library.MediaItem{{ID: 2}, {ID: 9}}, nil
+			case 9:
+				return []*library.MediaItem{{ID: 6001}}, nil
+			case 6001:
+				return nil, nil
+			default:
+				t.Fatalf("unexpected cursor %d", opts.AfterID)
+				return nil, nil
+			}
+		}
+		svc.loadItem = func(_ context.Context, id int64) (*library.MediaItem, error) {
+			return &library.MediaItem{ID: id, Path: "/media/movies/item.mkv"}, nil
+		}
+
+		svc.runBitmapSubtitleSweep(context.Background())
+
+		expect len(requests) == 3
+		expect requests[0].AfterID == int64(0)
+		expect requests[1].AfterID == int64(9)
+		expect requests[2].AfterID == int64(6001)
+		expect requests[0].Limit == bitmapSubtitleSweepPageLimit
+		expect requests[1].Limit == bitmapSubtitleSweepPageLimit
+		expect requests[2].Limit == bitmapSubtitleSweepPageLimit
+	}
+}
+
+unit "Random channel subtitle admission" {
+	then "rejects video-only movies before they can enter the random queue" {
+		svc := New(nil, nil, nil, nil, nil)
+		svc.rng = rand.New(rand.NewSource(1))
+		svc.maxMediaItemID = func(context.Context) (int64, error) {
+			return 100, nil
+		}
+		svc.listVideoItemsRing = func(context.Context, int64, int) ([]*library.MediaItem, error) {
+			return []*library.MediaItem{{
+				ID:         44,
+				Path:       "/media/movies/kung-pow.mkv",
+				Title:      "Kung Pow",
+				DurationMs: 4_800_000,
+				Streams:    []library.Stream{{StreamIndex: 0, StreamType: "video", Codec: "h264"}},
+			}}, nil
+		}
+		svc.listPlayHistory = func(context.Context, int) ([]library.RandomChannelPlay, error) {
+			return nil, nil
+		}
+
+		picked, err := svc.pickItems(context.Background(), nil, 1)
+
+		expect err == nil
+		expect len(picked) == 0
+	}
+
+	then "admits text and bitmap subtitle movies" {
+		svc := New(nil, nil, nil, nil, nil)
+		svc.rng = rand.New(rand.NewSource(2))
+		svc.maxMediaItemID = func(context.Context) (int64, error) {
+			return 100, nil
+		}
+		svc.listVideoItemsRing = func(context.Context, int64, int) ([]*library.MediaItem, error) {
+			return []*library.MediaItem{{
+				ID:         11,
+				Path:       "/media/movies/text.mkv",
+				Title:      "Text Movie",
+				DurationMs: 4_800_000,
+				Streams:    []library.Stream{{StreamIndex: 2, StreamType: "subtitle", Codec: "subrip", Language: "eng", IsDefault: true}},
+			}, {
+				ID:         22,
+				Path:       "/media/movies/bitmap.mkv",
+				Title:      "Bitmap Movie",
+				DurationMs: 4_800_000,
+				Streams:    []library.Stream{{StreamIndex: 3, StreamType: "subtitle", Codec: "hdmv_pgs_subtitle", Language: "eng", IsDefault: true}},
+			}}, nil
+		}
+		svc.listPlayHistory = func(context.Context, int) ([]library.RandomChannelPlay, error) {
+			return nil, nil
+		}
+
+		picked, err := svc.pickItems(context.Background(), nil, 2)
+		selected := map[int64]bool{}
+		for _, id := range picked {
+			selected[id] = true
+		}
+
+		expect err == nil
+		expect len(picked) == 2
+		expect selected[int64(11)]
+		expect selected[int64(22)]
+	}
+
+	then "hydrates shallow movie candidates before subtitle admission" {
+		svc := New(nil, nil, nil, nil, nil)
+		svc.rng = rand.New(rand.NewSource(3))
+		svc.maxMediaItemID = func(context.Context) (int64, error) {
+			return 100, nil
+		}
+		svc.listVideoItemsRing = func(context.Context, int64, int) ([]*library.MediaItem, error) {
+			return []*library.MediaItem{{
+				ID:         55,
+				Path:       "/media/movies/shallow.mkv",
+				Title:      "Shallow Movie",
+				DurationMs: 4_800_000,
+			}}, nil
+		}
+		hydrated := 0
+		svc.loadItem = func(context.Context, int64) (*library.MediaItem, error) {
+			hydrated++
+			return &library.MediaItem{
+				ID:         55,
+				Path:       "/media/movies/shallow.mkv",
+				Title:      "Shallow Movie",
+				DurationMs: 4_800_000,
+				Streams:    []library.Stream{{StreamIndex: 2, StreamType: "subtitle", Codec: "subrip", Language: "eng", IsDefault: true}},
+			}, nil
+		}
+		svc.listPlayHistory = func(context.Context, int) ([]library.RandomChannelPlay, error) {
+			return nil, nil
+		}
+
+		picked, err := svc.pickItems(context.Background(), nil, 1)
+
+		expect err == nil
+		expect len(picked) == 1
+		expect picked[0] == int64(55)
+		expect hydrated == 1
+	}
+}
+
+unit "Random shows episode progression" {
+	then "selects the next subtitled episode after channel-scoped series state" {
+		svc := NewWithConfig(ShowChannelConfig(), nil, nil, nil, nil, nil)
+		svc.loadItem = func(_ context.Context, id int64) (*library.MediaItem, error) {
+			return &library.MediaItem{
+				ID:      id,
+				Streams: []library.Stream{{StreamIndex: 2, StreamType: "subtitle", Codec: "subrip", Language: "eng", IsDefault: true}},
+				Metadata: &library.Metadata{
+					SeriesID: 9,
+				},
+			}, nil
+		}
+		svc.getSeriesState = func(_ context.Context, alias string, seriesID int64) (*library.RandomChannelSeriesState, error) {
+			expect alias == DefaultShowAlias
+			expect seriesID == int64(9)
+			return &library.RandomChannelSeriesState{ChannelAlias: alias, SeriesID: seriesID, LastMediaItemID: 101}, nil
+		}
+		svc.listEpisodesForSeries = func(context.Context, int64) ([]*library.MediaItem, error) {
+			return []*library.MediaItem{{
+				ID: 101,
+				Metadata: &library.Metadata{SeriesID: 9, Season: 1, Episode: 1},
+			}, {
+				ID: 102,
+				Metadata: &library.Metadata{SeriesID: 9, Season: 1, Episode: 2},
+			}}, nil
+		}
+
+		episode, _, err := svc.nextAdmissibleSeriesEpisode(context.Background(), 9, nil)
+
+		expect err == nil
+		expect episode.ID == int64(102)
+	}
+
+	then "wraps to the first subtitled episode at the end of a series" {
+		svc := NewWithConfig(ShowChannelConfig(), nil, nil, nil, nil, nil)
+		svc.loadItem = func(_ context.Context, id int64) (*library.MediaItem, error) {
+			return &library.MediaItem{
+				ID:      id,
+				Streams: []library.Stream{{StreamIndex: 2, StreamType: "subtitle", Codec: "subrip", Language: "eng", IsDefault: true}},
+				Metadata: &library.Metadata{
+					SeriesID: 9,
+				},
+			}, nil
+		}
+		svc.getSeriesState = func(context.Context, string, int64) (*library.RandomChannelSeriesState, error) {
+			return &library.RandomChannelSeriesState{ChannelAlias: DefaultShowAlias, SeriesID: 9, LastMediaItemID: 102}, nil
+		}
+		svc.listEpisodesForSeries = func(context.Context, int64) ([]*library.MediaItem, error) {
+			return []*library.MediaItem{{
+				ID: 101,
+				Metadata: &library.Metadata{SeriesID: 9, Season: 1, Episode: 1},
+			}, {
+				ID: 102,
+				Metadata: &library.Metadata{SeriesID: 9, Season: 1, Episode: 2},
+			}}, nil
+		}
+
+		episode, _, err := svc.nextAdmissibleSeriesEpisode(context.Background(), 9, nil)
+
+		expect err == nil
+		expect episode.ID == int64(101)
+	}
+
+	then "skips subtitleless episodes while preserving ordered progression" {
+		svc := NewWithConfig(ShowChannelConfig(), nil, nil, nil, nil, nil)
+		svc.loadItem = func(_ context.Context, id int64) (*library.MediaItem, error) {
+			item := &library.MediaItem{ID: id, Metadata: &library.Metadata{SeriesID: 9}}
+			if id == 103 {
+				item.Streams = []library.Stream{{StreamIndex: 2, StreamType: "subtitle", Codec: "subrip", Language: "eng", IsDefault: true}}
+			}
+			return item, nil
+		}
+		svc.getSeriesState = func(context.Context, string, int64) (*library.RandomChannelSeriesState, error) {
+			return &library.RandomChannelSeriesState{ChannelAlias: DefaultShowAlias, SeriesID: 9, LastMediaItemID: 101}, nil
+		}
+		svc.listEpisodesForSeries = func(context.Context, int64) ([]*library.MediaItem, error) {
+			return []*library.MediaItem{{ID: 101}, {ID: 102}, {ID: 103}}, nil
+		}
+
+		episode, _, err := svc.nextAdmissibleSeriesEpisode(context.Background(), 9, nil)
+
+		expect err == nil
+		expect episode.ID == int64(103)
+	}
+
+	then "queues one episode from each selected series" {
+		svc := NewWithConfig(ShowChannelConfig(), nil, nil, nil, nil, nil)
+		svc.rng = rand.New(rand.NewSource(4))
+		svc.listSeries = func(context.Context, library.ListSeriesOptions) ([]library.Series, int, error) {
+			return []library.Series{{ID: 7, Title: "A"}, {ID: 9, Title: "B"}}, 2, nil
+		}
+		svc.listEpisodesForSeries = func(_ context.Context, seriesID int64) ([]*library.MediaItem, error) {
+			return []*library.MediaItem{{
+				ID: seriesID * 100,
+				Metadata: &library.Metadata{
+					SeriesID: seriesID,
+					Season:   1,
+					Episode:  1,
+				},
+			}}, nil
+		}
+		svc.getSeriesState = func(context.Context, string, int64) (*library.RandomChannelSeriesState, error) {
+			return nil, nil
+		}
+		svc.loadItem = func(_ context.Context, id int64) (*library.MediaItem, error) {
+			return &library.MediaItem{ID: id, Streams: []library.Stream{{StreamIndex: 2, StreamType: "subtitle", Codec: "subrip", Language: "eng", IsDefault: true}}, Metadata: &library.Metadata{SeriesID: id / 100}}, nil
+		}
+		svc.listPlayHistory = func(context.Context, int) ([]library.RandomChannelPlay, error) {
+			return nil, nil
+		}
+
+		picked, err := svc.pickItems(context.Background(), nil, 2)
+		selected := map[int64]bool{}
+		for _, id := range picked {
+			selected[id] = true
+		}
+
+		expect err == nil
+		expect len(picked) == 2
+		expect selected[int64(700)]
+		expect selected[int64(900)]
+	}
+
+	then "persists played episode progress under the channel alias" {
+		svc := NewWithConfig(ShowChannelConfig(), nil, nil, nil, nil, nil)
+		var recordedAlias string
+		var recordedSeries int64
+		var recordedItem int64
+		svc.loadItem = func(context.Context, int64) (*library.MediaItem, error) {
+			return &library.MediaItem{
+				ID: 102,
+				Metadata: &library.Metadata{
+					SeriesID: 9,
+				},
+			}, nil
+		}
+		svc.upsertSeriesState = func(_ context.Context, alias string, seriesID int64, mediaItemID int64) error {
+			recordedAlias = alias
+			recordedSeries = seriesID
+			recordedItem = mediaItemID
+			return nil
+		}
+
+		err := svc.recordSeriesProgress(context.Background(), 102)
+
+		expect err == nil
+		expect recordedAlias == DefaultShowAlias
+		expect recordedSeries == int64(9)
+		expect recordedItem == int64(102)
+	}
+
+	then "does not persist show progress when authoritative playback fails" {
+		svc := NewWithConfig(ShowChannelConfig(), nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+		svc.SetController(&failingRecoveryController{playErr: errors.New("play failed")})
+		svc.warmItem = func(context.Context, *library.MediaItem) {}
+		svc.loadItem = func(context.Context, int64) (*library.MediaItem, error) {
+			return &library.MediaItem{
+				ID: 102,
+				Metadata: &library.Metadata{
+					SeriesID: 9,
+				},
+			}, nil
+		}
+		var writes int
+		svc.upsertSeriesState = func(context.Context, string, int64, int64) error {
+			writes++
+			return nil
+		}
+		room := &theatre.Room{RoomCode: DefaultShowRoomCode, Playlist: []int64{102}, CurrentItemIndex: 0}
+
+		err := svc.activateCurrentItem(context.Background(), room)
+
+		expect err != nil
+		expect writes == 0
+	}
+
+	then "keeps playback active when post-start show progress persistence fails" {
+		controller := &fakeRoomController{}
+		svc := NewWithConfig(ShowChannelConfig(), nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+		svc.SetController(controller)
+		svc.warmItem = func(context.Context, *library.MediaItem) {}
+		svc.loadItem = func(context.Context, int64) (*library.MediaItem, error) {
+			return &library.MediaItem{
+				ID: 102,
+				Metadata: &library.Metadata{
+					SeriesID: 9,
+				},
+			}, nil
+		}
+		svc.upsertSeriesState = func(context.Context, string, int64, int64) error {
+			return errors.New("progress failed")
+		}
+		room := &theatre.Room{RoomCode: DefaultShowRoomCode, Playlist: []int64{102}, CurrentItemIndex: 0}
+
+		err := svc.activateCurrentItem(context.Background(), room)
+		state := controller.snapshot()
+
+		expect err == nil
+		expect state.playSession == DefaultShowRoomCode
+		expect state.playPos == 0
+		expect state.playHasPos
+	}
+}
+
+unit "Random channel authoritative playback restore" {
+	then "clears a stale cache pause when the authoritative show clock is already playing" {
+		playback := theatre.NewPlaybackStateManager()
+		svc := NewWithConfig(ShowChannelConfig(), nil, nil, nil, playback, nil)
+		room := &theatre.Room{
+			RoomCode:         DefaultShowRoomCode,
+			Playlist:         []int64{102},
+			CurrentItemIndex: 0,
+		}
+		svc.setCachePausedStartupAt(true, 44.5)
+		playback.Set(DefaultShowRoomCode, theatre.PlaybackState{
+			Position:  90,
+			Playing:   true,
+			Timestamp: time.Now().UnixMilli(),
+			Syncing:   false,
+		})
+
+		facts, position, err := svc.buildFacts(context.Background(), room)
+		state := svc.snapshotState()
+		playing, _ := facts["channel.playing"].(bool)
+
+		expect err == nil
+		expect state.CurrentItemID == int64(102)
+		expect state.CachePaused == false
+		expect state.CachePauseStartup == false
+		expect state.CachePausePositionSet == false
+		expect playing
+		expect position >= 90
+	}
+
+	then "rebuilds the server clock against the current queued item" {
+		controller := &fakeRoomController{}
+		svc := New(nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+		svc.SetController(controller)
+		room := &theatre.Room{
+			RoomCode:         RoomCode,
+			Playlist:         []int64{42, 99},
+			CurrentItemIndex: 0,
+		}
+
+		err := svc.restoreAuthoritativePlayback(context.Background(), room, 12.5)
+		state := svc.snapshotState()
+		controllerState := controller.snapshot()
+
+		expect err == nil
+		expect controllerState.playSession == RoomCode
+		expect controllerState.playPos == 12.5
+		expect controllerState.playHasPos
+		expect state.CurrentItemID == 42
+	}
+
+	then "restores the server clock without synchronously warming the queue" {
+		warmed := []int64{}
+		controller := &fakeRoomController{}
+		svc := New(nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+		svc.SetController(controller)
+		svc.loadItem = func(_ context.Context, id int64) (*library.MediaItem, error) {
+			return &library.MediaItem{ID: id, Path: "/media/test.mp4"}, nil
+		}
+		svc.warmItem = func(_ context.Context, item *library.MediaItem) {
+			warmed = append(warmed, item.ID)
+		}
+		room := &theatre.Room{
+			RoomCode:         RoomCode,
+			Playlist:         []int64{42, 99, 123},
+			CurrentItemIndex: 0,
+		}
+
+		err := svc.restoreAuthoritativePlayback(context.Background(), room, 12.5)
+
+		expect err == nil
+		expect len(warmed) == 0
+	}
+}
+
+unit "Random channel off-hours idle deferral" {
+	then "does not defer idle for a stale paused checkpoint" {
+		room := &theatre.Room{
+			RoomCode:           RoomCode,
+			Playlist:           []int64{42, 99},
+			CurrentItemIndex:   0,
+			PlaybackPositionMs: 187834,
+		}
+
+		deferIdle := shouldDeferOffHoursIdle(room, 7200, 187.834, false)
+
+		expect deferIdle == false
+	}
+
+	then "defers idle while active playback can still finish" {
+		room := &theatre.Room{
+			RoomCode:           RoomCode,
+			Playlist:           []int64{42, 99},
+			CurrentItemIndex:   0,
+			PlaybackPositionMs: 187834,
+		}
+
+		deferIdle := shouldDeferOffHoursIdle(room, 7200, 187.834, true)
+
+		expect deferIdle
+	}
+
+	then "does not defer idle once active playback reaches the end" {
+		room := &theatre.Room{
+			RoomCode:           RoomCode,
+			Playlist:           []int64{42, 99},
+			CurrentItemIndex:   0,
+			PlaybackPositionMs: 7199600,
+		}
+
+		deferIdle := shouldDeferOffHoursIdle(room, 7200, 7199.6, true)
+
+		expect deferIdle == false
+	}
+}
+
+unit "Random channel live cache startup threshold" {
+	then "caps the startup buffer to a fixed window regardless of length" {
+		item := &library.MediaItem{DurationMs: 7_200_000}
+
+		segment := liveCacheStartupThresholdSegment(item)
+
+		expect segment == 89
+	}
+
+	then "adds the fixed startup buffer to the resumed playback position" {
+		item := &library.MediaItem{DurationMs: 5_979_115}
+
+		segment := liveCacheStartupRequiredSegment(item, 1976.36)
+
+		expect segment == 2065
+	}
+
+	then "warms a single low-latency window through the fixed startup buffer" {
+		item := &library.MediaItem{DurationMs: 1_800_000}
+
+		starts := liveCacheStartupWindowStarts(liveCacheStartupThresholdSegment(item))
+
+		expect len(starts) == 1
+		expect starts[0] == 0
+		expect liveCachePriorityForWindowStart(starts[0]) == 0
+	}
+
+	then "warms resumed startup from the synchronized playback window" {
+		item := &library.MediaItem{DurationMs: 1_800_000}
+
+		start, required := liveCacheStartupSegmentRange(item, 600)
+		starts := liveCacheStartupWindowStartsFrom(start, required)
+
+		expect start == 570
+		expect required == 689
+		expect len(starts) == 1
+		expect starts[0] == 570
+	}
+
+	then "allows startup when only a low-latency tail is still missing" {
+		expect liveCacheStartupRangeReady(1380, 1382)
+		expect liveCacheStartupRangeReady(1370, 1382) == false
+		expect liveCacheStartupRangeReady(0, 6) == false
+	}
+}
+
+unit "Random channel queue prewarm" {
+	then "enables production warmups by default" {
+		svc := New(nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+
+		expect svc.warmItem not_nil
+	}
+
+	then "warms one queued item's durable artifacts per prewarm pass" {
+		warmed := []int64{}
+		svc := New(nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+		svc.loadItem = func(_ context.Context, id int64) (*library.MediaItem, error) {
+			return &library.MediaItem{ID: id, Path: "/media/test.mp4"}, nil
+		}
+		svc.warmItem = func(_ context.Context, item *library.MediaItem) {
+			warmed = append(warmed, item.ID)
+		}
+		room := &theatre.Room{
+			RoomCode:         RoomCode,
+			Playlist:         []int64{42, 99, 123},
+			CurrentItemIndex: 0,
+		}
+
+		svc.prewarmQueue(context.Background(), room, theatre.SafeCurrentItemIndex(room))
+
+		expect len(warmed) == 1
+		expect warmed[0] == int64(42)
+	}
+
+	then "warms one remaining queued item during preload" {
+		warmed := []int64{}
+		warmDone := make(chan struct{}, 1)
+		svc := New(nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+		svc.startMediaWork(context.Background())
+		defer svc.closeMediaWork()
+		svc.loadItem = func(_ context.Context, id int64) (*library.MediaItem, error) {
+			return &library.MediaItem{ID: id, Path: "/media/test.mp4"}, nil
+		}
+		svc.warmItem = func(_ context.Context, item *library.MediaItem) {
+			warmed = append(warmed, item.ID)
+			warmDone <- struct{}{}
+		}
+		room := &theatre.Room{
+			RoomCode:         RoomCode,
+			Playlist:         []int64{42, 99, 123},
+			CurrentItemIndex: 0,
+		}
+
+		_, _, err := svc.applyAction(context.Background(), room, 0, vm.MatchedRule{Action: "PreloadNextItem"})
+		select {
+		case <-warmDone:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("expected asynchronous preload warmup")
+		}
+
+		expect err == nil
+		expect len(warmed) == 1
+		expect warmed[0] == int64(99)
+	}
+
+	then "bounds opportunistic live-cache prewarm to one base-rung physical window" {
+		queue := &recordingTranscodeQueue{}
+		warmed := []int64{}
+		svc := New(nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+		svc.SetTranscodeQueue(queue)
+		svc.liveCacheWindow = 8
+		svc.liveCacheQualities = []string{"h264-480p", "h264-720p", "h264-1080p"}
+		svc.loadItem = func(_ context.Context, id int64) (*library.MediaItem, error) {
+			return &library.MediaItem{
+				ID:         id,
+				Path:       "/media/long-playlist-item.mkv",
+				DurationMs: 3_600_000,
+				Streams: []library.Stream{{
+					StreamType: "video",
+					Height:     1080,
+				}},
+			}, nil
+		}
+		svc.warmItem = func(_ context.Context, item *library.MediaItem) {
+			warmed = append(warmed, item.ID)
+		}
+		room := &theatre.Room{
+			RoomCode:         RoomCode,
+			Playlist:         []int64{42, 99, 123, 456, 789},
+			CurrentItemIndex: 0,
+		}
+
+		accepted := svc.prewarmItems(context.Background(), room, 0, 1, 2, 3, 4)
+
+		expect accepted == 1
+		expect len(warmed) == 1
+		expect warmed[0] == int64(42)
+		expect len(queue.requests) == 1
+		req := queue.requests[0]
+		expect req.Job.Type == transcode.JobTypeLiveCache
+		expect req.Job.MediaItemID == int64(42)
+		expect req.Job.Quality == "h264-480p"
+		expect req.WindowStartSegment == 0
+		expect req.WindowSegmentCount == stream.LowLatencyWindowEndSegment(0, req.DurationMs)
+		expect req.WindowSegmentCount <= stream.LowLatencyWindowSegmentCount
+	}
+
+	then "continues past the single artifact warm only to find one bounded live-cache job" {
+		queue := &recordingTranscodeQueue{}
+		warmed := []int64{}
+		svc := New(nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+		svc.SetTranscodeQueue(queue)
+		svc.liveCacheWindow = 3
+		svc.liveCacheQualities = []string{"h264-480p", "h264-720p"}
+		svc.loadItem = func(_ context.Context, id int64) (*library.MediaItem, error) {
+			item := &library.MediaItem{
+				ID:         id,
+				DurationMs: 600_000,
+				Streams: []library.Stream{{
+					StreamType: "video",
+					Height:     720,
+				}},
+			}
+			if id != 42 {
+				item.Path = "/media/live-cache-eligible.mkv"
+			}
+			return item, nil
+		}
+		svc.warmItem = func(_ context.Context, item *library.MediaItem) {
+			warmed = append(warmed, item.ID)
+		}
+		room := &theatre.Room{
+			RoomCode:         RoomCode,
+			Playlist:         []int64{42, 99, 123},
+			CurrentItemIndex: 0,
+		}
+
+		accepted := svc.prewarmItems(context.Background(), room, 0, 1, 2)
+
+		expect accepted == 1
+		expect len(warmed) == 1
+		expect warmed[0] == int64(42)
+		expect len(queue.requests) == 1
+		expect queue.requests[0].Job.MediaItemID == int64(99)
+		expect queue.requests[0].WindowSegmentCount > 0
+	}
+
+	then "aligns a current opportunistic warmup to the playback window" {
+		queue := &recordingTranscodeQueue{}
+		svc := New(nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+		svc.SetTranscodeQueue(queue)
+		svc.liveCacheWindow = 1
+		svc.liveCacheQualities = []string{"h264-480p", "h264-720p"}
+		svc.loadItem = func(_ context.Context, id int64) (*library.MediaItem, error) {
+			return &library.MediaItem{
+				ID:         id,
+				Path:       "/media/current-playback-window.mkv",
+				DurationMs: 3_600_000,
+				Streams: []library.Stream{{
+					StreamType: "video",
+					Height:     720,
+				}},
+			}, nil
+		}
+		svc.warmItem = func(context.Context, *library.MediaItem) {}
+		room := &theatre.Room{
+			RoomCode:           RoomCode,
+			Playlist:           []int64{42, 99},
+			CurrentItemIndex:   0,
+			PlaybackPositionMs: 65_000,
+		}
+
+		accepted := svc.prewarmItems(context.Background(), room, 0, 1)
+		startSegment := stream.LowLatencyAlignedWindowStartSegment(65)
+		req := queue.requests[0]
+
+		expect accepted == 1
+		expect len(queue.requests) == 1
+		expect req.Job.MediaItemID == int64(42)
+		expect req.WindowStartSegment == startSegment
+		expect req.WindowSegmentCount == stream.LowLatencyWindowEndSegment(startSegment, req.DurationMs) - startSegment
+	}
+}
+
+unit "Random channel playback snapshot persistence" {
+	then "persists forward progress from the authoritative server clock" {
+		persisted := int64(0)
+		svc := New(nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+		svc.persistPlayback = func(_ context.Context, positionMs int64) error {
+			persisted = positionMs
+			return nil
+		}
+		room := &theatre.Room{
+			RoomCode:           RoomCode,
+			Playlist:           []int64{42, 99},
+			CurrentItemIndex:   0,
+			PlaybackPositionMs: 12000,
+		}
+
+		svc.persistPlaybackSnapshot(context.Background(), room, 45.25, true, true)
+
+		expect persisted == int64(45250)
+		expect room.PlaybackPositionMs == int64(45250)
+	}
+
+	then "does not rewrite stale checkpoints without an authoritative playing clock" {
+		persisted := int64(0)
+		svc := New(nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+		svc.persistPlayback = func(_ context.Context, positionMs int64) error {
+			persisted = positionMs
+			return nil
+		}
+		room := &theatre.Room{
+			RoomCode:           RoomCode,
+			Playlist:           []int64{42, 99},
+			CurrentItemIndex:   0,
+			PlaybackPositionMs: 12000,
+		}
+
+		svc.persistPlaybackSnapshot(context.Background(), room, 45.25, false, true)
+		svc.persistPlaybackSnapshot(context.Background(), room, 45.25, true, false)
+		svc.persistPlaybackSnapshot(context.Background(), room, 11.5, true, true)
+
+		expect persisted == int64(0)
+		expect room.PlaybackPositionMs == int64(12000)
+	}
+}
+
+unit "Random channel recovery ordering" {
+	then "restores playback and skips optional queue warming before Run" {
+		controller := &fakeRoomController{}
+		warmed := make(chan struct{}, 1)
+		svc := New(nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+		svc.SetController(controller)
+		svc.loadItem = func(_ context.Context, id int64) (*library.MediaItem, error) {
+			return &library.MediaItem{ID: id, Path: "/media/test.mp4"}, nil
+		}
+		svc.warmItem = func(_ context.Context, item *library.MediaItem) {
+			warmed <- struct{}{}
+		}
+		room := &theatre.Room{
+			RoomCode:         RoomCode,
+			Playlist:         []int64{42, 99},
+			CurrentItemIndex: 0,
+		}
+
+		svc.recoverPlaybackAndPrewarm(context.Background(), room, 12.5, false, false, false)
+		select {
+		case <-warmed:
+			t.Fatalf("optional queue warmup must not run before Service.Run starts media workers")
+		case <-time.After(50 * time.Millisecond):
+		}
+		controllerState := controller.snapshot()
+
+		expect controllerState.playSession == RoomCode
+		expect controllerState.playPos == 12.5
+		expect controllerState.playHasPos
+	}
+}
+
+unit "Random channel live cache startup gate timeout" {
+	given "a startup gate deadline already set for the pending item" {
+		base := time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC)
+		deadline := base.Add(maxLiveCacheGateSeconds * time.Second)
+		state := runtimeState{IntermissionNextID: 984, LiveCacheGateDeadline: &deadline}
+
+		when "the clock has passed the deadline" {
+			now := base.Add((maxLiveCacheGateSeconds + 1) * time.Second)
+			expired := liveCacheGateExpired(liveCacheGateDeadline(state, 984, now), now)
+
+			then "reports the gate as expired so the channel can proceed" {
+				expect expired
+			}
+		}
+		when "the clock is still before the deadline" {
+			now := base.Add(60 * time.Second)
+			expired := liveCacheGateExpired(liveCacheGateDeadline(state, 984, now), now)
+
+			then "keeps the gate closed" {
+				expect !expired
+			}
+		}
+		when "the pending item changes" {
+			now := base.Add(60 * time.Second)
+			fresh := liveCacheGateDeadline(state, 999, now)
+
+			then "starts a fresh bounded budget for the new item" {
+				expect fresh.Equal(now.Add(maxLiveCacheGateSeconds * time.Second))
+			}
+		}
+	}
+	given "no startup gate deadline yet for a newly gated item" {
+		base := time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC)
+		state := runtimeState{IntermissionNextID: 984}
+
+		when "the gate is first evaluated for the item" {
+			deadline := liveCacheGateDeadline(state, 984, base)
+
+			then "opens a bounded budget from now" {
+				expect deadline.Equal(base.Add(maxLiveCacheGateSeconds * time.Second))
+			}
+		}
+	}
+}

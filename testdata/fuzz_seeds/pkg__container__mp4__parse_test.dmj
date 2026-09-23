@@ -1,0 +1,214 @@
+package mp4_test
+
+import (
+	"bytes"
+	"encoding/binary"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/container/mp4"
+)
+
+unit "Box parser" {
+	given "a minimal ftyp box" {
+		var buf bytes.Buffer
+		body := []byte("mp42")
+		body = append(body, 0, 0, 0, 0)
+		body = append(body, []byte("mp42isom")...)
+		sizeBuf := make([]byte, 4)
+		binary.BigEndian.PutUint32(sizeBuf, uint32(8+len(body)))
+		buf.Write(sizeBuf)
+		buf.Write([]byte("ftyp"))
+		buf.Write(body)
+
+		when "reading the box" {
+			box, err := mp4.ReadBox(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "type is ftyp" {
+				expect box.Type == "ftyp"
+			}
+			then "size matches" {
+				expect box.Size == int64(buf.Len())
+			}
+			then "has data" {
+				expect len(box.Data) > 0
+			}
+		}
+	}
+
+	given "a container box (moov) with children" {
+		var buf bytes.Buffer
+
+		// Build a trak child
+		trakBody := []byte("trak-inner-data")
+		trakSize := 8 + len(trakBody)
+		trakBuf := make([]byte, 4)
+		binary.BigEndian.PutUint32(trakBuf, uint32(trakSize))
+
+		// Build moov with trak child
+		var moovBody bytes.Buffer
+		moovBody.Write(trakBuf)
+		moovBody.Write([]byte("free")) // use free as non-container
+		moovBody.Write(trakBody)
+
+		moovSize := 8 + moovBody.Len()
+		moovSizeBuf := make([]byte, 4)
+		binary.BigEndian.PutUint32(moovSizeBuf, uint32(moovSize))
+		buf.Write(moovSizeBuf)
+		buf.Write([]byte("moov"))
+		buf.Write(moovBody.Bytes())
+
+		when "reading the moov box" {
+			box, err := mp4.ReadBox(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "type is moov" {
+				expect box.Type == "moov"
+			}
+			then "has children" {
+				expect len(box.Children) > 0
+			}
+		}
+	}
+
+	given "a box with extended 64-bit size" {
+		var buf bytes.Buffer
+		// size=1 means 64-bit extended size follows
+		binary.Write(&buf, binary.BigEndian, uint32(1))
+		buf.Write([]byte("mdat"))
+		binary.Write(&buf, binary.BigEndian, uint64(16+10)) // 16 header + 10 data
+		buf.Write(make([]byte, 10))
+
+		when "reading" {
+			box, err := mp4.ReadBox(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "type is mdat" {
+				expect box.Type == "mdat"
+			}
+			then "data length is 10" {
+				expect len(box.Data) == 10
+			}
+		}
+	}
+
+	given "empty input" {
+		when "reading from empty reader" {
+			_, err := mp4.ReadBox(bytes.NewReader(nil), 0)
+
+			then "returns error" {
+				expect err != nil
+			}
+		}
+	}
+}
+
+unit "Box.Find recursive search" {
+	given "a nested box tree" {
+		root := &mp4.Box{
+			Type: "moov",
+			Children: []*mp4.Box{
+				{
+					Type: "trak",
+					Children: []*mp4.Box{
+						{
+							Type: "mdia",
+							Children: []*mp4.Box{
+								{Type: "hdlr", Data: []byte("handler")},
+								{
+									Type: "minf",
+									Children: []*mp4.Box{
+										{
+											Type: "stbl",
+											Children: []*mp4.Box{
+												{Type: "stsz", Data: []byte("sizes")},
+												{Type: "stco", Data: []byte("offsets")},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		then "Find locates deeply nested boxes" {
+			stsz := root.Find("stsz")
+			expect stsz != nil
+			expect stsz.Type == "stsz"
+		}
+		then "Find returns nil for missing box" {
+			expect root.Find("nonexistent") == nil
+		}
+		then "FindAll collects all matching" {
+			// Only one stsz in the tree
+			all := root.FindAll("stsz")
+			expect len(all) == 1
+		}
+	}
+}
+
+unit "ParseAvcC" {
+	given "a valid avcC structure" {
+		// Minimal avcC: version(1) + profile(1) + compat(1) + level(1)
+		// + lengthSizeMinusOne(1) + numSPS(1) + sps entries + numPPS(1) + pps entries
+		data := []byte{
+			0x01,       // version
+			0x64, 0x00, 0x1F, // profile, compat, level
+			0xFF,       // 0xFC | 3 (lengthSizeMinusOne=3 → lengthSize=4)
+			0xE1,       // 0xE0 | 1 (numSPS=1)
+		}
+		// SPS: length=4, data=67 42 00 1F
+		spsLen := make([]byte, 2)
+		binary.BigEndian.PutUint16(spsLen, 4)
+		data = append(data, spsLen...)
+		data = append(data, 0x67, 0x42, 0x00, 0x1F)
+		// numPPS=1
+		data = append(data, 0x01)
+		// PPS: length=2, data=68 CE
+		ppsLen := make([]byte, 2)
+		binary.BigEndian.PutUint16(ppsLen, 2)
+		data = append(data, ppsLen...)
+		data = append(data, 0x68, 0xCE)
+
+		when "parsing" {
+			ps := mp4.ParseAvcC(data)
+
+			then "extracts 1 SPS" {
+				expect ps != nil
+				expect len(ps.SPS) == 1
+				expect len(ps.SPS[0]) == 4
+				expect ps.SPS[0][0] == 0x67
+			}
+			then "extracts 1 PPS" {
+				expect len(ps.PPS) == 1
+				expect len(ps.PPS[0]) == 2
+				expect ps.PPS[0][0] == 0x68
+			}
+			then "no VPS for H.264" {
+				expect len(ps.VPS) == 0
+			}
+		}
+	}
+
+	given "truncated avcC data" {
+		data := []byte{0x01, 0x64}
+
+		when "parsing" {
+			ps := mp4.ParseAvcC(data)
+
+			then "returns nil" {
+				expect ps == nil
+			}
+		}
+	}
+}
+

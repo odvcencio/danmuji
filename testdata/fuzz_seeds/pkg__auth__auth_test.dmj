@@ -1,0 +1,62 @@
+package auth_test
+
+import (
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/odvcencio/goetrope/pkg/auth"
+)
+
+unit "RoomGrantService" {
+	given "a grant service" {
+		cfg := auth.RoomGrantConfig{Key: []byte("test-secret-key-32bytes!!")}
+		svc := auth.NewRoomGrantService(cfg)
+
+		when "granting access to a room" {
+			rec := httptest.NewRecorder()
+			svc.Grant(rec, "ABC123", time.Now().Add(4*time.Hour))
+
+			then "sets a cookie" {
+				cookies := rec.Result().Cookies()
+				expect len(cookies) >= 1
+			}
+		}
+
+		when "checking grant without cookie" {
+			req := httptest.NewRequest("GET", "/theatre/ABC123", nil)
+
+			then "has no grant" {
+				reject svc.HasGrant(req, "ABC123")
+			}
+		}
+
+		when "granting then checking" {
+			rec := httptest.NewRecorder()
+			svc.Grant(rec, "XYZ789", time.Now().Add(time.Hour))
+			cookies := rec.Result().Cookies()
+
+			checkReq := httptest.NewRequest("GET", "/theatre/XYZ789", nil)
+			for _, c := range cookies {
+				checkReq.AddCookie(c)
+			}
+
+			then "has grant for correct room" {
+				expect svc.HasGrant(checkReq, "XYZ789")
+			}
+			then "no grant for wrong room" {
+				reject svc.HasGrant(checkReq, "WRONG1")
+			}
+		}
+	}
+}
+
+unit "DiscordService unconfigured" {
+	given "a discord service with empty config" {
+		svc := auth.NewDiscordService(auth.DiscordConfig{})
+
+		then "is not configured" {
+			reject svc.Configured()
+		}
+	}
+}

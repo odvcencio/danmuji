@@ -1,0 +1,217 @@
+package worker
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"log"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/transcode"
+)
+
+type classifiedFallbackSpecBackend struct {
+	failure  error
+	calls    int
+	profiles []transcode.VideoProfile
+}
+
+func (backend *classifiedFallbackSpecBackend) Supports(transcode.VideoProfile) bool {
+	return true
+}
+
+func (backend *classifiedFallbackSpecBackend) TranscodeHLS(_ context.Context, job transcode.Job, profile transcode.VideoProfile, _ ProgressSink) (transcode.Completion, error) {
+	backend.calls++
+	backend.profiles = append(backend.profiles, profile)
+	if profile.HardwareDecode && backend.failure != nil {
+		return transcode.Completion{JobID: job.ID, Success: false, Message: backend.failure.Error()}, backend.failure
+	}
+	return transcode.Completion{JobID: job.ID, Success: true, Message: "completed"}, nil
+}
+
+func classifiedFallbackSpecExecutor(t *testing.T, failure error) (*Executor, *classifiedFallbackSpecBackend, string) {
+	t.Helper()
+	root := t.TempDir()
+	source, err := os.CreateTemp(root, "gpu-fallback-*.mp4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+	backend := &classifiedFallbackSpecBackend{failure: failure}
+	exec := mustTestExecutor(t, root)
+	exec.caps = transcode.Capabilities{
+		HasFFmpeg:          true,
+		CPUAvailable:       true,
+		NVENCAvailable:     true,
+		PreferredBackend:   transcode.BackendNVENC,
+		GPUDevice:          "0",
+		VideoEncoders:      []string{"h264_nvenc", "libx264"},
+		CUDAScaleAvailable: true,
+	}
+	exec.ffmpeg = backend
+	return exec, backend, source.Name()
+}
+
+unit "typed CUDA decode failure boundary" {
+	then "classifies only bounded CUDA decoder and scale failures" {
+		decoder := "[h264] cuvidCreateDecoder failed -> CUDA_ERROR_INVALID_VALUE"
+		expect classifyHardwareDecodeFailure(decoder) == HardwareDecodeFailureDecoder
+		decoderWithArguments := "[h264 @ 0x123] ctx->cvdl->cuvidCreateDecoder(&ctx->cudecoder, &cuinfo) failed -> CUDA_ERROR_INVALID_VALUE"
+		expect classifyHardwareDecodeFailure(decoderWithArguments) == HardwareDecodeFailureDecoder
+		decodePicture := "[hevc_cuvid @ 0x123] cuvidDecodePicture failed -> CUDA_ERROR_INVALID_VALUE"
+		expect classifyHardwareDecodeFailure(decodePicture) == HardwareDecodeFailureDecoder
+
+		scale := "[Parsed_scale_cuda_0] Failed to configure output pad"
+		expect classifyHardwareDecodeFailure(scale) == HardwareDecodeFailureScale
+		bracketedScale := "[Parsed_scale_cuda_0 @ 0x123] Failed to configure output pad"
+		expect classifyHardwareDecodeFailure(bracketedScale) == HardwareDecodeFailureScale
+
+		unavailable := "Cannot load libcuda.so.1"
+		expect classifyHardwareDecodeFailure(unavailable) == HardwareDecodeFailureCUDAUnavailable
+		bracketedUnavailable := "[AVHWDeviceContext @ 0x123] Cannot load libcuda.so.1"
+		expect classifyHardwareDecodeFailure(bracketedUnavailable) == HardwareDecodeFailureCUDAUnavailable
+		invalidDevice := "[AVHWDeviceContext @ 0x123] cu->cuDeviceGet(&device, device_idx) failed -> CUDA_ERROR_INVALID_DEVICE: invalid device ordinal"
+		expect classifyHardwareDecodeFailure(invalidDevice) == HardwareDecodeFailureCUDAUnavailable
+	}
+
+	then "does not relabel mux audio encode IO or cancellation failures" {
+		for _, stderr := range []string{
+			"Error opening output file /secret/media/output.m3u8: Permission denied",
+			"[aac] Error while opening encoder",
+			"[h264_nvenc] InitializeEncoder failed: invalid param",
+			"Conversion failed after muxer write error",
+			"Immediate exit requested",
+		} {
+			expect classifyHardwareDecodeFailure(stderr) == HardwareDecodeFailureReason("")
+		}
+	}
+
+	then "does not combine a healthy CUDA diagnostic with an unrelated later failure" {
+		mixedScale := "[Parsed_scale_cuda_0] w:1920 h:1080 fmt:p010le -> w:1280 h:720 fmt:yuv420p\nError opening output file /secret/output.m3u8: Permission denied"
+		expect classifyHardwareDecodeFailure(mixedScale) == HardwareDecodeFailureReason("")
+		mixedScaleStatus := "[Parsed_scale_cuda_0] supported formats; unsupported requests: 0\n[aac] Error while opening encoder"
+		expect classifyHardwareDecodeFailure(mixedScaleStatus) == HardwareDecodeFailureReason("")
+
+		mixedDecoder := "[hevc] NVDEC capabilities: format supported: yes\n[aac] Error while opening encoder"
+		expect classifyHardwareDecodeFailure(mixedDecoder) == HardwareDecodeFailureReason("")
+		mixedDecoderStatus := "[hevc] NVDEC capabilities: unsupported formats: none\n[aac] Error while opening encoder"
+		expect classifyHardwareDecodeFailure(mixedDecoderStatus) == HardwareDecodeFailureReason("")
+		successfulCreate := "[h264] cuvidCreateDecoder initialized successfully\n[aac] Error while opening encoder"
+		expect classifyHardwareDecodeFailure(successfulCreate) == HardwareDecodeFailureReason("")
+		sameLineSuccess := "[h264] cuvidCreateDecoder initialized decoder=0x123 [aac] Error while opening encoder"
+		expect classifyHardwareDecodeFailure(sameLineSuccess) == HardwareDecodeFailureReason("")
+	}
+
+	then "does not treat CUDA tokens in paths or metadata as subsystem evidence" {
+		for _, stderr := range []string{
+			"Error opening output file /secret/cuvidCreateDecoder/output.m3u8: Permission denied",
+			"Error opening output file /secret/cuvidDecodePicture/output.m3u8: Permission denied",
+			"Error opening output file /secret/scale_cuda/output.m3u8: Permission denied",
+			"Error opening output file /secret/cannot load libcuda/output.m3u8: Permission denied",
+			"[hls @ 0x123] Failed to open segment '/secret/scale_cuda/output.ts'",
+			"Metadata title: cuvidCreateDecoder failed retrospective",
+		} {
+			expect classifyHardwareDecodeFailure(stderr) == HardwareDecodeFailureReason("")
+		}
+	}
+
+	then "keeps raw stderr out of the returned error" {
+		secret := "/secret/media/password=hunter2.mkv"
+		err := newFFmpegTranscodeError(errors.New("exit status 1"), "ffmpeg hls failed", "cuvidCreateDecoder failed "+secret, true)
+		reason, ok := hardwareDecodeFailureReason(err)
+		expect ok
+		expect reason == HardwareDecodeFailureDecoder
+		reject strings.Contains(err.Error(), secret)
+	}
+
+	then "does not classify CUDA-looking stderr for a software profile" {
+		err := newFFmpegTranscodeError(errors.New("exit status 1"), "ffmpeg hls failed", "cuvidCreateDecoder failed", false)
+		_, ok := hardwareDecodeFailureReason(err)
+		reject ok
+	}
+}
+
+@serial
+unit "causal worker fallback" {
+	then "a confirmed decoder failure falls back once and caches a reason metric" {
+		var logs bytes.Buffer
+		previousLogWriter := log.Writer()
+		log.SetOutput(&logs)
+		defer log.SetOutput(previousLogWriter)
+		secret := "/secret/media/private-title.mkv"
+		failure := newFFmpegTranscodeError(errors.New("exit status 1"), "ffmpeg hls failed", "cuvidCreateDecoder failed "+secret, true)
+		exec, backend, source := classifiedFallbackSpecExecutor(t, failure)
+		job := transcode.Job{ID: "confirmed-gpu-failure", Type: transcode.JobTypeLiveCache, SourcePath: source, Quality: "h264-720p"}
+
+		completion, err := exec.Execute(context.Background(), job, nil)
+		expect err == nil
+		expect completion.Success
+		expect backend.calls == 2
+		expect backend.profiles[0].HardwareDecode
+		reject backend.profiles[1].HardwareDecode
+
+		metrics := exec.HardwareDecodeFallbackMetrics()
+		expect metrics.Total == 1
+		expect metrics.ByReason[HardwareDecodeFailureDecoder] == 1
+		expect strings.Contains(logs.String(), "code=hardware_decode_fallback")
+		expect strings.Contains(logs.String(), "metric=hardware_decode_fallback_total")
+		expect strings.Contains(logs.String(), "reason_code=cuda_decoder_failed")
+		reject strings.Contains(logs.String(), secret)
+
+		completion, err = exec.Execute(context.Background(), job, nil)
+		expect err == nil
+		expect completion.Success
+		expect backend.calls == 3
+		reject backend.profiles[2].HardwareDecode
+	}
+
+	then "an unrelated ffmpeg failure is returned without fallback or demotion" {
+		exec, backend, source := classifiedFallbackSpecExecutor(t, errors.New("mux write failed"))
+		job := transcode.Job{ID: "unrelated-failure", Type: transcode.JobTypeLiveCache, SourcePath: source, Quality: "h264-720p"}
+
+		completion, err := exec.Execute(context.Background(), job, nil)
+		expect err != nil
+		reject completion.Success
+		expect backend.calls == 1
+		expect backend.profiles[0].HardwareDecode
+		expect exec.HardwareDecodeFallbackMetrics().Total == 0
+
+		_, err = exec.Execute(context.Background(), job, nil)
+		expect err != nil
+		expect backend.calls == 2
+		expect backend.profiles[1].HardwareDecode
+	}
+
+	then "reviewer counterexamples never retry cache or increment metrics" {
+		for _, testCase := range []struct {
+			name   string
+			stderr string
+		}{
+			{name: "successful-cuvid-plus-aac", stderr: "[h264] cuvidCreateDecoder initialized successfully\n[aac] Error while opening encoder"},
+			{name: "cuvid-output-path", stderr: "Error opening output file /secret/cuvidCreateDecoder/output.m3u8: Permission denied"},
+			{name: "scale-output-path", stderr: "Error opening output file /secret/scale_cuda/output.m3u8: Permission denied"},
+		} {
+			t.Run(testCase.name, func(t *testing.T) {
+				failure := newFFmpegTranscodeError(errors.New("exit status 1"), "ffmpeg hls failed", testCase.stderr, true)
+				exec, backend, source := classifiedFallbackSpecExecutor(t, failure)
+				job := transcode.Job{ID: "unclassified-review-case", Type: transcode.JobTypeLiveCache, SourcePath: source, Quality: "h264-720p"}
+
+				completion, err := exec.Execute(context.Background(), job, nil)
+				expect err != nil
+				reject completion.Success
+				expect backend.calls == 1
+				expect backend.profiles[0].HardwareDecode
+				expect exec.HardwareDecodeFallbackMetrics().Total == 0
+
+				_, err = exec.Execute(context.Background(), job, nil)
+				expect err != nil
+				expect backend.calls == 2
+				expect backend.profiles[1].HardwareDecode
+			})
+		}
+	}
+}

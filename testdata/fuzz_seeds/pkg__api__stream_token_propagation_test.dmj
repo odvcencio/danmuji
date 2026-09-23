@@ -1,0 +1,378 @@
+package api
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/odvcencio/goetrope/pkg/library"
+	"github.com/odvcencio/goetrope/pkg/randomchannel"
+	"github.com/odvcencio/goetrope/pkg/streamtoken"
+	"github.com/odvcencio/goetrope/pkg/transcode"
+)
+
+type tokenPropagationChannelAdmin struct {
+	summary *randomchannel.Summary
+}
+
+func (s tokenPropagationChannelAdmin) Summary(context.Context) (*randomchannel.Summary, error) {
+	return s.summary, nil
+}
+
+func (s tokenPropagationChannelAdmin) AdvanceNext(context.Context) error { return nil }
+func (s tokenPropagationChannelAdmin) ForceReroll(context.Context) error { return nil }
+func (s tokenPropagationChannelAdmin) SetActiveTranscodeGroup(string)     {}
+
+unit "Negotiated stream URL token continuity" {
+	given "an explicitly injected minter and a refreshed item token" {
+		minter := streamtoken.NewUnsafeMinterFromRawStringForTest("propagation-secret", time.Hour)
+		defer minter.Close()
+		item := &library.MediaItem{
+			ID:        42,
+			Container: "mp4",
+			Streams: []library.Stream{
+				{StreamType: "video", Codec: "h264"},
+				{StreamType: "audio", Codec: "aac"},
+			},
+		}
+		refreshed := minter.Mint(item.ID, "token-only-viewer")
+
+		when "each active negotiation result is serialized" {
+			native, nativeOK := nativePlayNegotiation(item.ID, item, streamNegotiateRequest{})
+			expect nativeOK
+			responses := []streamNegotiateResponse{
+				native,
+				directPlayNegotiation(item.ID, streamDecision{Action: "DirectPlay"}, 4),
+				{MasterPlaylistURL: theatreMasterPlaylistURL(item.ID, transcode.CodecH264, 8_000_000, true, 2, 12.5)},
+				onDemandTranscodeResponse(item.ID, "h264-720p", "Transcode", "", 4),
+			}
+
+			then "every produced URL carries a token valid only for that item" {
+				for _, response := range responses {
+					response = withNegotiationStreamToken(response, refreshed)
+					parsed, err := url.Parse(response.MasterPlaylistURL)
+					expect err == nil
+					token := parsed.Query().Get("token")
+					expect token != ""
+					_, valid := minter.Verify(token, item.ID)
+					expect valid
+					_, wrongItemValid := minter.Verify(token, 99)
+					reject wrongItemValid
+
+					followed := false
+					next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+						followed = true
+						w.WriteHeader(http.StatusNoContent)
+					})
+					var followup http.Handler = withStreamTokenPolicy(minter, nil, nil, next)
+					if strings.HasPrefix(parsed.Path, "/api/stream/") {
+						followup = requireStreamAuth(minter, nil, nil, "/api/stream/", next)
+					}
+					req := httptest.NewRequest(http.MethodGet, response.MasterPlaylistURL, nil)
+					req.RemoteAddr = "203.0.113.9:1234"
+					rec := httptest.NewRecorder()
+					followup.ServeHTTP(rec, req)
+					expect followed
+					expect rec.Code == http.StatusNoContent
+				}
+			}
+		}
+
+		when "a produced token is reused for another item" {
+			response := withNegotiationStreamToken(
+				directPlayNegotiation(item.ID, streamDecision{Action: "DirectPlay"}, 4),
+				refreshed,
+			)
+			wrongItemURL := strings.Replace(response.MasterPlaylistURL, "/42/", "/99/", 1)
+			followed := false
+			followup := withStreamTokenPolicy(minter, nil, nil, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				followed = true
+			}))
+			req := httptest.NewRequest(http.MethodGet, wrongItemURL, nil)
+			req.RemoteAddr = "203.0.113.9:1234"
+			rec := httptest.NewRecorder()
+			followup.ServeHTTP(rec, req)
+
+			then "the follow-up request is denied" {
+				reject followed
+				expect rec.Code == http.StatusUnauthorized
+			}
+		}
+
+		when "the token is removed from a protected produced URL" {
+			followed := false
+			followup := withStreamTokenPolicy(minter, nil, nil, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				followed = true
+			}))
+			req := httptest.NewRequest(http.MethodGet, "/stream/42/master.m3u8", nil)
+			req.RemoteAddr = "203.0.113.9:1234"
+			rec := httptest.NewRecorder()
+			followup.ServeHTTP(rec, req)
+
+			then "unauthenticated follow-up remains denied" {
+				reject followed
+				expect rec.Code == http.StatusUnauthorized
+			}
+		}
+	}
+}
+
+unit "WebVTT protected-asset token continuity" {
+	given "bitmap subtitle and trickplay manifests with protected asset URLs" {
+		minter := streamtoken.NewUnsafeMinterFromRawStringForTest("propagation-secret", time.Hour)
+		defer minter.Close()
+		token := minter.Mint(42, "token-only-viewer")
+		manifest := strings.Join([]string{
+			"WEBVTT",
+			"",
+			"00:00:01.000 --> 00:00:03.000",
+			"/stream/42/subtitles/bitmap/2-00000.png#xywh=100,900,800,60&canvas=1920,1080",
+			"",
+			"00:00:04.000 --> 00:00:06.000",
+			"/stream/42/trickplay/sprite.jpg#xywh=0,180,240,135&canvas=1200,540",
+			"",
+			"00:00:07.000 --> 00:00:08.000",
+			"https://cdn.example.invalid/stream/42/trickplay/sprite.jpg#xywh=0,0,1,1",
+			"",
+			"00:00:09.000 --> 00:00:10.000",
+			"//cdn.example.invalid/stream/42/subtitles/bitmap/2-00001.png",
+			"",
+		}, "\n")
+
+		when "the server emits the manifest to an authorized token-only viewer" {
+			decorated := injectWebVTTStreamToken([]byte(manifest), token)
+
+			then "each protected asset URL retains item-bound authority and its fragment" {
+				assetLines := []string{}
+				for _, line := range strings.Split(string(decorated), "\n") {
+					if strings.HasPrefix(line, "/stream/") {
+						assetLines = append(assetLines, line)
+					}
+				}
+				expect len(assetLines) == 2
+				for _, assetURL := range assetLines {
+					parsed, err := url.Parse(assetURL)
+					expect err == nil
+					expect parsed.Fragment != ""
+					_, valid := minter.Verify(parsed.Query().Get("token"), 42)
+					expect valid
+
+					followed := false
+					followup := withStreamTokenPolicy(minter, nil, nil, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+						followed = true
+						w.WriteHeader(http.StatusNoContent)
+					}))
+					// URL fragments are interpreted by the browser and never sent in
+					// the HTTP follow-up request.
+					followURL := *parsed
+					followURL.Fragment = ""
+					req := httptest.NewRequest(http.MethodGet, followURL.String(), nil)
+					req.RemoteAddr = "203.0.113.9:1234"
+					rec := httptest.NewRecorder()
+					followup.ServeHTTP(rec, req)
+					expect followed
+					expect rec.Code == http.StatusNoContent
+				}
+				expect strings.Contains(string(decorated), "\nhttps://cdn.example.invalid/stream/42/trickplay/sprite.jpg#xywh=0,0,1,1\n")
+				expect strings.Contains(string(decorated), "\n//cdn.example.invalid/stream/42/subtitles/bitmap/2-00001.png\n")
+			}
+		}
+	}
+}
+
+unit "HLS playlist token containment" {
+	given "protected relative references mixed with untrusted absolute references" {
+		hostileLines := []string{
+			"https://cdn.example.invalid/bucket/seg00001.ts",
+			"//cdn.example.invalid/bucket/seg00002.ts",
+			"https:stream/42/h264/seg00003.ts",
+			"https://watch.example.invalid@evil.example.invalid/stream/42/seg00004.ts",
+			"../admin/export",
+			`\evil.example.invalid\stream\42\seg00005.ts`,
+			`#EXT-X-MAP:URI="https://cdn.example.invalid/bucket/init.mp4"`,
+			`#EXT-X-MEDIA:TYPE=SUBTITLES,URI="//cdn.example.invalid/subtitles/2.vtt"`,
+		}
+		playlist := strings.Join(append([]string{
+			"#EXTM3U",
+			"#EXTINF:4.000,",
+			"/stream/42/h264/seg00000.ts?ll=1",
+			"seg-local.ts",
+			`#EXT-X-MAP:URI="/stream/42/h264/init.mp4"`,
+			`#EXT-X-MEDIA:TYPE=SUBTITLES,URI="/stream/42/subtitles/2.vtt"`,
+			"#EXT-X-PREFETCH:/stream/42/h264/seg00006.m4s",
+			"/stream/42/recovery/seg00007.ts",
+		}, hostileLines...), "\n") + "\n"
+
+		when "a refreshed Goetrope capability is propagated" {
+			decorated := injectPlaylistToken(playlist, "item-token")
+
+			then "only protected same-origin relative references carry it" {
+				for _, expected := range []string{
+					"/stream/42/h264/seg00000.ts?ll=1&token=item-token",
+					"seg-local.ts?token=item-token",
+					`#EXT-X-MAP:URI="/stream/42/h264/init.mp4?token=item-token"`,
+					`#EXT-X-MEDIA:TYPE=SUBTITLES,URI="/stream/42/subtitles/2.vtt?token=item-token"`,
+					"#EXT-X-PREFETCH:/stream/42/h264/seg00006.m4s?token=item-token",
+					"/stream/42/recovery/seg00007.ts?token=item-token",
+				} {
+					expect strings.Contains(decorated, expected)
+				}
+				for _, hostile := range hostileLines {
+					expect strings.Contains(decorated, "\n"+hostile+"\n")
+				}
+			}
+		}
+	}
+}
+
+unit "Required stream authority constructors" {
+	then "the error-returning router constructor rejects a nil minter" {
+		_, err := NewRouterWithRequiredStreamMinter(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+		expect errors.Is(err, ErrStreamTokenAuthorityRequired)
+	}
+
+	then "the legacy WithMinter constructor fails closed on nil" {
+		router := NewRouterWithStreamMinter(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+		req := httptest.NewRequest(http.MethodGet, "/health", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		expect rec.Code == http.StatusServiceUnavailable
+	}
+
+	then "the random-channel minter wrapper fails closed on nil" {
+		handler := WithRandomChannelStreamMinter(http.NotFoundHandler(), tokenPropagationChannelAdmin{}, nil)
+		req := httptest.NewRequest(http.MethodGet, "/api/channel/1", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		expect rec.Code == http.StatusServiceUnavailable
+	}
+}
+
+unit "Negotiation authorization contract" {
+	given "the production router has an explicitly injected stream minter" {
+		minter := streamtoken.NewUnsafeMinterFromRawStringForTest("propagation-secret", time.Hour)
+		defer minter.Close()
+		router := NewRouterWithStreamMinter(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, minter)
+
+		when "a token-only viewer negotiates its bound item" {
+			token := minter.Mint(42, "token-only-viewer")
+			req := httptest.NewRequest(http.MethodPost, "/api/stream/42/negotiate?token="+url.QueryEscape(token), strings.NewReader("{}"))
+			req.RemoteAddr = "203.0.113.9:1234"
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			then "authorization passes before the missing-store diagnostic" {
+				expect rec.Code == http.StatusServiceUnavailable
+			}
+		}
+
+		when "an anonymous viewer negotiates without a token" {
+			req := httptest.NewRequest(http.MethodPost, "/api/stream/42/negotiate", strings.NewReader("{}"))
+			req.RemoteAddr = "203.0.113.9:1234"
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			then "the request is denied before reaching negotiation" {
+				expect rec.Code == http.StatusUnauthorized
+			}
+		}
+
+		when "a token for another item is reused for negotiation" {
+			token := minter.Mint(7, "token-only-viewer")
+			req := httptest.NewRequest(http.MethodPost, "/api/stream/42/negotiate?token="+url.QueryEscape(token), strings.NewReader("{}"))
+			req.RemoteAddr = "203.0.113.9:1234"
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			then "the wrong-item token is denied" {
+				expect rec.Code == http.StatusUnauthorized
+			}
+		}
+	}
+
+	given "a compatibility router used by tests has no minter" {
+		router := NewUnsafeRouterWithoutStreamAuth(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+
+		when "a request reaches negotiation without credentials" {
+			req := httptest.NewRequest(http.MethodPost, "/api/stream/42/negotiate", strings.NewReader("{}"))
+			req.RemoteAddr = "203.0.113.9:1234"
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			then "the test-only compatibility path remains a fail-safe no-op" {
+				expect rec.Code == http.StatusServiceUnavailable
+			}
+		}
+	}
+}
+
+unit "Generated-media recovery token continuity" {
+	given "a current channel item and an explicitly injected minter" {
+		minter := streamtoken.NewUnsafeMinterFromRawStringForTest("propagation-secret", time.Hour)
+		defer minter.Close()
+		handler := &streamHandler{
+			streamTokens: minter,
+			channelAdmin: tokenPropagationChannelAdmin{summary: &randomchannel.Summary{
+				CurrentItemIndex: 0,
+				CurrentPosition:  15,
+				Playing:          true,
+				Playlist: []randomchannel.PlaylistEntry{
+					{MediaItemID: 42},
+				},
+			}},
+		}
+
+		when "a token-only viewer follows a generated-media recovery URL" {
+			incoming := minter.Mint(42, "token-only-viewer")
+			req := httptest.NewRequest(http.MethodGet, "/fbd8aebd-1a8b-4e2a-be99-3d2f907cce14?position=12.5&token="+url.QueryEscape(incoming), nil)
+			req.RemoteAddr = "203.0.113.9:1234"
+			rec := httptest.NewRecorder()
+			handler.handleGeneratedMediaSource(rec, req)
+
+			then "the redirect retains refreshed item-bound authority" {
+				expect rec.Code == http.StatusTemporaryRedirect
+				location, err := url.Parse(rec.Header().Get("Location"))
+				expect err == nil
+				expect location.Path == "/stream/42/master.m3u8"
+				token := location.Query().Get("token")
+				expect token != ""
+				_, valid := minter.Verify(token, 42)
+				expect valid
+				_, wrongItemValid := minter.Verify(token, 7)
+				reject wrongItemValid
+			}
+		}
+
+		when "an anonymous viewer follows the same recovery URL without a token" {
+			req := httptest.NewRequest(http.MethodGet, "/fbd8aebd-1a8b-4e2a-be99-3d2f907cce14", nil)
+			req.RemoteAddr = "203.0.113.9:1234"
+			rec := httptest.NewRecorder()
+			handler.handleGeneratedMediaSource(rec, req)
+
+			then "recovery does not mint new authority" {
+				expect rec.Code == http.StatusUnauthorized
+				expect rec.Header().Get("Location") == ""
+			}
+		}
+
+		when "a viewer reuses a different item's token" {
+			wrong := minter.Mint(7, "token-only-viewer")
+			req := httptest.NewRequest(http.MethodGet, "/fbd8aebd-1a8b-4e2a-be99-3d2f907cce14?token="+url.QueryEscape(wrong), nil)
+			req.RemoteAddr = "203.0.113.9:1234"
+			rec := httptest.NewRecorder()
+			handler.handleGeneratedMediaSource(rec, req)
+
+			then "recovery rejects wrong-item reuse" {
+				expect rec.Code == http.StatusUnauthorized
+			}
+		}
+	}
+}

@@ -1,0 +1,80 @@
+package library_test
+
+import (
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/library"
+)
+
+unit "ResolveFilenameMetadata movies" {
+	each "movie filename" {
+		defaults { filename: "", expectYear: 0, minConfidence: 0.0 }
+		{ name: "standard movie",
+		  filename: "The.Matrix.1999.2160p.BluRay.x265.mp4",
+		  expectYear: 1999, minConfidence: 0.9 }
+		{ name: "movie with parens",
+		  filename: "Blade Runner 2049 (2017) 1080p.mp4",
+		  expectYear: 2017, minConfidence: 0.9 }
+		{ name: "no year",
+		  filename: "Some.Random.Movie.1080p.BluRay.mp4",
+		  expectYear: 0, minConfidence: 0.4 }
+		{ name: "bare filename",
+		  filename: "clip.mp4",
+		  expectYear: 0, minConfidence: 0.0 }
+	} do {
+		then "extracts title" {
+			meta := library.ResolveFilenameMetadata(scenario.filename.(string))
+			expect meta.RawTitle != ""
+		}
+		then "extracts year when present" {
+			meta := library.ResolveFilenameMetadata(scenario.filename.(string))
+			if scenario.expectYear.(int) > 0 {
+				expect meta.Year == scenario.expectYear.(int)
+			}
+		}
+		then "confidence meets minimum" {
+			meta := library.ResolveFilenameMetadata(scenario.filename.(string))
+			expect meta.Confidence >= scenario.minConfidence.(float64)
+		}
+	}
+}
+
+unit "ResolveFilenameMetadata episodes" {
+	each "tv episode filename" {
+		defaults { filename: "", expectSeason: 0, expectEpisode: 0 }
+		{ name: "standard SxxExx",
+		  filename: "The.Office.US.S02E03.1080p.WEB-DL.m4v",
+		  expectSeason: 2, expectEpisode: 3 }
+		{ name: "lowercase sxxexx",
+		  filename: "breaking.bad.s05e16.720p.mp4",
+		  expectSeason: 5, expectEpisode: 16 }
+		{ name: "with year and season",
+		  filename: "Severance.2022.S01E01.BluRay.mp4",
+		  expectSeason: 1, expectEpisode: 1 }
+	} do {
+		then "extracts season and episode" {
+			meta := library.ResolveFilenameMetadata(scenario.filename.(string))
+			expect meta.Season == scenario.expectSeason.(int)
+			expect meta.Episode == scenario.expectEpisode.(int)
+		}
+	}
+}
+
+unit "IsSupportedMediaFile" {
+	each "file path" {
+		defaults { path: "", supported: false }
+		{ name: "mp4",          path: "/media/movie.mp4",       supported: true }
+		{ name: "m4v",          path: "/media/movie.m4v",       supported: true }
+		{ name: "mov",          path: "/media/clip.mov",        supported: true }
+		{ name: "mkv",          path: "/media/movie.mkv",       supported: true }
+		{ name: "avi",          path: "/media/movie.avi",       supported: false }
+		{ name: "txt",          path: "/media/readme.txt",      supported: false }
+		{ name: "empty",        path: "",                       supported: false }
+		{ name: "hidden file",  path: "/media/.hidden.mp4",     supported: false }
+		{ name: "no extension", path: "/media/noext",           supported: false }
+	} do {
+		then "returns correct support status" {
+			expect library.IsSupportedMediaFile(scenario.path.(string)) == scenario.supported.(bool)
+		}
+	}
+}

@@ -1,0 +1,117 @@
+package api
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+func gosxIntegrityNoop(called *bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		*called = true
+		w.WriteHeader(http.StatusOK)
+	}
+}
+
+unit "GoSX action integrity metadata" {
+	then "native post routes carry explicit profiles and classes" {
+		owner, ok := GoSXActionRouteForPath("/control/cache/cleanup")
+		expect ok
+		expect owner.Action == "cache.cleanup"
+		expect owner.Class == ClassOwner
+		expect owner.Profile.BodyLimit == GuestBootstrapBodyLimit
+		expect owner.Profile.RequireOrigin
+		expect owner.Profile.ContentTypes[0] == "application/x-www-form-urlencoded"
+		reject owner.FloorExempt
+
+		moderator, ok := GoSXActionRouteForPath("/control/room")
+		expect ok
+		expect moderator.Action == "room.create"
+		expect moderator.Class == ClassModerator
+		expect moderator.FloorExempt
+
+		host, ok := GoSXActionRouteForPath("/party/ROOM01/pause")
+		expect ok
+		expect host.Action == "room.control.pause"
+		expect host.Class == ClassHost
+		expect host.FloorExempt
+		expect host.Profile.BodyLimit == GuestBootstrapBodyLimit
+
+		requests, ok := GoSXActionRouteForPath("/requests")
+		expect ok
+		expect requests.Action == "requests.create"
+		expect requests.Class == ClassAnonymous
+		expect requests.Profile.BodyLimit == SmallMutationBodyLimit
+	}
+
+	then "control page reads remain on the owner floor" {
+		req := httptest.NewRequest(http.MethodGet, "/control", nil)
+		entry, ok := classifyRoute(req)
+		expect ok
+		expect entry.Action == "gosx.control.read"
+		expect entry.Class == ClassOwner
+		reject routeFloorBypassed(entry)
+	}
+}
+
+unit "mutation guard form integrity" {
+	given "an origin-only form profile" {
+		guard := NewMutationGuard(RuntimeDependencies{ExternalOrigin: "https://watch.example"})
+		profile := MutationProfile{
+			BodyLimit: GuestBootstrapBodyLimit,
+			ContentTypes: []string{"application/x-www-form-urlencoded"},
+			RequireOrigin: true,
+		}
+
+		when "the form has no Origin or Referer" {
+			called := false
+			req := httptest.NewRequest(http.MethodPost, "/party/ROOM01/unlock", strings.NewReader("password=swordfish"))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			rec := httptest.NewRecorder()
+			guard.Guard(profile, gosxIntegrityNoop(&called))(rec, req)
+
+			then "it is rejected before the handler" {
+				expect rec.Code == http.StatusForbidden
+				reject called
+			}
+		}
+
+		when "the form has the canonical Origin" {
+			called := false
+			req := httptest.NewRequest(http.MethodPost, "/party/ROOM01/unlock", strings.NewReader("password=swordfish"))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req.Header.Set("Origin", "https://watch.example")
+			rec := httptest.NewRecorder()
+			guard.Guard(profile, gosxIntegrityNoop(&called))(rec, req)
+
+			then "legacy origin-only actions may reach the handler" {
+				expect rec.Code == http.StatusOK
+				expect called
+			}
+		}
+
+		when "the form is oversized" {
+			called := false
+			req := httptest.NewRequest(http.MethodPost, "/party/ROOM01/unlock", strings.NewReader("payload="+strings.Repeat("x", int(GuestBootstrapBodyLimit))))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req.Header.Set("Origin", "https://watch.example")
+			rec := httptest.NewRecorder()
+			guard.Guard(profile, gosxIntegrityNoop(&called))(rec, req)
+
+			then "the body limit rejects before parsing" {
+				expect rec.Code == http.StatusRequestEntityTooLarge
+				reject called
+			}
+		}
+	}
+
+	then "form CSRF fields are accepted as the synchronizer token carrier" {
+		req := httptest.NewRequest(http.MethodPost, "/control/room", strings.NewReader("csrf_token=form-token&access_mode=public"))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		expect csrfTokenFromRequest(req) == "form-token"
+		body, _ := io.ReadAll(req.Body)
+		expect strings.Contains(string(body), "access_mode=public")
+	}
+}

@@ -1,0 +1,37 @@
+package gosxwatch
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/library"
+	"github.com/odvcencio/goetrope/pkg/theatre"
+)
+
+unit "GoSX party playlist broadcasts use library metadata" {
+	room := &theatre.Room{
+		Playlist:         []int64{42},
+		CurrentItemIndex: 0,
+	}
+	store := stubStore{items: map[int64]*library.MediaItem{
+		42: &library.MediaItem{
+			ID:         42,
+			Path:       "/media/Inland.Empire.2006.1080p.mkv",
+			Title:      "Inland.Empire.2006.1080p",
+			Year:       2006,
+			DurationMs: 10800000,
+		},
+	}}
+	entries := partyPlaylistMessageEntries(context.Background(), store, room)
+	message := string(theatre.PlaylistUpdateMessageWithEntries(room, entries))
+
+	then "normalizes rich queue metadata for websocket clients" {
+		expect len(entries) == 1
+		expect entries[0].MediaItemID == int64(42)
+		expect entries[0].DisplayTitle == "Inland Empire"
+		expect entries[0].DurationMS == int64(10800000)
+		expect strings.Contains(message, "\"playlist_entries\"")
+		expect strings.Contains(message, "\"display_title\":\"Inland Empire\"")
+	}
+}

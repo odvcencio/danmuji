@@ -1,0 +1,188 @@
+package api_test
+
+import (
+	"encoding/json"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/api"
+)
+
+unit "Liveness endpoint" {
+	given "a router with no dependencies" {
+		handler := api.NewUnsafeRouterWithoutStreamAuth(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+
+		when "requesting liveness" {
+			req := httptest.NewRequest("GET", "/live", nil)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			then "returns 200" {
+				expect rec.Code == 200
+			}
+			then "response is JSON with status" {
+				var body map[string]any
+				_ = json.Unmarshal(rec.Body.Bytes(), &body)
+				expect body["status"] == "live"
+			}
+		}
+	}
+}
+
+unit "Library endpoints without store" {
+	given "a router with nil store" {
+		handler := api.NewUnsafeRouterWithoutStreamAuth(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+
+		when "listing library" {
+			req := httptest.NewRequest("GET", "/api/library", nil)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			then "returns 503" {
+				expect rec.Code == 503
+			}
+		}
+
+		when "getting item detail" {
+			req := httptest.NewRequest("GET", "/api/library/1", nil)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			then "returns error" {
+				expect rec.Code >= 400
+			}
+		}
+
+	}
+
+	given "a router with nil store and an admin key configured" {
+		admin := api.NewAdminVerifier([]byte("topsecret"))
+		handler := api.NewUnsafeRouterWithDependencies(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, api.RuntimeDependencies{Admin: admin})
+
+		when "scanning library with a verified admin key" {
+			req := httptest.NewRequest("POST", "/api/library/scan", nil)
+			req.RemoteAddr = "198.51.100.10:4000"
+			req.Header.Set("X-Goetrope-Admin-Key", "topsecret")
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			then "returns 503 without scanner" {
+				expect rec.Code == 503
+			}
+		}
+	}
+}
+
+unit "Stream endpoints without store" {
+	given "a router with nil store" {
+		handler := api.NewUnsafeRouterWithoutStreamAuth(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+
+		when "requesting master playlist" {
+			req := httptest.NewRequest("GET", "/stream/1/master.m3u8", nil)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			then "returns error" {
+				expect rec.Code >= 400
+			}
+		}
+
+		when "requesting segment" {
+			req := httptest.NewRequest("GET", "/stream/1/original/seg00000.ts", nil)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			then "returns error" {
+				expect rec.Code >= 400
+			}
+		}
+
+		when "negotiating stream" {
+			req := httptest.NewRequest("POST", "/api/stream/1/negotiate", strings.NewReader("{}"))
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			then "returns error" {
+				expect rec.Code >= 400
+			}
+		}
+	}
+}
+
+unit "Theatre endpoints without manager" {
+	given "a router with nil theatre" {
+		handler := api.NewUnsafeRouterWithoutStreamAuth(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+
+		when "creating a room" {
+			body := `{"access_mode":"public"}`
+			req := httptest.NewRequest("POST", "/api/theatre/create", strings.NewReader(body))
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			then "returns error" {
+				expect rec.Code >= 400
+			}
+		}
+
+		when "getting a room" {
+			req := httptest.NewRequest("GET", "/api/theatre/ABC123", nil)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			then "returns error" {
+				expect rec.Code >= 400
+			}
+		}
+	}
+}
+
+unit "Ingest endpoint without pipeline" {
+	given "a router with nil ingester" {
+		handler := api.NewUnsafeRouterWithoutStreamAuth(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+
+		when "submitting ingest" {
+			body := `{"path":"/media/movie.mp4"}`
+			req := httptest.NewRequest("POST", "/api/ingest", strings.NewReader(body))
+			req.RemoteAddr = "127.0.0.1:4000"
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			then "returns error" {
+				expect rec.Code >= 400
+			}
+		}
+	}
+}
+
+unit "Retired admin api endpoints" {
+	given "a router with nil dependencies" {
+		handler := api.NewUnsafeRouterWithoutStreamAuth(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+
+		when "requesting legacy admin overview from loopback" {
+			req := httptest.NewRequest("GET", "/api/admin/overview", nil)
+			req.RemoteAddr = "127.0.0.1:4000"
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			then "returns not found" {
+				expect rec.Code == 404
+			}
+		}
+	}
+
+	given "a router with public middleware" {
+		handler := api.NewUnsafeRouterWithoutStreamAuth(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+
+		when "public caller requests legacy admin overview" {
+			req := httptest.NewRequest("GET", "/api/admin/overview", nil)
+			req.RemoteAddr = "198.51.100.10:4000"
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			then "returns not found" {
+				expect rec.Code == 404
+			}
+		}
+	}
+}

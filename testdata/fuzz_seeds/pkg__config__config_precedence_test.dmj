@@ -1,0 +1,208 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func writePrecedenceConfig(t *testing.T, contents string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(".", "goetrope.toml"), []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+@serial
+unit "configuration precedence preserves explicit zero values" {
+	given "a TOML layer with values for every representative field kind" {
+		dir := t.TempDir()
+		t.Chdir(dir)
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		writePrecedenceConfig(t, `
+[server]
+listen = "127.0.0.1:4100"
+
+[postgres]
+dsn_source = "env:FILE_DSN"
+
+[media]
+dirs = ["/file/media"]
+
+[discord]
+moderator_user_ids = ["100"]
+
+[auth]
+cookie_secure = true
+
+[feed]
+mode = "file-mode"
+
+[programming]
+file = "./channels.toml"
+hot_reload = true
+`)
+
+		when "higher-priority environment values are explicitly empty or false" {
+			t.Setenv("GOETROPE_LISTEN", "")
+			t.Setenv("GOETROPE_POSTGRES_DSN_SOURCE", "")
+			t.Setenv("GOETROPE_MEDIA_DIRS", "")
+			t.Setenv("GOETROPE_GOSX_MOD_DISCORD_USER_IDS", "")
+			t.Setenv("GOETROPE_AUTH_COOKIE_SECURE", "false")
+			t.Setenv("GOETROPE_FEED_MODEL", "")
+			t.Setenv("GOETROPE_PROGRAMMING_FILE", "")
+			t.Setenv("GOETROPE_PROGRAMMING_HOT_RELOAD", "false")
+			result, err := Load(LoadOptions{})
+
+			then "the environment clears strings and slices instead of reviving TOML values" {
+				expect err == nil
+				expect result.Config.Server.Listen == ""
+				expect result.Config.Postgres.DSNSource.String() == ""
+				expect len(result.Config.Media.Dirs) == 0
+				expect len(result.Config.Discord.ModeratorUserIDs) == 0
+				expect result.Config.Feed.Mode == ""
+				expect result.Config.Programming.File == ""
+			}
+
+			then "an explicit false boolean survives precedence" {
+				expect result.Config.Auth.CookieSecure != nil
+				reject *result.Config.Auth.CookieSecure
+				expect result.Config.Programming.HotReload != nil
+				reject *result.Config.Programming.HotReload
+			}
+		}
+	}
+}
+
+@serial
+unit "invalid boolean environment input is actionable" {
+	then "the loader reports the exact environment variable and field" {
+		t.Chdir(t.TempDir())
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		t.Setenv("GOETROPE_AUTH_COOKIE_SECURE", "definitely")
+		_, err := Load(LoadOptions{})
+		expect err != nil
+		expect strings.Contains(err.Error(), "GOETROPE_AUTH_COOKIE_SECURE")
+		expect strings.Contains(err.Error(), "auth.cookie_secure")
+	}
+
+	then "an explicitly blank boolean is invalid rather than treated as absent" {
+		t.Chdir(t.TempDir())
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		t.Setenv("GOETROPE_AUTH_COOKIE_SECURE", "")
+		_, err := Load(LoadOptions{})
+		expect err != nil
+		expect strings.Contains(err.Error(), "GOETROPE_AUTH_COOKIE_SECURE")
+	}
+
+	then "programming hot reload reports the exact environment variable and field" {
+		t.Chdir(t.TempDir())
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		t.Setenv("GOETROPE_PROGRAMMING_HOT_RELOAD", "later")
+		_, err := Load(LoadOptions{})
+		expect err != nil
+		expect strings.Contains(err.Error(), "GOETROPE_PROGRAMMING_HOT_RELOAD")
+		expect strings.Contains(err.Error(), "programming.hot_reload")
+	}
+}
+
+@serial
+unit "explicit flag values outrank environment values" {
+	then "empty strings and slices supplied by changed flags clear lower layers" {
+		t.Chdir(t.TempDir())
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		t.Setenv("GOETROPE_LISTEN", "127.0.0.1:4200")
+		t.Setenv("GOETROPE_POSTGRES_DSN_SOURCE", "env:ENV_DSN")
+		t.Setenv("GOETROPE_MEDIA_DIRS", "/env/media")
+		empty := ""
+		emptyDirs := []string{}
+		result, err := Load(LoadOptions{Flags: FlagOverrides{
+			Listen: &empty,
+			PostgresDSNSource: &empty,
+			MediaDirs: &emptyDirs,
+		}})
+		expect err == nil
+		expect result.Config.Server.Listen == ""
+		expect result.Config.Postgres.DSNSource.String() == ""
+		expect len(result.Config.Media.Dirs) == 0
+	}
+
+	then "source-reference flags normalize whitespace before duplicate-target validation" {
+		t.Chdir(t.TempDir())
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		master := "  env:SHARED_FLAG_SOURCE  "
+		dsn := " env:SHARED_FLAG_SOURCE "
+		result, err := Load(LoadOptions{Flags: FlagOverrides{
+			MasterKeySource: &master,
+			PostgresDSNSource: &dsn,
+		}})
+		expect err == nil
+		expect result.Config.Security.MasterKeySource.String() == "env:SHARED_FLAG_SOURCE"
+		expect result.Config.Postgres.DSNSource.String() == "env:SHARED_FLAG_SOURCE"
+		validationErr := Validate(result.Config)
+		expect validationErr != nil
+		expect strings.Contains(validationErr.Error(), "duplicates environment target")
+	}
+
+	then "invalid source-reference flags report only the flag name and safe reason" {
+		t.Chdir(t.TempDir())
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		marker := "inline:FLAG_SECRET_MARKER_72"
+		_, err := Load(LoadOptions{Flags: FlagOverrides{PostgresDSNSource: &marker}})
+		expect err != nil
+		expect strings.Contains(err.Error(), "--postgres-dsn-source")
+		reject strings.Contains(err.Error(), "FLAG_SECRET_MARKER_72")
+	}
+}
+
+@serial
+unit "explicit TOML values override defaults" {
+	then "blank strings and empty slices remain explicit" {
+		dir := t.TempDir()
+		t.Chdir(dir)
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		writePrecedenceConfig(t, `
+[server]
+listen = ""
+
+[policies]
+dir = ""
+
+[discord]
+moderator_role_ids = []
+`)
+		result, err := Load(LoadOptions{})
+		expect err == nil
+		expect result.Config.Server.Listen == ""
+		expect result.Config.Policies.Dir == ""
+		expect len(result.Config.Discord.ModeratorRoleIDs) == 0
+	}
+}
+
+@serial
+unit "programming configuration is origin-aware" {
+	then "defaults synthesize built-in channels with hot reload enabled" {
+		t.Chdir(t.TempDir())
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		result, err := Load(LoadOptions{})
+		expect err == nil
+		expect result.Config.Programming.File == ""
+		expect result.Config.Programming.HotReload != nil
+		expect *result.Config.Programming.HotReload
+		expect result.Effective(CommandConfig).Fields["programming.file"].Origin.Layer == "default"
+		expect result.Effective(CommandConfig).Fields["programming.hot_reload"].Origin.Layer == "default"
+	}
+
+	then "file paths are trimmed and environment origin is preserved" {
+		t.Chdir(t.TempDir())
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		t.Setenv("GOETROPE_PROGRAMMING_FILE", "  /etc/goetrope/programming.toml  ")
+		result, err := Load(LoadOptions{})
+		expect err == nil
+		expect result.Config.Programming.File == "/etc/goetrope/programming.toml"
+		field := result.Effective(CommandConfig).Fields["programming.file"]
+		expect field.Origin.Layer == "environment"
+		expect field.Origin.Source == "GOETROPE_PROGRAMMING_FILE"
+	}
+}

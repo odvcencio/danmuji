@@ -1,0 +1,156 @@
+package stream_test
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/odvcencio/goetrope/pkg/stream"
+)
+
+unit "MediaIndex cache" {
+	before each {
+		stream.ResetMediaIndexCache()
+	}
+
+	given "a valid MP4 file" {
+		// We can't easily create a real MP4 for unit tests, but we can
+		// verify cache key stability and hit/miss behavior by checking
+		// that the same file path returns the same pointer on second call.
+		//
+		// For now, test the cache reset and the error path.
+
+		when "loading a nonexistent file" {
+			_, err := stream.LoadMediaIndex("/nonexistent.mp4", 4.0)
+
+			then "returns an error" {
+				expect err != nil
+			}
+		}
+	}
+
+	given "default segment duration" {
+		when "segment duration is zero" {
+			_, err := stream.LoadMediaIndex("/nonexistent.mp4", 0)
+
+			then "still returns an error about stat not finding the file" {
+				expect err != nil
+			}
+		}
+
+		when "segment duration is negative" {
+			_, err := stream.LoadMediaIndex("/nonexistent.mp4", -5.0)
+
+			then "uses default and returns file error" {
+				expect err != nil
+			}
+		}
+	}
+}
+
+unit "MediaIndex cache key stability" {
+	// BUG CHECK: The cache key must be stable across calls for the same file.
+	// If the key incorporates something that changes between calls (like a
+	// value that varies per file-open rather than per file-stat), the cache
+	// will never hit.
+
+	before each {
+		stream.ResetMediaIndexCache()
+	}
+
+	given "a temp file that does not change" {
+		tmp, err := os.CreateTemp("", "cachekey-*.dat")
+		expect err == nil
+		tmpPath := tmp.Name()
+		// Write some bytes so it has a nonzero size
+		_, _ = tmp.Write([]byte("test data"))
+		tmp.Close()
+		defer os.Remove(tmpPath)
+
+		// Ensure mod time is stable (no writes between stats)
+		time.Sleep(10 * time.Millisecond)
+
+		when "stat-ing the file twice" {
+			info1, err1 := os.Stat(tmpPath)
+			expect err1 == nil
+			info2, err2 := os.Stat(tmpPath)
+			expect err2 == nil
+
+			then "mod time nanos are identical" {
+				expect info1.ModTime().UnixNano() == info2.ModTime().UnixNano()
+			}
+			then "sizes are identical" {
+				expect info1.Size() == info2.Size()
+			}
+		}
+	}
+}
+
+unit "ResetMediaIndexCache" {
+	given "a cache that has been populated" {
+		// After reset, no cached entries should remain.
+		// We can verify by checking that the reset function doesn't panic
+		// and that subsequent loads don't get stale data.
+
+		when "calling reset twice" {
+			stream.ResetMediaIndexCache()
+			stream.ResetMediaIndexCache()
+
+			then "does not panic" {
+				expect true
+			}
+		}
+	}
+
+	given "media index cache stats" {
+		when "taking a snapshot after reset" {
+			stream.ResetMediaIndexCache()
+			stats := stream.MediaIndexCacheStatsSnapshot()
+
+			then "reports bounded entry and byte capacity" {
+				expect stats.Entries == 0
+				expect stats.MaxEntries > 0
+				expect stats.EstimatedBytes == 0
+				expect stats.MaxEstimatedBytes > 0
+			}
+
+			then "starts aggregate eviction counters at zero" {
+				expect stats.Evictions == 0
+				expect stats.ExpiredEvictions == 0
+				expect stats.CapacityEvictions == 0
+				expect stats.OversizeRejects == 0
+			}
+		}
+	}
+}
+
+unit "Transcode cache segment ranges" {
+	given "cached segments after a missing prefix" {
+		tmp, err := os.CreateTemp("", "variant-contiguous-range-*.mp4")
+		expect err == nil
+		tmpPath := tmp.Name()
+		tmp.Close()
+		defer os.Remove(tmpPath)
+
+		dir, err := stream.TranscodeCacheDir(tmpPath, "h264", 1.0)
+		expect err == nil
+		err = os.MkdirAll(dir, 0o755)
+		expect err == nil
+		for i := 4; i <= 9; i++ {
+			err = os.WriteFile(filepath.Join(dir, fmt.Sprintf("seg%05d.ts", i)), []byte("not-real-ts"), 0o644)
+			expect err == nil
+		}
+
+		then "the requested range does not require earlier prefix segments" {
+			rangeReady := stream.TranscodeVariantCachedSegmentRange(tmpPath, "h264", 1.0, 4, 9, 120_000)
+			cached, total := stream.TranscodeVariantCachedSegmentRangeProgress(tmpPath, "h264", 1.0, 3, 9, 120_000)
+
+			expect rangeReady == true
+			expect stream.TranscodeVariantCachedSegmentRange(tmpPath, "h264", 1.0, 3, 9, 120_000) == false
+			expect cached == 6
+			expect total == 7
+		}
+	}
+}

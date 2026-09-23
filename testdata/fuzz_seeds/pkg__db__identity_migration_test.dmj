@@ -1,0 +1,39 @@
+package db
+
+import (
+	"strings"
+	"testing"
+)
+
+unit "identity_v1 migration contract" {
+	then "the additive migration preserves identifiers and orders Discord backfill before nullability" {
+		source, err := migrationFS.ReadFile("migrations/012_identity_v1.sql")
+		expect err == nil
+		sql := string(source)
+		expect strings.Contains(sql, "CREATE UNIQUE INDEX users_one_active_owner")
+		expect strings.Contains(sql, "WHERE role = 'owner' AND status = 'active'")
+		expect strings.Contains(sql, "INSERT INTO auth_identities (user_id, provider, subject)")
+		expect strings.Contains(sql, "VALUES (12, 'identity_v1')")
+		reject strings.Contains(sql, "UPDATE watch_history")
+		reject strings.Contains(sql, "ALTER COLUMN id")
+		backfillAt := strings.Index(sql, "INSERT INTO auth_identities")
+		dropNotNullAt := strings.Index(sql, "ALTER COLUMN discord_user_id DROP NOT NULL")
+		expect backfillAt >= 0
+		expect dropNotNullAt > backfillAt
+	}
+
+	then "every accepted identity-owned logical table is created additively" {
+		source, err := migrationFS.ReadFile("migrations/012_identity_v1.sql")
+		expect err == nil
+		sql := string(source)
+		for _, table := range []string{
+			"auth_identities", "local_credentials", "auth_sessions",
+			"auth_one_time_tokens", "room_invites", "browser_grants",
+			"worker_credentials", "security_audit",
+		} {
+			expect strings.Contains(sql, "CREATE TABLE " + table)
+		}
+		reject strings.Contains(strings.ToUpper(sql), "DROP TABLE")
+		reject strings.Contains(strings.ToUpper(sql), "DROP COLUMN")
+	}
+}

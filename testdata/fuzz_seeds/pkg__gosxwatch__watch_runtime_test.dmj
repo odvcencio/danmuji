@@ -1,0 +1,829 @@
+package gosxwatch
+
+import (
+"io"
+"net/http"
+"net/http/httptest"
+"os"
+"os/exec"
+"path/filepath"
+"strings"
+"testing"
+)
+
+unit "watch runtime subtitle controls delegate cue ownership to GoSX" {
+	runtimeBytes, err := os.ReadFile("public/watch-runtime.js")
+	expect err == nil
+	runtime := string(runtimeBytes)
+	then "writes external subtitle controls only through GoSX video signals" {
+		expect strings.Contains(runtime, "var subtitleTrackSignal = \"$video.subtitleTrack\"")
+		expect strings.Contains(runtime, "var subtitleStatusSignal = \"$video.subtitleStatus\"")
+		expect strings.Contains(runtime, "var subtitleOffsetSignal = \"$video.subtitleOffsetMs\"")
+		expect strings.Contains(runtime, "var subtitleScaleSignal = \"$video.subtitleScale\"")
+		expect strings.Contains(runtime, "var subtitleStyleSignal = \"$video.subtitleStyle\"")
+		expect strings.Contains(runtime, "writeSharedSignal(subtitleTrackSignal, nextTrack)")
+		expect strings.Contains(runtime, "writeSharedSignal(subtitleTrackSignal, \"\")")
+		expect strings.Contains(runtime, "writeSharedSignal(subtitleOffsetSignal, clampSubtitleOffsetMs(ms))")
+		expect strings.Contains(runtime, "writeSharedSignal(subtitleScaleSignal, clampSubtitleScale(value))")
+		expect strings.Contains(runtime, "writeSharedSignal(subtitleStyleSignal, clampSubtitleStyle(value))")
+		expect strings.Contains(runtime, "subscribeSharedSignal(subtitleTrackSignal")
+		expect strings.Contains(runtime, "subscribeSharedSignal(subtitleStatusSignal")
+		expect strings.Contains(runtime, "subscribeSharedSignal(subtitleOffsetSignal")
+		expect strings.Contains(runtime, "subscribeSharedSignal(subtitleScaleSignal")
+		expect strings.Contains(runtime, "subscribeSharedSignal(subtitleStyleSignal")
+	}
+	then "retains accessible external controls and track reconciliation without app cue painting" {
+		expect strings.Contains(runtime, "function rebuildSubtitleOptions(select, tracks, selected)")
+		expect strings.Contains(runtime, "function syncSubtitleControlsForItem(root, current)")
+		expect strings.Contains(runtime, "function syncVideoTrackElements(video, tracks)")
+		expect strings.Contains(runtime, "function subtitleTrackIdentity(entry)")
+		expect strings.Contains(runtime, "function subtitleOffsetLabel(ms)")
+		expect strings.Contains(runtime, "function renderSubtitleOffsetControls(controls)")
+		expect strings.Contains(runtime, "function renderSubtitlePresentationControls(controls)")
+		expect strings.Contains(runtime, "function engineSubtitleOverlayForControls(controls)")
+		expect strings.Contains(runtime, "adjustSubtitleOffsetMs(controls, -subtitleOffsetStepMs)")
+		expect strings.Contains(runtime, "adjustSubtitleOffsetMs(controls, subtitleOffsetStepMs)")
+		expect strings.Contains(runtime, "setSubtitleScale(controls, \"s\")")
+		expect strings.Contains(runtime, "setSubtitleScale(controls, \"l\")")
+		expect strings.Contains(runtime, "setSubtitleStyle(controls, \"boxed\")")
+		expect strings.Contains(runtime, "setSubtitleStyle(controls, \"minimal\")")
+	}
+	then "keeps subtitle controls mounted and honest when the current media has no tracks" {
+		expect strings.Contains(runtime, "controls.dataset.watchSubtitleLabel = \"No subtitles available\"")
+		expect strings.Contains(runtime, "rebuildSubtitleOptions(select, [], \"\")")
+		expect strings.Contains(runtime, "syncVideoTrackElements(videoForControls(controls), [])")
+		expect strings.Contains(runtime, "button.dataset.watchSubtitleState = \"unavailable\"")
+		expect strings.Contains(runtime, "button.title = \"No subtitles available\"")
+		expect strings.Contains(runtime, "select.disabled = true")
+		expect strings.Contains(runtime, "control.disabled = true")
+		reject strings.Contains(runtime, "controls.hidden = true;\n      controls.dataset.watchSubtitleTrack = \"\"")
+	}
+	then "removes Goetrope bespoke subtitle persistence fetch parsing and painter code" {
+		reject strings.Contains(runtime, "goetrope:watch-subtitles")
+		reject strings.Contains(runtime, "goetrope:watch-subtitle-track")
+		reject strings.Contains(runtime, "goetrope:watch-subtitle-offset-ms")
+		reject strings.Contains(runtime, "goetrope:watch-subtitle-scale")
+		reject strings.Contains(runtime, "goetrope:watch-subtitle-style")
+		reject strings.Contains(runtime, "function parseWebVTT")
+		reject strings.Contains(runtime, "function parseSubtitleTimestamp")
+		reject strings.Contains(runtime, "function parseBitmapCue")
+		reject strings.Contains(runtime, "function syncSubtitlePainter")
+		reject strings.Contains(runtime, "function renderSubtitleOverlay")
+		reject strings.Contains(runtime, "function activeSubtitleCuesForControls")
+		reject strings.Contains(runtime, "function prefetchBitmapSubtitleImages")
+		reject strings.Contains(runtime, "function subtitleStyleElement")
+		reject strings.Contains(runtime, "fetch(fetchSrc")
+		reject strings.Contains(runtime, "new Image()")
+	}
+	then "keeps live-edge lag and native text-track ownership inside the GoSX engine" {
+		expect strings.Contains(runtime, "var videoIsLiveSignal = \"$video.isLive\"")
+		expect strings.Contains(runtime, "var videoLiveEdgeLagSignal = \"$video.liveEdgeLag\"")
+		reject strings.Contains(runtime, "video.seekable")
+		reject strings.Contains(runtime, "textTracks[i].mode")
+		reject strings.Contains(runtime, "track.removeAttribute(\"default\")")
+	}
+}
+
+unit "watch runtime owns live DOM resources" {
+	runtimeBytes, err := os.ReadFile("public/watch-runtime.js")
+	expect err == nil
+	runtime := string(runtimeBytes)
+	then "disposes live clock timers when nodes disconnect" {
+		expect strings.Contains(runtime, "liveClockRegistry")
+		expect strings.Contains(runtime, "disposeClock")
+		expect strings.Contains(runtime, "window.clearInterval")
+		expect strings.Contains(runtime, "sweepRegistry(liveClockRegistry, disposeClock)")
+	}
+	then "unsubscribes subtitle controls when nodes disconnect" {
+		expect strings.Contains(runtime, "subtitleControlRegistry")
+		expect strings.Contains(runtime, "disposeSubtitleControls")
+		expect strings.Contains(runtime, "_watchSubtitleUnsubscribe")
+		expect strings.Contains(runtime, "sweepRegistry(subtitleControlRegistry, disposeSubtitleControls)")
+	}
+}
+
+unit "watch runtime keeps subtitle controls stable across trackless transitions" {
+	runtimeBytes, err := os.ReadFile("public/watch-runtime.js")
+	expect err == nil
+	runtime := string(runtimeBytes)
+	exportMarker := "globalThis.__watchRuntimeTest = { syncSubtitleControlsForItem: syncSubtitleControlsForItem, syncReactiveMedia: syncReactiveMedia, setupSubtitleControls: setupSubtitleControls, enableSubtitleTrack: enableSubtitleTrack, readSharedSignal: readSharedSignal, writeSharedSignal: writeSharedSignal };"
+	instrumented := strings.Replace(runtime, "\n})();\n", "\n"+exportMarker+"\n})();\n", 1)
+	expect strings.Contains(instrumented, "__watchRuntimeTest")
+	script := `const shared = { values: new Map(), subscribers: new Map(), nextID: 0 };
+function emptyList(){ return { forEach(){} }; }
+function el(tag){
+  const node = {
+    tagName: tag,
+    dataset: {},
+    attrs: {},
+    children: [],
+    options: [],
+    value: "",
+    hidden: false,
+    disabled: false,
+    isConnected: true,
+    _textContent: "",
+    classList: { toggle(){} },
+    style: {},
+    setAttribute(k, v){ this.attrs[k] = String(v); },
+    getAttribute(k){ return this.attrs[k] || ""; },
+    removeAttribute(k){ delete this.attrs[k]; },
+    appendChild(child){ child.parent = this; this.children.push(child); if (tag === "select") this.options.push(child); },
+    remove(){ if (!this.parent) return; this.parent.children = this.parent.children.filter(c => c !== this); if (this.parent.options) this.parent.options = this.parent.options.filter(c => c !== this); },
+    addEventListener(){},
+    removeEventListener(){},
+    querySelector(sel){ return this._selectors && this._selectors[sel] || null; },
+    querySelectorAll(sel){ return sel === "track" ? this.children.filter(c => c.tagName === "track") : emptyList(); },
+    closest(){ return this._closest || null; },
+    contains(node){ return node === this || this.children.some(child => child === node || (child.contains && child.contains(node))); }
+  };
+  Object.defineProperty(node, "textContent", {
+    get(){ return this._textContent; },
+    set(v){ this._textContent = String(v); if (tag === "select") { this.children = []; this.options = []; } }
+  });
+  return node;
+}
+const listeners = new Map();
+const manifestScript = el("script");
+manifestScript.id = "gosx-manifest";
+manifestScript.textContent = JSON.stringify({
+  engines: [{
+    id: "gosx-engine-0",
+    component: "GoSXVideo",
+    kind: "video",
+    props: {
+      src: "/stream/6/master.m3u8?abr=theatre&ll=1&subs=external",
+      subtitleTrack: "",
+      subtitleTracks: [{ id: "m6:en", label: "English", src: "/subtitles/6.vtt" }]
+    }
+  }]
+});
+const disposed = [];
+const bootstraps = [];
+global.window = {
+  __gosx: { sharedSignals: shared, engines: new Map() },
+  location: { href: "http://example.test/watch/1", origin: "http://example.test" },
+  addEventListener(type, fn){ listeners.set(type, fn); },
+  setInterval(fn){ return 1; },
+  clearInterval(){},
+  setTimeout(fn){ return 1; },
+  clearTimeout(){},
+  requestAnimationFrame(fn){ return 1; },
+  localStorage: { getItem(){ return ""; }, setItem(){} },
+  crypto: { getRandomValues(bytes){ bytes.fill(1); } }
+};
+global.document = {
+  readyState: "complete",
+  body: {},
+  head: { appendChild(){} },
+  documentElement: { contains(){ return true; } },
+  activeElement: null,
+  querySelectorAll(){ return emptyList(); },
+  querySelector(sel){ return sel === "#gosx-manifest" ? manifestScript : null; },
+  getElementById(id){ return id === "gosx-manifest" ? manifestScript : null; },
+  createElement(tag){ return el(tag); },
+  createTextNode(text){ const node = el("#text"); node.textContent = text; return node; },
+  addEventListener(type, fn){ listeners.set(type, fn); },
+  removeEventListener(){},
+  dispatchEvent(event){ const fn = listeners.get(event.type); if (fn) fn(event); return true; }
+};
+global.navigator = {};
+global.MutationObserver = undefined;
+global.CustomEvent = function(type, init){ this.type = type; this.detail = init && init.detail; };
+eval(require("fs").readFileSync(process.argv[2], "utf8"));
+const api = global.__watchRuntimeTest;
+const button = el("button");
+const select = el("select");
+const offset = el("div");
+const size = el("div");
+const style = el("div");
+["down","up","reset"].forEach(name => offset._selectors = Object.assign(offset._selectors || {}, { ["[data-watch-subtitle-offset-" + name + "]"]: el("button") }));
+offset._selectors["[data-watch-subtitle-offset-value]"] = el("span");
+["s","m","l"].forEach(name => size._selectors = Object.assign(size._selectors || {}, { ["[data-watch-subtitle-size-" + name + "]"]: el("button") }));
+["classic","boxed","minimal"].forEach(name => style._selectors = Object.assign(style._selectors || {}, { ["[data-watch-subtitle-style-" + name + "]"]: el("button") }));
+const video = el("video");
+const overlay = el("div");
+const shell = el("section");
+shell.querySelector = function(sel){ return sel === "video" ? video : (sel === ".gosx-video-subtitle-overlay" ? overlay : null); };
+shell.appendChild(video);
+window.__gosx.engines.set("gosx-engine-0", { kind: "video", component: "GoSXVideo", mount: shell });
+window.__gosx_dispose_engine = function(id){
+  disposed.push(id);
+  window.__gosx.engines.delete(id);
+};
+window.__gosx_bootstrap_page = function(reuseIDs){
+  bootstraps.push(reuseIDs);
+  window.__gosx.engines.set("gosx-engine-0", { kind: "video", component: "GoSXVideo", mount: shell });
+  return Promise.resolve();
+};
+const controls = el("div");
+controls._closest = shell;
+controls._selectors = {
+  "[data-watch-subtitle-toggle]": button,
+  "[data-watch-subtitle-select]": select,
+  "[data-watch-subtitle-offset]": offset,
+  "[data-watch-subtitle-size]": size,
+  "[data-watch-subtitle-style-picker]": style
+};
+const root = {
+  dataset: {},
+  querySelector(sel){
+    if (sel === "[data-watch-subtitle-controls]") return controls;
+    if (sel === "[data-watch-reactive-shell]") return shell;
+    return null;
+  }
+};
+api.setupSubtitleControls(controls);
+api.syncSubtitleControlsForItem(root, { media_item_id: 1, subtitle_tracks: [] });
+if (controls.hidden) throw new Error("trackless media hid subtitle controls");
+if (!button.disabled || button.attrs["aria-pressed"] !== "false") throw new Error("trackless media did not disable the button honestly");
+if (!select.disabled || select.value !== "" || video.children.length !== 0) throw new Error("trackless media left stale subtitle state");
+api.syncSubtitleControlsForItem(root, { media_item_id: 2, subtitle_tracks: [{ id: "en", label: "English", src: "/subtitles/2.vtt" }] });
+if (button.disabled || select.disabled) throw new Error("track-bearing media did not re-enable controls");
+if (select.options.length !== 2 || select.options[1].value !== "m2:en" || video.children.length !== 1) throw new Error("track-bearing media did not rebuild scoped track options/elements");
+api.writeSharedSignal("$video.subtitleTrack", "m2:en");
+api.syncSubtitleControlsForItem(root, { media_item_id: 2 });
+if (button.disabled || select.disabled || video.children.length !== 1) throw new Error("same-media partial payload cleared subtitle controls");
+api.syncSubtitleControlsForItem(root, { media_item_id: 3, subtitle_tracks: null });
+if (!button.disabled || !select.disabled || video.children.length !== 0) throw new Error("trackless null-payload transition left controls enabled or stale tracks");
+if (api.readSharedSignal("$video.subtitleTrack", "stale") !== "") throw new Error("null-payload trackless transition did not clear selected subtitle signal");
+api.syncSubtitleControlsForItem(root, { media_item_id: 4, subtitle_tracks: [{ id: "en", label: "English", src: "/subtitles/4.vtt" }] });
+if (button.disabled || select.disabled || video.children.length !== 1) throw new Error("track-bearing media did not recover after a null-payload trackless transition");
+api.writeSharedSignal("$video.subtitleTrack", "m4:en");
+api.syncSubtitleControlsForItem(root, { media_item_id: 5 });
+if (!button.disabled || !select.disabled || video.children.length !== 0) throw new Error("missing-payload trackless transition left controls enabled or stale tracks");
+if (api.readSharedSignal("$video.subtitleTrack", "stale") !== "") throw new Error("missing-payload trackless transition did not clear selected subtitle signal");
+api.syncReactiveMedia(root, { current_item: { media_item_id: 6, src: "/stream/6/master.m3u8?abr=theatre&ll=1&subs=external", subtitle_tracks: [{ id: "en", label: "English", src: "/subtitles/6.vtt" }], audio_tracks: [] }, playing: true, current_position_secs: 9 });
+api.enableSubtitleTrack(controls, "m6:en");
+if (api.readSharedSignal("$video.src", "") === "" || video.children.length !== 1) throw new Error("track-bearing reactive media did not prime source and subtitles");
+if (api.readSharedSignal("$video.subtitleTrack", "") !== "m6:en") throw new Error("reactive media did not enable the scoped subtitle signal");
+api.syncReactiveMedia(root, { current_item: { media_item_id: 7, src: "/stream/7/master.m3u8?abr=theatre&ll=1&subs=external", subtitle_tracks: [{ id: "en", label: "English", src: "/subtitles/7.vtt" }], audio_tracks: [] }, playing: true, current_position_secs: 3 });
+let manifest = JSON.parse(manifestScript.textContent);
+let props = manifest.engines[0].props;
+if (api.readSharedSignal("$video.subtitleTrack", "stale") !== "") throw new Error("same-id rollover did not clear selected subtitle signal");
+if (select.options.length !== 2 || select.options[1].value !== "m7:en") throw new Error("same-id rollover did not scope the new option to media 7");
+if (video.children.length !== 1 || video.children[0].src !== "/subtitles/7.vtt" || video.children[0].dataset.watchSubtitleId !== "m7:en" || video.children[0].dataset.watchSubtitleMediaId !== "7") throw new Error("same-id rollover left stale subtitle track DOM");
+if (props.subtitleTrack !== "" || props.subtitleTracks.length !== 1 || props.subtitleTracks[0].id !== "m7:en" || props.subtitleTracks[0].src !== "/subtitles/7.vtt" || !props.src.includes("/stream/7/master.m3u8")) throw new Error("same-id rollover did not refresh the GoSX video manifest");
+if (disposed.length === 0 || bootstraps.length === 0 || !(bootstraps[bootstraps.length - 1] instanceof Set)) throw new Error("same-id rollover did not remount the GoSX video engine with reusable ids");
+api.enableSubtitleTrack(controls, "m7:en");
+if (api.readSharedSignal("$video.subtitleTrack", "") !== "m7:en") throw new Error("same-id rollover selected the stale media subtitle id");
+api.syncReactiveMedia(root, { current_item: { media_item_id: 8, src: "/stream/8/master.m3u8?abr=theatre&ll=1&subs=external", subtitle_tracks: [{ id: "spa", label: "Spanish", src: "/subtitles/8.vtt" }], audio_tracks: [] }, playing: true, current_position_secs: 4 });
+manifest = JSON.parse(manifestScript.textContent);
+props = manifest.engines[0].props;
+if (api.readSharedSignal("$video.subtitleTrack", "stale") !== "") throw new Error("different-id rollover did not clear selected subtitle signal");
+if (select.options.length !== 2 || select.options[1].value !== "m8:spa") throw new Error("different-id rollover did not scope the new option to media 8");
+if (video.children.length !== 1 || video.children[0].src !== "/subtitles/8.vtt" || video.children[0].dataset.watchSubtitleId !== "m8:spa") throw new Error("different-id rollover left stale subtitle track DOM");
+if (props.subtitleTracks.length !== 1 || props.subtitleTracks[0].id !== "m8:spa" || props.subtitleTracks[0].src !== "/subtitles/8.vtt" || !props.src.includes("/stream/8/master.m3u8")) throw new Error("different-id rollover did not refresh the GoSX video manifest");
+api.syncReactiveMedia(root, { current_item: null, playlist_entries: [], current_item_index: 0, playing: false });
+if (api.readSharedSignal("$video.src", "stale") !== "") throw new Error("no-current transition did not clear video src signal");
+if (api.readSharedSignal("$video.subtitleTrack", "stale") !== "") throw new Error("no-current transition did not clear subtitle signal");
+if (video.children.length !== 0 || video.dataset.watchRequestedSrc || video.dataset.watchAttachedSrc || video.dataset.watchSubtitleTrack !== "") throw new Error("no-current transition left stale video/subtitle DOM state");
+if (!button.disabled || !select.disabled || root.dataset.watchReactiveMediaId !== "" || root._watchReactiveSourcePrimed) throw new Error("no-current transition did not reset controls and reactive media bookkeeping");`
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "watch-subtitle-transition-test.js")
+	writeErr := os.WriteFile(scriptPath, []byte(script), 0o600)
+	expect writeErr == nil
+	runtimePath := filepath.Join(dir, "watch-runtime.instrumented.js")
+	writeRuntimeErr := os.WriteFile(runtimePath, []byte(instrumented), 0o600)
+	expect writeRuntimeErr == nil
+	cmd := exec.Command("node", scriptPath, runtimePath)
+	cmd.Env = os.Environ()
+	output, runErr := cmd.CombinedOutput()
+	if runErr != nil {
+		t.Fatalf("node harness failed: %v\n%s", runErr, string(output))
+	}
+	then "keeps the subtitle control mounted disabled re-enabled and cleared again" {
+		expect runErr == nil
+	}
+}
+
+unit "watch runtime keeps GoSX pages reactive" {
+	runtimeBytes, err := os.ReadFile("public/watch-runtime.js")
+	expect err == nil
+	runtime := string(runtimeBytes)
+	then "polls and disposes page reactive roots" {
+		expect strings.Contains(runtime, "reactivePageRegistry")
+		expect strings.Contains(runtime, "function setupReactivePage(root)")
+		expect strings.Contains(runtime, "document.querySelectorAll(\"[data-watch-reactive]\").forEach(setupReactivePage)")
+		expect strings.Contains(runtime, "sweepRegistry(reactivePageRegistry, disposeReactivePage)")
+	}
+	then "auto-binds controls inserted after initial load" {
+		expect strings.Contains(runtime, "var bootFrame = 0")
+		expect strings.Contains(runtime, "var bootObserver = null")
+		expect strings.Contains(runtime, "function scheduleBoot()")
+		expect strings.Contains(runtime, "new MutationObserver")
+		expect strings.Contains(runtime, "bootObserver.observe(document.body, { childList: true, subtree: true })")
+		expect strings.Contains(runtime, "window.addEventListener(\"pageshow\", boot)")
+	}
+	then "nudges autoplay with a muted fallback for restrictive browsers" {
+		expect strings.Contains(runtime, "var autoplayVideoRegistry = []")
+		expect strings.Contains(runtime, "function attemptAutoplayVideo(video, mutedFallback)")
+		expect strings.Contains(runtime, "video.play()")
+		expect strings.Contains(runtime, "video.setAttribute(\"autoplay\", \"\")")
+		expect strings.Contains(runtime, "video.muted = true")
+		expect strings.Contains(runtime, "video.muted ? \"muted\" : \"playing\"")
+		expect strings.Contains(runtime, "data-watch-audio-unmute")
+		expect strings.Contains(runtime, "dataset.watchAudioMuted")
+		expect strings.Contains(runtime, "function syncAudioUnmuteButtons(video)")
+		expect strings.Contains(runtime, "document.querySelectorAll(\"video[autoplay], video.player-video\").forEach(setupAutoplayVideo)")
+		expect strings.Contains(runtime, "sweepRegistry(autoplayVideoRegistry, disposeAutoplayVideo)")
+	}
+	then "keeps channel playback non-pausable from the video surface" {
+		expect strings.Contains(runtime, "function enforceChannelVideo(video)")
+		expect strings.Contains(runtime, "video.controls = false")
+		expect strings.Contains(runtime, "video.removeAttribute(\"controls\")")
+		expect strings.Contains(runtime, "function channelVideoShouldPlay(video)")
+		expect strings.Contains(runtime, "video.addEventListener(\"pause\", video._watchChannelPauseListener)")
+		reject strings.Contains(runtime, "_watchChannelInputBlocker")
+	}
+	then "recovers stalled playback without a page refresh" {
+		expect strings.Contains(runtime, "function scheduleVideoRecovery(video, reason)")
+		expect strings.Contains(runtime, "video.addEventListener(\"waiting\", video._watchRecoveryWaitingListener)")
+		expect strings.Contains(runtime, "video.addEventListener(\"stalled\", video._watchRecoveryStalledListener)")
+		expect strings.Contains(runtime, "video.addEventListener(\"error\", video._watchRecoveryErrorListener)")
+		expect strings.Contains(runtime, "function generatedMediaSource(value)")
+		expect strings.Contains(runtime, "/^blob:/i.test(src)")
+		expect strings.Contains(runtime, "function canonicalMediaSource(value)")
+		expect strings.Contains(runtime, "function firstCanonicalMediaSource(values)")
+		expect strings.Contains(runtime, "audioControls && audioControls.dataset.watchAudioSrc")
+		expect strings.Contains(runtime, "function reloadVideoSource(video)")
+		expect strings.Contains(runtime, "var videoMetadataRecoveryDelayMs = 12000")
+		expect strings.Contains(runtime, "sourceWithAudioTrack(src, sourceTrack, recoveryPositionForVideo(video))")
+		expect strings.Contains(runtime, "writeSharedSignal(videoSrcSignal, next)")
+	}
+	then "switches audio tracks through the GoSX video source signal" {
+		expect strings.Contains(runtime, "var audioControlRegistry = []")
+		expect strings.Contains(runtime, "var videoSrcSignal = \"$video.src\"")
+		expect strings.Contains(runtime, "function setupAudioControls")
+		expect strings.Contains(runtime, "controls.closest(\"[data-watch-reactive]\")")
+		expect strings.Contains(runtime, "function sourceWithAudioTrack(src, trackID, position)")
+		expect strings.Contains(runtime, "src = canonicalMediaSource(src)")
+		expect strings.Contains(runtime, "writeSharedSignal(videoSrcSignal, src)")
+		expect strings.Contains(runtime, "document.querySelectorAll(\"[data-watch-audio-controls]\").forEach(setupAudioControls)")
+		expect strings.Contains(runtime, "sweepRegistry(audioControlRegistry, disposeAudioControls)")
+	}
+	then "persists the selected audio track through the GoSX engine signal instead of a bespoke localStorage key" {
+		expect strings.Contains(runtime, "var audioTrackSignal = \"$video.audioTrack\"")
+		expect strings.Contains(runtime, "readSharedSignal(audioTrackSignal, \"\")")
+		expect strings.Contains(runtime, "writeSharedSignal(audioTrackSignal, selected)")
+		reject strings.Contains(runtime, "audioTrackKey")
+	}
+	then "wires the quality picker, volume slider, and viewer-count chip to the GoSX video engine" {
+		expect strings.Contains(runtime, "var videoQualityLevelsSignal = \"$video.qualityLevels\"")
+		expect strings.Contains(runtime, "var videoQualityLevelSignal = \"$video.qualityLevel\"")
+		expect strings.Contains(runtime, "var videoVolumeSignal = \"$video.volume\"")
+		expect strings.Contains(runtime, "var videoViewerCountSignal = \"$video.viewerCount\"")
+		expect strings.Contains(runtime, "function setupHUDControls(controls)")
+		expect strings.Contains(runtime, "function currentFullscreenElement()")
+		expect strings.Contains(runtime, "document.webkitFullscreenElement")
+		expect strings.Contains(runtime, "function requestPlayerFullscreen(target)")
+		expect strings.Contains(runtime, "target.webkitRequestFullscreen")
+		expect strings.Contains(runtime, "function exitPlayerFullscreen()")
+		expect strings.Contains(runtime, "document.webkitExitFullscreen")
+		expect strings.Contains(runtime, "function syncFullscreenToggles()")
+		expect strings.Contains(runtime, "shell.dataset.watchFullscreen = active ? \"true\" : \"false\"")
+		expect strings.Contains(runtime, "function ensureFullscreenObserver()")
+		expect strings.Contains(runtime, "webkitfullscreenchange")
+		expect strings.Contains(runtime, "function disposeHUDControls(controls)")
+		expect strings.Contains(runtime, "writeSharedSignal(videoQualityLevelSignal, toNumber(qualitySelect.value, -1))")
+		expect strings.Contains(runtime, "writeSharedSignal(videoVolumeSignal, toNumber(volumeSlider.value, 1))")
+		expect strings.Contains(runtime, "subscribeSharedSignal(videoQualityLevelsSignal")
+		expect strings.Contains(runtime, "subscribeSharedSignal(videoViewerCountSignal")
+		expect strings.Contains(runtime, "document.querySelectorAll(\"[data-watch-hud-controls]\").forEach(setupHUDControls)")
+		expect strings.Contains(runtime, "sweepRegistry(hudControlRegistry, disposeHUDControls)")
+	}
+	then "consumes theatre updates through the GoSX hub runtime" {
+		expect strings.Contains(runtime, "var watchHubHeartbeatSignal = \"$watch.theatre.heartbeat\"")
+		expect strings.Contains(runtime, "var watchHubEventSignal = \"$watch.theatre.event\"")
+		expect strings.Contains(runtime, "var watchHubBufferReadySignal = \"$watch.theatre.bufferReady\"")
+		expect strings.Contains(runtime, "function setupReactiveHub(root)")
+		expect strings.Contains(runtime, "subscribeSharedSignal(watchHubHeartbeatSignal")
+		expect strings.Contains(runtime, "subscribeSharedSignal(watchHubEventSignal")
+		expect strings.Contains(runtime, "writeSharedSignal(watchHubBufferReadySignal, { type: \"buffer_ready\" })")
+		expect strings.Contains(runtime, "function disposeReactiveHub(root)")
+		reject strings.Contains(runtime, "document.addEventListener(\"gosx:hub:event\", root._watchReactiveHubListener)")
+		reject strings.Contains(runtime, "document.removeEventListener(\"gosx:hub:event\", root._watchReactiveHubListener)")
+		reject strings.Contains(runtime, "new WebSocket(url)")
+		reject strings.Contains(runtime, "function scheduleReactiveSocketReconnect(root)")
+		reject strings.Contains(runtime, "socket.binaryType = \"arraybuffer\"")
+	}
+	then "reconciles live media source and selectors from channel summaries" {
+		expect strings.Contains(runtime, "function syncReactiveMedia(root, summary)")
+		expect strings.Contains(runtime, "function channelSourceForItem(current, position, audioTrack)")
+		expect strings.Contains(runtime, "summaryViewerPosition(summary")
+		expect strings.Contains(runtime, "writeSharedSignal(videoSrcSignal, next)")
+		expect strings.Contains(runtime, "function syncAudioControlsForItem(root, current, selected, src)")
+		expect strings.Contains(runtime, "function syncSubtitleControlsForItem(root, current)")
+		expect strings.Contains(runtime, "function syncVideoTrackElements(video, tracks)")
+		expect strings.Contains(runtime, "function scopedSubtitleTracksForMedia(mediaID, tracks)")
+		expect strings.Contains(runtime, "function syncGosxVideoSubtitleManifest(root, current, src, tracks)")
+		expect strings.Contains(runtime, "window.__gosx_dispose_engine(engineID)")
+		expect strings.Contains(runtime, "window.__gosx_bootstrap_page(reusableGosxEngineIDsExcept(engineID))")
+		expect strings.Contains(runtime, "root._watchReactiveSourcePrimed")
+	}
+	then "keeps subtitle track elements stable across token-rotated src refreshes" {
+		expect strings.Contains(runtime, "function subtitleTrackIdentity(")
+		expect strings.Contains(runtime, "subtitleTrackIdentity(existing[i]) !== subtitleTrackIdentity(")
+		expect strings.Contains(runtime, "dataset.watchSubtitleMediaId")
+		reject strings.Contains(runtime, "trimString(existing[i].getAttribute(\"src\")) !== trimString(tracks[i].src)")
+		expect strings.Contains(runtime, "subtitleTrackRebuilds")
+	}
+	then "refreshes a subtitle track src only after the browser reports a fetch error" {
+		expect strings.Contains(runtime, "function refreshSubtitleTrackSource(")
+		expect strings.Contains(runtime, "el.addEventListener(\"error\"")
+	}
+	then "renders the intermission timer into the GoSX overlay" {
+		expect strings.Contains(runtime, "function intermissionRemaining(summary)")
+		expect strings.Contains(runtime, "function intermissionCountdown(intermission)")
+		expect strings.Contains(runtime, "intermission.ends_at || intermission.endsAt")
+		expect strings.Contains(runtime, "function renderIntermissionOverlay(root, model)")
+		reject strings.Contains(runtime, "function renderIntermissionCard(root, model)")
+		expect strings.Contains(runtime, "shell.dataset.watchPlayerState = \"intermission\"")
+		expect strings.Contains(runtime, "model.intermissionRemainingLabel")
+		reject strings.Contains(runtime, "data-watch-intermission-card")
+		expect strings.Contains(runtime, "until next")
+	}
+	then "updates party queue state without a reload" {
+		expect strings.Contains(runtime, "function pageScope(root)")
+		expect strings.Contains(runtime, "root.closest(\".watch-page\")")
+		expect strings.Contains(runtime, "function summaryHasPlaylist(summary)")
+		expect strings.Contains(runtime, "No item queued")
+		expect strings.Contains(runtime, "No next item queued")
+		expect strings.Contains(runtime, "function renderQueueState(root, currentIndex)")
+		expect strings.Contains(runtime, "function renderQueueRows(root, entries)")
+		expect strings.Contains(runtime, "if (pageState.summary)")
+		expect strings.Contains(runtime, "function createQueueRow(root, index, entry)")
+		expect strings.Contains(runtime, "[data-watch-queue-row]")
+		expect strings.Contains(runtime, "queue-row--current")
+		expect strings.Contains(runtime, "Prewarming")
+	}
+	then "prefers rich theatre playlist payloads" {
+		expect strings.Contains(runtime, "summary.playlist_entries")
+		expect strings.Contains(runtime, "summary.current_item")
+		expect strings.Contains(runtime, "summary.next_item")
+		expect strings.Contains(runtime, "media_item_id")
+	}
+	then "merges websocket playlist payloads before the next poll" {
+		expect strings.Contains(runtime, "function mergeRealtimePlaylistEntries(summary, playlist)")
+		expect strings.Contains(runtime, "function setRealtimeCurrentItems(summary, currentExplicit, nextExplicit)")
+		expect strings.Contains(runtime, "function playlistEntriesNeedPoll(entries)")
+		expect strings.Contains(runtime, "richPlaylistMessage")
+		expect strings.Contains(runtime, "playlistPollNeeded")
+		expect strings.Contains(runtime, "Array.isArray(msg.playlist_entries)")
+		expect strings.Contains(runtime, "summary.current_item = playlist[index] || null")
+		expect strings.Contains(runtime, "summary.next_item = playlist[index + 1] || null")
+		expect strings.Contains(runtime, "(!playlistPayloadSeen || playlistPollNeeded)")
+	}
+	then "leaves watch-party action forms as native POST redirects" {
+		reject strings.Contains(runtime, "function setupActionForm(form)")
+		reject strings.Contains(runtime, "function submitActionForm(form")
+		reject strings.Contains(runtime, "data-watch-action-form")
+		reject strings.Contains(runtime, "setFormPending")
+		expect strings.Contains(runtime, "function refreshReactivePages()")
+	}
+	then "wires host-only keyboard shortcuts gated on data-watch-host-shortcuts" {
+		expect strings.Contains(runtime, "function setupHostShortcuts(controls)")
+		expect strings.Contains(runtime, "function disposeHostShortcuts(controls)")
+		expect strings.Contains(runtime, "document.querySelectorAll(\"[data-watch-host-shortcuts]\").forEach(setupHostShortcuts)")
+		expect strings.Contains(runtime, "sweepRegistry(hostShortcutsRegistry, disposeHostShortcuts)")
+		expect strings.Contains(runtime, "document.addEventListener(\"keydown\", controls._watchHostShortcutsListener, true)")
+		expect strings.Contains(runtime, "key === \" \" || key === \"Spacebar\"")
+		expect strings.Contains(runtime, "key === \"ArrowLeft\" || key === \"ArrowRight\"")
+		expect strings.Contains(runtime, "var delta = event.shiftKey ? 30 : 10")
+		expect strings.Contains(runtime, "function hostShortcutsTargetsEditableField(target)")
+		expect strings.Contains(runtime, "target.closest(\"button, a, input, textarea, select, summary")
+		expect strings.Contains(runtime, "[role=\\\"button\\\"]")
+		expect strings.Contains(runtime, "[tabindex]:not([tabindex=\\\"-1\\\"])")
+	}
+}
+
+unit "watch runtime consumes each GoSX hub message once through shared signals" {
+	runtimeBytes, err := os.ReadFile("public/watch-runtime.js")
+	expect err == nil
+	runtime := string(runtimeBytes)
+	exportMarker := "globalThis.__watchRuntimeTest = { setupReactiveHub: setupReactiveHub, disposeReactiveHub: disposeReactiveHub, writeSharedSignal: writeSharedSignal };"
+	instrumented := strings.Replace(runtime, "\n})();\n", "\n"+exportMarker+"\n})();\n", 1)
+	expect strings.Contains(instrumented, "__watchRuntimeTest")
+	script := `const shared = { values: new Map(), subscribers: new Map(), nextID: 0 };
+const listeners = new Map();
+function emptyList(){ return { forEach(){} }; }
+global.window = {
+  __gosx: { sharedSignals: shared },
+  location: { href: "http://example.test/watch/1", origin: "http://example.test" },
+  addEventListener(type, fn){ listeners.set(type, fn); },
+  setInterval(fn){ return 1; },
+  clearInterval(){},
+  setTimeout(fn){ return 1; },
+  clearTimeout(){},
+  requestAnimationFrame(fn){ return 1; },
+  localStorage: { getItem(){ return ""; }, setItem(){} },
+  crypto: { getRandomValues(bytes){ bytes.fill(1); } },
+  fetch(){ return Promise.reject(new Error("unexpected fetch")); }
+};
+global.document = {
+  readyState: "complete",
+  body: {},
+  head: { appendChild(){} },
+  documentElement: { contains(){ return true; } },
+  activeElement: null,
+  querySelectorAll(){ return emptyList(); },
+  querySelector(){ return null; },
+  createElement(){ return { setAttribute(){}, appendChild(){}, classList: { toggle(){} }, dataset: {}, style: {}, addEventListener(){}, removeEventListener(){}, textContent: "" }; },
+  createTextNode(text){ return { textContent: text }; },
+  addEventListener(type, fn){ listeners.set(type, fn); },
+  removeEventListener(){},
+  dispatchEvent(event){ const fn = listeners.get(event.type); if (fn) fn(event); return true; }
+};
+global.navigator = {};
+global.MutationObserver = undefined;
+global.CustomEvent = function(type, init){ this.type = type; this.detail = init && init.detail; };
+eval(require("fs").readFileSync(process.argv[2], "utf8"));
+const api = global.__watchRuntimeTest;
+const root = {
+  _watchReactivePage: { summary: {} },
+  closest(){ return this; },
+  querySelectorAll(){ return emptyList(); },
+  querySelector(){ return null; },
+  dataset: {}
+};
+global.window.__gosx_set_shared_signal = function(name, payload){
+  shared.values.set(name, payload);
+  const subscribers = shared.subscribers.get(name);
+  if (subscribers) subscribers.forEach(fn => fn(JSON.parse(payload)));
+  return "";
+};
+api.setupReactiveHub(root);
+api.writeSharedSignal("$watch.theatre.event", { type: "sync_play", position: 12, playing: true });
+document.dispatchEvent(new CustomEvent("gosx:hub:event", { detail: { hubName: "goetrope-watch", event: "sync_play", data: { position: 34, playing: true } } }));
+if (root._watchReactivePage.summary.current_position_secs !== 12) {
+  throw new Error("expected shared-signal dispatch to leave position 12, got " + root._watchReactivePage.summary.current_position_secs);
+}
+api.disposeReactiveHub(root);
+api.writeSharedSignal("$watch.theatre.event", { type: "sync_play", position: 56, playing: true });
+if (root._watchReactivePage.summary.current_position_secs !== 12) {
+  throw new Error("disposed hub subscriber still received messages: " + root._watchReactivePage.summary.current_position_secs);
+}
+api.writeSharedSignal("$watch.theatre.bufferReady", { type: "buffer_ready" });
+if (JSON.parse(shared.values.get("$watch.theatre.bufferReady")).type !== "buffer_ready") {
+  throw new Error("buffer_ready outbound signal was not written");
+}`
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "watch-hub-runtime-test.js")
+	writeErr := os.WriteFile(scriptPath, []byte(script), 0o600)
+	expect writeErr == nil
+	runtimePath := filepath.Join(dir, "watch-runtime.instrumented.js")
+	writeRuntimeErr := os.WriteFile(runtimePath, []byte(instrumented), 0o600)
+	expect writeRuntimeErr == nil
+	cmd := exec.Command("node", scriptPath, runtimePath)
+	cmd.Env = os.Environ()
+	output, runErr := cmd.CombinedOutput()
+	if runErr != nil {
+		t.Fatalf("node harness failed: %v\n%s", runErr, string(output))
+	}
+	then "applies one inbound message and can write outbound buffer readiness" {
+		expect runErr == nil
+	}
+}
+
+unit "GoSX watch and party pages expose reactive hooks" {
+	watchBytes, watchErr := os.ReadFile("app/watch/[id]/page.gsx")
+	expect watchErr == nil
+	partyBytes, partyErr := os.ReadFile("app/party/[slug]/page.gsx")
+	expect partyErr == nil
+	watchPage := string(watchBytes)
+	partyPage := string(partyBytes)
+	then "the watch page binds live labels and overlay targets" {
+		expect strings.Contains(watchPage, "data-watch-reactive-endpoint={data.room.api_href}")
+		reject strings.Contains(watchPage, "data-watch-reactive-ws=")
+		reject strings.Contains(watchPage, "<If when={data.player.has_subtitles}>")
+		expect strings.Contains(watchPage, "data-watch-reactive-media-id={data.current_item.media_item_id}")
+		expect strings.Contains(watchPage, "data-watch-reactive-intermission-active={data.intermission.active_text}")
+		expect strings.Contains(watchPage, "data-watch-intermission-overlay")
+		reject strings.Contains(watchPage, "data-watch-intermission-card")
+		expect strings.Contains(watchPage, "data-watch-overlay-count")
+		expect strings.Contains(watchPage, "data-watch-bind=\"current-title\"")
+		expect strings.Contains(watchPage, "data-watch-live-intermission-ends-at={data.intermission.ends_at_text}")
+		expect strings.Contains(watchPage, "subtitleTrack=\"\"")
+		expect !strings.Contains(watchPage, "\n\t\t\t\t\tcontrols")
+		reject strings.Contains(watchPage, "data-watch-subtitle-overlay")
+		expect strings.Contains(watchPage, "data-watch-subtitle-src={track.src}")
+		expect strings.Contains(watchPage, "data-watch-subtitle-offset")
+		expect strings.Contains(watchPage, "data-watch-subtitle-offset-down")
+		expect strings.Contains(watchPage, "data-watch-subtitle-offset-up")
+		expect strings.Contains(watchPage, "data-watch-subtitle-offset-reset")
+		expect strings.Contains(watchPage, "data-watch-subtitle-offset-value")
+		expect strings.Contains(watchPage, "data-watch-subtitle-size")
+		expect strings.Contains(watchPage, "data-watch-subtitle-size-s")
+		expect strings.Contains(watchPage, "data-watch-subtitle-size-m")
+		expect strings.Contains(watchPage, "data-watch-subtitle-size-l")
+		expect strings.Contains(watchPage, "data-watch-subtitle-style-picker")
+		expect strings.Contains(watchPage, "data-watch-subtitle-style-classic")
+		expect strings.Contains(watchPage, "data-watch-subtitle-style-boxed")
+		expect strings.Contains(watchPage, "data-watch-subtitle-style-minimal")
+		expect strings.Contains(watchPage, "data-watch-audio-unmute")
+		expect strings.Contains(watchPage, "player-hud-controls")
+		expect strings.Contains(watchPage, "data-watch-audio-controls")
+		expect strings.Contains(watchPage, "data-watch-audio-select")
+		expect strings.Contains(watchPage, "persistPrefs")
+		expect strings.Contains(watchPage, "persistKey=\"goetrope-watch\"")
+		expect strings.Contains(watchPage, "lockInput")
+		expect strings.Contains(watchPage, "data-watch-hud-controls")
+		expect strings.Contains(watchPage, "data-watch-hud-controls role=\"group\" aria-label=\"Playback options\"")
+		expect strings.Contains(watchPage, "data-watch-volume-controls role=\"group\" aria-label=\"Volume\"")
+		expect strings.Contains(watchPage, "data-watch-quality-controls role=\"group\" aria-label=\"Video quality\"")
+		expect strings.Contains(watchPage, "aria-label=\"Subtitle options\"")
+		expect strings.Contains(watchPage, "data-watch-subtitle-controls")
+		expect strings.Contains(watchPage, "data-watch-subtitle-offset role=\"group\" aria-label=\"Subtitle sync offset\"")
+		expect strings.Contains(watchPage, "data-watch-subtitle-size role=\"group\" aria-label=\"Subtitle size\"")
+		expect strings.Contains(watchPage, "data-watch-subtitle-style-picker role=\"group\" aria-label=\"Subtitle style\"")
+		expect strings.Contains(watchPage, "aria-label=\"Audio track\"")
+		expect strings.Contains(watchPage, "aria-pressed=\"false\"\n\t\t\t\t\t\ttitle=\"Full screen\"")
+		expect strings.Contains(watchPage, "data-watch-volume-slider")
+		expect strings.Contains(watchPage, "data-watch-quality-select")
+		expect strings.Contains(watchPage, "data-watch-viewer-count")
+	}
+	then "the party page binds transport, queue, and progress targets" {
+		reject strings.Contains(partyPage, "data-watch-reactive-ws=")
+		reject strings.Contains(partyPage, "data-watch-action-form")
+		reject strings.Contains(partyPage, "<If when={data.player.has_subtitles}>")
+		expect strings.Contains(partyPage, "data-watch-queue-row={props.from_index}")
+		expect strings.Contains(partyPage, "data-watch-page-progress")
+		expect strings.Contains(partyPage, "subtitleTrack=\"\"")
+		expect !strings.Contains(partyPage, "\n\t\t\t\t\t\t\tcontrols")
+		reject strings.Contains(partyPage, "data-watch-subtitle-overlay")
+		expect strings.Contains(partyPage, "data-watch-subtitle-src={track.src}")
+		expect strings.Contains(partyPage, "data-watch-subtitle-offset")
+		expect strings.Contains(partyPage, "data-watch-subtitle-offset-down")
+		expect strings.Contains(partyPage, "data-watch-subtitle-offset-up")
+		expect strings.Contains(partyPage, "data-watch-subtitle-offset-reset")
+		expect strings.Contains(partyPage, "data-watch-subtitle-offset-value")
+		expect strings.Contains(partyPage, "data-watch-subtitle-size")
+		expect strings.Contains(partyPage, "data-watch-subtitle-size-s")
+		expect strings.Contains(partyPage, "data-watch-subtitle-size-m")
+		expect strings.Contains(partyPage, "data-watch-subtitle-size-l")
+		expect strings.Contains(partyPage, "data-watch-subtitle-style-picker")
+		expect strings.Contains(partyPage, "data-watch-subtitle-style-classic")
+		expect strings.Contains(partyPage, "data-watch-subtitle-style-boxed")
+		expect strings.Contains(partyPage, "data-watch-subtitle-style-minimal")
+		expect strings.Contains(partyPage, "data-watch-audio-unmute")
+		expect strings.Contains(partyPage, "player-external-controls--party")
+		expect strings.Contains(partyPage, "player-hud-controls--party")
+		expect strings.Contains(partyPage, "data-watch-audio-controls")
+		expect strings.Contains(partyPage, "data-watch-audio-select")
+		expect strings.Contains(partyPage, "persistPrefs")
+		expect strings.Contains(partyPage, "persistKey=\"goetrope-watch\"")
+		expect strings.Contains(partyPage, "lockInput")
+		expect strings.Contains(partyPage, "data-watch-hud-controls")
+		expect strings.Contains(partyPage, "data-watch-hud-controls role=\"group\" aria-label=\"Playback options\"")
+		expect strings.Contains(partyPage, "data-watch-volume-controls role=\"group\" aria-label=\"Volume\"")
+		expect strings.Contains(partyPage, "data-watch-quality-controls role=\"group\" aria-label=\"Video quality\"")
+		expect strings.Contains(partyPage, "aria-label=\"Subtitle options\"")
+		expect strings.Contains(partyPage, "data-watch-subtitle-controls")
+		expect strings.Contains(partyPage, "data-watch-subtitle-offset role=\"group\" aria-label=\"Subtitle sync offset\"")
+		expect strings.Contains(partyPage, "data-watch-subtitle-size role=\"group\" aria-label=\"Subtitle size\"")
+		expect strings.Contains(partyPage, "data-watch-subtitle-style-picker role=\"group\" aria-label=\"Subtitle style\"")
+		expect strings.Contains(partyPage, "aria-label=\"Audio track\"")
+		expect strings.Contains(partyPage, "aria-pressed=\"false\"\n\t\t\t\t\t\t\t\ttitle=\"Full screen\"")
+		expect strings.Contains(partyPage, "data-watch-volume-slider")
+		expect strings.Contains(partyPage, "data-watch-quality-select")
+		expect strings.Contains(partyPage, "data-watch-viewer-count")
+		expect strings.Contains(partyPage, "data-watch-host-shortcuts")
+		expect strings.Contains(partyPage, "data-watch-host-token={data.manage.token}")
+		expect strings.Contains(partyPage, "data-watch-host-play-action={data.manage.play_action}")
+		expect strings.Contains(partyPage, "data-watch-host-pause-action={data.manage.pause_action}")
+		expect strings.Contains(partyPage, "data-watch-host-back-action={data.manage.back_action}")
+		expect strings.Contains(partyPage, "data-watch-host-forward-action={data.manage.forward_action}")
+	}
+}
+
+unit "GoSX watch and party routes bind theatre hub mode" {
+	goSourceFiles, globErr := filepath.Glob("*.go")
+	expect globErr == nil
+	dataSource := ""
+	for _, file := range goSourceFiles {
+		if strings.HasSuffix(file, "_test.go") {
+			continue
+		}
+		sourceBytes, sourceErr := os.ReadFile(file)
+		expect sourceErr == nil
+		dataSource += string(sourceBytes)
+	}
+	fileModuleBytes, fileModuleErr := os.ReadFile("filemodules.go")
+	expect fileModuleErr == nil
+	fileModules := string(fileModuleBytes)
+	then "adds a hub path without replacing the existing websocket and player sync paths" {
+		expect strings.Contains(dataSource, "\"websocket_path\": mountPath(videoSyncPath(playbackRoomCode, summary.WebSocketPath))")
+		expect strings.Contains(dataSource, "\"hub_path\":       mountPath(videoHubPath(playbackRoomCode, summary.WebSocketPath))")
+		expect strings.Contains(dataSource, "\"websocket_path\": mountPath(fmt.Sprintf(")
+		expect strings.Contains(dataSource, "\"hub_path\":    mountPath(videoHubPath(displayCode, \"\"))")
+		expect strings.Contains(dataSource, "\"sync_href\":            videoSyncPath(roomCode, explicitSyncPath)")
+		expect strings.Contains(dataSource, "func videoHubPath(roomCode, explicitPath string) string")
+		expect strings.Contains(dataSource, "[2]string{\"protocol\", \"gosx-hub\"}")
+	}
+	then "binds inbound theatre events and outbound buffer readiness to shared signals" {
+		expect strings.Contains(fileModules, "ctx.Runtime().BindHub(\"goetrope-watch\", hubPath")
+		expect strings.Contains(fileModules, "{Event: \"sync_heartbeat\", Signal: watchHubHeartbeatSignal}")
+		expect strings.Contains(fileModules, "{Event: \"sync_prepare\", Signal: watchHubEventSignal}")
+		expect strings.Contains(fileModules, "{Event: \"sync_play\", Signal: watchHubEventSignal}")
+		expect strings.Contains(fileModules, "{Event: \"pause\", Signal: watchHubEventSignal}")
+		expect strings.Contains(fileModules, "{Event: \"seek\", Signal: watchHubEventSignal}")
+		expect strings.Contains(fileModules, "{Event: \"playlist_update\", Signal: watchHubEventSignal}")
+		expect strings.Contains(fileModules, "{Event: \"playlist_change\", Signal: watchHubEventSignal}")
+		expect strings.Contains(fileModules, "{Event: \"buffer_ready\", Signal: watchHubBufferReadySignal, Direction: \"out\"}")
+	}
+}
+
+// setConfig/NewHandler mutate package-level global state; other danmuji
+// units (e.g. url_ingest_disabled_test.dmj) also call setConfig and auto-run
+// in parallel, so this unit must opt out of that auto-parallelization to
+// avoid racing on the shared config between NewHandler and ServeHTTP.
+@serial
+unit "GoSX watch page serves a forward-buffer hlsConfig for the live channel" {
+	mounted := newMountedLiveTheatreFixture(t)
+	req := httptest.NewRequest(http.MethodGet, DefaultBasePath+"/watch/1", nil)
+	rec := httptest.NewRecorder()
+	mounted.ServeHTTP(rec, req)
+	bodyBytes, readErr := io.ReadAll(rec.Body)
+	expect readErr == nil
+	html := string(bodyBytes)
+
+	then "holds viewers 8-16s behind the live edge instead of hls.js's near-live defaults" {
+		// The random channel runs viewers ~20s behind the produced edge
+		// (GOETROPE_RANDOM_CHANNEL_VIEWER_DELAY_SECONDS). hls.js's own
+		// defaults target only ~3s behind live, which starves the buffer
+		// and amplifies jitter into drops. This asserts the rendered
+		// engine props JSON actually carries the wider hlsConfig values
+		// (roomSnapshot in data.go), not the shared default hls map.
+		expect rec.Code == http.StatusOK
+		expect strings.Contains(html, "\"hlsConfig\": {")
+		expect strings.Contains(html, "\"lowLatencyMode\": false")
+		expect strings.Contains(html, "\"liveSyncDuration\": 8")
+		expect strings.Contains(html, "\"liveMaxLatencyDuration\": 16")
+		expect strings.Contains(html, "\"maxBufferLength\": 12")
+		expect strings.Contains(html, "\"maxMaxBufferLength\": 20")
+		expect strings.Contains(html, "\"backBufferLength\": 30")
+		expect strings.Contains(html, "\"enableWorker\": true")
+		reject strings.Contains(html, "\"hls\": {")
+	}
+	then "keeps the shared default's ABR and gap-bridging keys instead of silently reverting to hls.js defaults" {
+		// hls_config is seeded from a copy of the shared default hls map
+		// (roomSnapshot in data.go), not a from-scratch 7-key map, so
+		// these keys must survive the merge unchanged:
+		//   - capLevelToPlayerSize: hls.js defaults this to false; losing
+		//     it lets small players pull the top ABR rung and starve for
+		//     bandwidth.
+		//   - maxBufferHole: hls.js defaults this to 0.1s; losing it drops
+		//     to a value too small to bridge the 0.1-0.5s discontinuities
+		//     at 1s mpegts segment joins, so those joins stall+nudge
+		//     instead of playing through.
+		expect strings.Contains(html, "\"capLevelToPlayerSize\": true")
+		expect strings.Contains(html, "\"maxBufferHole\": 0.5")
+	}
+}
+
+unit "watch runtime emits bounded playback telemetry" {
+	runtimeBytes, err := os.ReadFile("public/watch-runtime.js")
+	expect err == nil
+	runtime := string(runtimeBytes)
+	then "correlates stall episodes without blocking recovery" {
+		expect strings.Contains(runtime, "var playbackTelemetryEndpoint = \"/api/playback/telemetry\"")
+		expect strings.Contains(runtime, "function beginPlaybackStall(video, reason)")
+		expect strings.Contains(runtime, "function endPlaybackStall(video, outcome)")
+		expect strings.Contains(runtime, "context: playbackTelemetryContext(video)")
+		expect strings.Contains(runtime, "mediaID: Math.max(0, Math.floor(toNumber(root && root.dataset.watchReactiveMediaId")
+		expect strings.Contains(runtime, "context: episode.context")
+		expect strings.Contains(runtime, "media_id: episode.mediaID")
+		expect strings.Contains(runtime, "function videoBufferAhead(video)")
+		expect strings.Contains(runtime, "function playbackErrorClass(video)")
+		expect strings.Contains(runtime, "var videoStalledSignal = \"$video.stalled\"")
+		expect strings.Contains(runtime, "scheduleVideoRecovery(video, \"engine_stalled\")")
+		expect strings.Contains(runtime, "video._watchRecoveryStalledUnsubscribe()")
+		expect strings.Contains(runtime, "emitPlaybackTelemetry(video, \"stall_start\"")
+		expect strings.Contains(runtime, "emitPlaybackTelemetry(video, \"stall_end\"")
+		expect strings.Contains(runtime, "recordPlaybackRecovery(video, \"recovery_action\", \"play_retry\"")
+		expect strings.Contains(runtime, "recordPlaybackRecovery(video, \"recovery_action\", \"source_reload\"")
+		expect strings.Contains(runtime, "episode.lastAction === \"source_reload\"")
+		reject strings.Contains(runtime, "else if (reloaded)")
+		expect strings.Contains(runtime, "keepalive: true")
+		expect strings.Contains(runtime, "credentials: \"same-origin\"")
+	}
+	then "shares one beacon-first sender between stall episodes and periodic quality samples" {
+		expect strings.Contains(runtime, "function postPlaybackTelemetry(payload)")
+		expect strings.Contains(runtime, "navigator.sendBeacon")
+		expect strings.Contains(runtime, "postPlaybackTelemetry(payload)")
+		expect strings.Contains(runtime, "var qualitySampleIntervalMs = 60000")
+		expect strings.Contains(runtime, "var qualitySampleSequence = 0")
+		expect strings.Contains(runtime, "function sendQualitySample(video)")
+		expect strings.Contains(runtime, "typeof video.getVideoPlaybackQuality !== \"function\"")
+		expect strings.Contains(runtime, "video.getVideoPlaybackQuality()")
+		expect strings.Contains(runtime, "\"quality_sample\"")
+		expect strings.Contains(runtime, "frames_decoded")
+		expect strings.Contains(runtime, "frames_dropped")
+		expect strings.Contains(runtime, "track_rebuilds: subtitleTrackRebuilds")
+		expect strings.Contains(runtime, "function telemetryMediaID(video)")
+		expect strings.Contains(runtime, "function currentRenditionName(video)")
+		expect strings.Contains(runtime, "sendQualitySample(video)")
+		expect strings.Contains(runtime, "qualitySampleIntervalMs)")
+		expect strings.Contains(runtime, "clearInterval(video._watchQualitySampleInterval)")
+	}
+}

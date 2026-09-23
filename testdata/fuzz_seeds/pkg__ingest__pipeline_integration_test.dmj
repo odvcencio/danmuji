@@ -1,0 +1,246 @@
+package ingest_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"fmt"
+	"os"
+	"testing"
+
+	"github.com/docker/go-connections/nat"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
+
+	"github.com/odvcencio/goetrope/pkg/db"
+	"github.com/odvcencio/goetrope/pkg/decision"
+	"github.com/odvcencio/goetrope/pkg/ingest"
+	"github.com/odvcencio/goetrope/pkg/library"
+)
+
+// buildMinimalMP4 creates a tiny valid MP4 with 5 video samples for pipeline testing.
+func buildMinimalMP4() []byte {
+	var buf bytes.Buffer
+	numSamples := 5
+	sampleSize := 50
+
+	ftyp := makeBox("ftyp", []byte("isom\x00\x00\x00\x00isom"))
+
+	mdatBody := make([]byte, numSamples*sampleSize)
+	for i := 0; i < numSamples; i++ {
+		off := i * sampleSize
+		binary.BigEndian.PutUint32(mdatBody[off:off+4], uint32(sampleSize-4))
+		if sampleSize > 4 {
+			mdatBody[off+4] = 0x65
+		}
+	}
+	mdat := makeBox("mdat", mdatBody)
+
+	ftypSize := len(ftyp)
+
+	avcCBody := []byte{
+		0x01, 0x64, 0x00, 0x1F, 0xFF, 0xE1,
+		0x00, 0x04, 0x67, 0x64, 0x00, 0x1F,
+		0x01, 0x00, 0x02, 0x68, 0xCE,
+	}
+	avcC := makeBox("avcC", avcCBody)
+
+	avc1Base := make([]byte, 70)
+	binary.BigEndian.PutUint16(avc1Base[24:26], 1920)
+	binary.BigEndian.PutUint16(avc1Base[26:28], 1080)
+	avc1 := makeBox("avc1", append(avc1Base, avcC...))
+
+	stsdBody := make([]byte, 8)
+	binary.BigEndian.PutUint32(stsdBody[4:8], 1)
+	stsd := makeBox("stsd", append(stsdBody, avc1...))
+
+	stszBody := make([]byte, 12+numSamples*4)
+	binary.BigEndian.PutUint32(stszBody[8:12], uint32(numSamples))
+	for i := 0; i < numSamples; i++ {
+		binary.BigEndian.PutUint32(stszBody[12+i*4:16+i*4], uint32(sampleSize))
+	}
+	stsz := makeBox("stsz", stszBody)
+
+	stcoBody := make([]byte, 12)
+	binary.BigEndian.PutUint32(stcoBody[4:8], 1)
+	stco := makeBox("stco", stcoBody)
+
+	stscBody := make([]byte, 20)
+	binary.BigEndian.PutUint32(stscBody[4:8], 1)
+	binary.BigEndian.PutUint32(stscBody[8:12], 1)
+	binary.BigEndian.PutUint32(stscBody[12:16], uint32(numSamples))
+	binary.BigEndian.PutUint32(stscBody[16:20], 1)
+	stsc := makeBox("stsc", stscBody)
+
+	sttsBody := make([]byte, 16)
+	binary.BigEndian.PutUint32(sttsBody[4:8], 1)
+	binary.BigEndian.PutUint32(sttsBody[8:12], uint32(numSamples))
+	binary.BigEndian.PutUint32(sttsBody[12:16], 3000)
+	stts := makeBox("stts", sttsBody)
+
+	stssBody := make([]byte, 12)
+	binary.BigEndian.PutUint32(stssBody[4:8], 1)
+	binary.BigEndian.PutUint32(stssBody[8:12], 1)
+	stss := makeBox("stss", stssBody)
+
+	var stblBody bytes.Buffer
+	stblBody.Write(stsd)
+	stblBody.Write(stsz)
+	stblBody.Write(stco)
+	stblBody.Write(stsc)
+	stblBody.Write(stts)
+	stblBody.Write(stss)
+	stbl := makeContainerBox("stbl", stblBody.Bytes())
+
+	mdhdBody := make([]byte, 24)
+	binary.BigEndian.PutUint32(mdhdBody[12:16], 90000)
+	binary.BigEndian.PutUint32(mdhdBody[16:20], uint32(numSamples)*3000)
+	mdhd := makeBox("mdhd", mdhdBody)
+
+	hdlrBody := make([]byte, 24)
+	copy(hdlrBody[8:12], "vide")
+	hdlr := makeBox("hdlr", hdlrBody)
+
+	minf := makeContainerBox("minf", stbl)
+
+	var mdiaBody bytes.Buffer
+	mdiaBody.Write(mdhd)
+	mdiaBody.Write(hdlr)
+	mdiaBody.Write(minf)
+	mdia := makeContainerBox("mdia", mdiaBody.Bytes())
+	trak := makeContainerBox("trak", mdia)
+	moov := makeContainerBox("moov", trak)
+
+	mdatOffset := uint32(ftypSize + len(moov) + 8)
+	for i := 0; i < len(moov)-12; i++ {
+		if string(moov[i+4:i+8]) == "stco" {
+			binary.BigEndian.PutUint32(moov[i+8+8:i+8+12], mdatOffset)
+			break
+		}
+	}
+
+	buf.Write(ftyp)
+	buf.Write(moov)
+	buf.Write(mdat)
+	return buf.Bytes()
+}
+
+func makeBox(boxType string, data []byte) []byte {
+	hdr := make([]byte, 8)
+	binary.BigEndian.PutUint32(hdr[0:4], uint32(8+len(data)))
+	copy(hdr[4:8], boxType)
+	return append(hdr, data...)
+}
+
+func makeContainerBox(boxType string, children []byte) []byte {
+	return makeBox(boxType, children)
+}
+
+integration "Ingest pipeline with real Postgres" {
+	before all {
+		ctx := context.Background()
+		pgReq := testcontainers.ContainerRequest{
+			Image:        "postgres:15",
+			ExposedPorts: []string{"5432/tcp"},
+			Env: map[string]string{
+				"POSTGRES_USER":     "test",
+				"POSTGRES_PASSWORD": "test",
+				"POSTGRES_DB":       "goetrope_test",
+			},
+			WaitingFor: wait.ForListeningPort(nat.Port("5432/tcp")),
+		}
+		pgContainer, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+			ContainerRequest: pgReq,
+			Started:          true,
+		})
+		if err != nil {
+			t.Fatalf("start postgres: %v", err)
+		}
+		t.Cleanup(func() { _ = pgContainer.Terminate(ctx) })
+
+		pgHost, err := pgContainer.Host(ctx)
+		if err != nil {
+			t.Fatalf("get host: %v", err)
+		}
+		pgPort, err := pgContainer.MappedPort(ctx, "5432/tcp")
+		if err != nil {
+			t.Fatalf("get port: %v", err)
+		}
+		connStr := fmt.Sprintf("postgres://test:test@%s:%s/goetrope_test?sslmode=disable", pgHost, pgPort.Port())
+
+		pool, err := pgxpool.New(ctx, connStr)
+		if err != nil {
+			t.Fatalf("connect: %v", err)
+		}
+		t.Cleanup(func() { pool.Close() })
+
+		if migErr := db.Migrate(ctx, pool); migErr != nil {
+			t.Fatalf("migrate: %v", migErr)
+		}
+
+		store := library.NewStore(pool)
+		engine, _ := decision.NewEngine("../../policies")
+		pipeline := ingest.NewPipeline(store, engine)
+	}
+
+	given "a synthetic MP4 file on disk" {
+		mp4Data := buildMinimalMP4()
+		tmp, tmpErr := os.CreateTemp("", "ingest-test-*.mp4")
+		expect tmpErr == nil
+		_, writeErr := tmp.Write(mp4Data)
+		expect writeErr == nil
+		tmpPath := tmp.Name()
+		tmp.Close()
+		defer os.Remove(tmpPath)
+
+		when "ingesting the file" {
+			item, err := pipeline.IngestPath(ctx, tmpPath)
+
+			then "succeeds" {
+				expect err == nil
+				expect item not_nil
+			}
+			then "assigns an ID" {
+				expect item.ID > 0
+			}
+			then "sets the path" {
+				expect item.Path == tmpPath
+			}
+			then "detects video stream" {
+				foundVideo := false
+				for _, s := range item.Streams {
+					if s.StreamType == "video" {
+						foundVideo = true
+					}
+				}
+				expect foundVideo
+			}
+			then "sets container type" {
+				expect item.Container == "mp4"
+			}
+		}
+
+		when "ingesting the same file twice" {
+			item1, _ := pipeline.IngestPath(ctx, tmpPath)
+			item2, err := pipeline.IngestPath(ctx, tmpPath)
+
+			then "second ingest succeeds via upsert" {
+				expect err == nil
+			}
+			then "same ID is returned" {
+				expect item1.ID == item2.ID
+			}
+		}
+	}
+
+	given "a nonexistent file" {
+		when "ingesting" {
+			_, err := pipeline.IngestPath(ctx, "/nonexistent/movie.mp4")
+
+			then "returns error" {
+				expect err != nil
+			}
+		}
+	}
+}

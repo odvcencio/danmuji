@@ -1,0 +1,100 @@
+package mp4_test
+
+import (
+	"encoding/binary"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/container/mp4"
+)
+
+unit "ParseHvcC" {
+	given "a valid hvcC structure" {
+		// Minimal hvcC: general_profile(12) + misc(9) + numArrays(1) + array header(3) + nalu_len(2) + nalu(4)
+		data := make([]byte, 23+2+4)
+		// First 22 bytes: general profile/tier/level/constraints
+		data[21] = 0xFF // 0xFC | 3 -> lengthSizeMinusOne=3
+		data[22] = 1    // numOfArrays
+		// Array entry: type=0x20 (VPS), numNalus=1
+		data[23] = 0x20
+		binary.BigEndian.PutUint16(data[24:26], 1) // numNalus
+		binary.BigEndian.PutUint16(data[26:28], 1) // naluLength
+		data[28] = 0x40                            // VPS NAL unit type byte
+
+		when "parsing" {
+			ps := mp4.ParseHvcC(data)
+
+			then "returns param sets" {
+				expect ps not_nil
+			}
+			then "extracts VPS" {
+				expect len(ps.VPS) >= 1
+			}
+		}
+	}
+
+	given "truncated hvcC" {
+		data := make([]byte, 5)
+
+		when "parsing" {
+			ps := mp4.ParseHvcC(data)
+
+			then "returns nil" {
+				expect ps == nil
+			}
+		}
+	}
+}
+
+unit "ParseAvcC edge cases" {
+	given "avcC with multiple SPS and PPS" {
+		data := []byte{
+			0x01,             // version
+			0x64, 0x00, 0x1F, // profile, compat, level
+			0xFF,             // lengthSizeMinusOne=3
+			0xE2,             // 0xE0 | 2 -> numSPS=2
+		}
+		// SPS 1: length=2
+		data = append(data, 0x00, 0x02, 0x67, 0xAA)
+		// SPS 2: length=3
+		data = append(data, 0x00, 0x03, 0x67, 0xBB, 0xCC)
+		// numPPS=2
+		data = append(data, 0x02)
+		// PPS 1: length=1
+		data = append(data, 0x00, 0x01, 0x68)
+		// PPS 2: length=2
+		data = append(data, 0x00, 0x02, 0x68, 0xDD)
+
+		when "parsing" {
+			ps := mp4.ParseAvcC(data)
+
+			then "extracts 2 SPS" {
+				expect ps not_nil
+				expect len(ps.SPS) == 2
+			}
+			then "extracts 2 PPS" {
+				expect len(ps.PPS) == 2
+			}
+		}
+	}
+
+	given "avcC with zero SPS" {
+		data := []byte{
+			0x01, 0x64, 0x00, 0x1F, 0xFF,
+			0xE0, // numSPS=0
+			0x01, // numPPS=1
+			0x00, 0x02, 0x68, 0xCE,
+		}
+
+		when "parsing" {
+			ps := mp4.ParseAvcC(data)
+
+			then "returns empty SPS" {
+				expect ps not_nil
+				expect len(ps.SPS) == 0
+			}
+			then "still extracts PPS" {
+				expect len(ps.PPS) == 1
+			}
+		}
+	}
+}

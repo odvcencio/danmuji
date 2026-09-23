@@ -1,0 +1,786 @@
+package library_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/docker/go-connections/nat"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
+
+	"github.com/odvcencio/goetrope/pkg/db"
+	"github.com/odvcencio/goetrope/pkg/library"
+)
+
+integration "Store watch history and cache stats" {
+	before all {
+		ctx := context.Background()
+		pgReq := testcontainers.ContainerRequest{
+			Image:        "postgres:15",
+			ExposedPorts: []string{"5432/tcp"},
+			Env: map[string]string{
+				"POSTGRES_USER":     "test",
+				"POSTGRES_PASSWORD": "test",
+				"POSTGRES_DB":       "goetrope_test",
+			},
+			WaitingFor: wait.ForAll(
+				wait.ForListeningPort(nat.Port("5432/tcp")),
+				wait.ForLog("database system is ready to accept connections").WithOccurrence(2),
+			).WithDeadline(2 * time.Minute),
+		}
+		pgContainer, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+			ContainerRequest: pgReq,
+			Started:          true,
+		})
+		if err != nil {
+			t.Fatalf("start postgres: %v", err)
+		}
+		t.Cleanup(func() { _ = pgContainer.Terminate(ctx) })
+
+		pgHost, err := pgContainer.Host(ctx)
+		if err != nil {
+			t.Fatalf("get host: %v", err)
+		}
+		pgPort, err := pgContainer.MappedPort(ctx, "5432/tcp")
+		if err != nil {
+			t.Fatalf("get port: %v", err)
+		}
+		connStr := fmt.Sprintf("postgres://test:test@%s:%s/goetrope_test?sslmode=disable", pgHost, pgPort.Port())
+		pool, err := pgxpool.New(ctx, connStr)
+		if err != nil {
+			t.Fatalf("connect: %v", err)
+		}
+		t.Cleanup(func() { pool.Close() })
+
+		if migErr := db.Migrate(ctx, pool); migErr != nil {
+			t.Fatalf("migrate: %v", migErr)
+		}
+
+		store := library.NewStore(pool)
+
+		// Seed a media item
+		item := &library.MediaItem{
+			Path: "/media/watch-test.mp4", Title: "Watch Test",
+			DurationMs: 7200000, Container: "mp4",
+		}
+		_ = store.UpsertItem(ctx, item)
+	}
+
+	given "a media item exists" {
+		when "recording watch progress" {
+			err := store.UpsertWatchHistory(ctx, library.WatchHistory{MediaItemID: item.ID, PositionMS: 45000, Completed: false})
+
+			then "succeeds" {
+				expect err == nil
+			}
+		}
+
+		when "getting watch history after recording" {
+			_ = store.UpsertWatchHistory(ctx, library.WatchHistory{MediaItemID: item.ID, PositionMS: 60000, Completed: false})
+			history, err := store.GetWatchHistory(ctx, item.ID)
+
+			then "succeeds" {
+				expect err == nil
+				expect history not_nil
+			}
+			then "has correct position" {
+				expect history.PositionMS == int64(60000)
+			}
+			then "is not completed" {
+				reject history.Completed
+			}
+		}
+
+		when "marking as completed" {
+			_ = store.UpsertWatchHistory(ctx, library.WatchHistory{MediaItemID: item.ID, PositionMS: 7200000, Completed: true})
+			history, _ := store.GetWatchHistory(ctx, item.ID)
+
+			then "is completed" {
+				expect history.Completed
+			}
+		}
+
+		when "listing recent watch history" {
+			_ = store.UpsertWatchHistory(ctx, library.WatchHistory{MediaItemID: item.ID, PositionMS: 120000, Completed: false})
+			items, err := store.ListWatchHistory(ctx, 10)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "returns the watched item" {
+				expect len(items) >= 1
+				expect items[0].MediaItemID == item.ID
+			}
+		}
+	}
+
+	given "no watch history exists" {
+		when "getting history for unknown item" {
+			history, err := store.GetWatchHistory(ctx, 99999)
+
+			then "returns nil without error" {
+				expect err == nil
+				expect history == nil
+			}
+		}
+	}
+
+	given "per-user identities and watch history" {
+		when "upserting a user by discord id" {
+			userID, err := store.UpsertUser(ctx, "discord-user-1", "Neo")
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "assigns a positive id" {
+				expect userID > int64(0)
+			}
+		}
+
+		when "upserting the same discord id again" {
+			firstID, _ := store.UpsertUser(ctx, "discord-user-1", "Neo")
+			secondID, err := store.UpsertUser(ctx, "discord-user-1", "Neo Anderson")
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "returns the same internal id" {
+				expect secondID == firstID
+			}
+		}
+
+		when "inspecting the authoritative Discord identity after an upsert" {
+			userID, upsertErr := store.UpsertUser(ctx, "discord-identity-v1", "Identity Viewer")
+			var identityUserID int64
+			var provider, subject string
+			identityErr := pool.QueryRow(ctx, `
+				SELECT user_id, provider, subject
+				FROM auth_identities
+				WHERE provider='discord' AND subject='discord-identity-v1'
+			`).Scan(&identityUserID, &provider, &subject)
+
+			then "the legacy column and authoritative identity resolve to one preserved internal id" {
+				expect upsertErr == nil
+				expect identityErr == nil
+				expect identityUserID == userID
+				expect provider == "discord"
+				expect subject == "discord-identity-v1"
+			}
+		}
+
+		when "concurrently upserting one Discord subject" {
+			const callers = 12
+			ids := make(chan int64, callers)
+			errs := make(chan error, callers)
+			start := make(chan struct{})
+			var wg sync.WaitGroup
+			for index := 0; index < callers; index++ {
+				wg.Add(1)
+				go func(index int) {
+					defer wg.Done()
+					<-start
+					id, err := store.UpsertUser(ctx, "discord-concurrent-identity", fmt.Sprintf("Viewer %d", index))
+					ids <- id
+					errs <- err
+				}(index)
+			}
+			close(start)
+			wg.Wait()
+			close(ids)
+			close(errs)
+			var firstID int64
+			allSame := true
+			for id := range ids {
+				if firstID == 0 {
+					firstID = id
+				}
+				allSame = allSame && id == firstID
+			}
+			allSucceeded := true
+			for err := range errs {
+				allSucceeded = allSucceeded && err == nil
+			}
+			var identityCount int
+			countErr := pool.QueryRow(ctx, `
+				SELECT COUNT(*) FROM auth_identities
+				WHERE provider='discord' AND subject='discord-concurrent-identity'
+			`).Scan(&identityCount)
+
+			then "all callers receive one user and one identity row" {
+				expect allSucceeded
+				expect allSame
+				expect firstID > int64(0)
+				expect countErr == nil
+				expect identityCount == 1
+			}
+		}
+
+		when "the legacy column conflicts with an authoritative subject mapping" {
+			var authoritativeUserID, conflictingUserID int64
+			_ = pool.QueryRow(ctx, `
+				INSERT INTO users (discord_user_id, username)
+				VALUES ('legacy-authoritative-user', 'Authoritative') RETURNING id
+			`).Scan(&authoritativeUserID)
+			_, _ = pool.Exec(ctx, `
+				INSERT INTO auth_identities (user_id, provider, subject)
+				VALUES ($1, 'discord', 'discord-conflicting-subject')
+			`, authoritativeUserID)
+			_ = pool.QueryRow(ctx, `
+				INSERT INTO users (discord_user_id, username)
+				VALUES ('discord-conflicting-subject', 'Conflicting') RETURNING id
+			`).Scan(&conflictingUserID)
+			resolvedID, err := store.UpsertUser(ctx, "discord-conflicting-subject", "Must Fail Closed")
+
+			then "the store fails closed without relinking or merging either user" {
+				expect err is library.ErrDiscordIdentityConflict
+				expect resolvedID == int64(0)
+				var mappedUserID int64
+				expect pool.QueryRow(ctx, `
+					SELECT user_id FROM auth_identities
+					WHERE provider='discord' AND subject='discord-conflicting-subject'
+				`).Scan(&mappedUserID) == nil
+				expect mappedUserID == authoritativeUserID
+				reject mappedUserID == conflictingUserID
+			}
+		}
+
+		when "one user already has a different authoritative Discord subject" {
+			var userID int64
+			_ = pool.QueryRow(ctx, `
+				INSERT INTO users (discord_user_id, username)
+				VALUES ('discord-user-provider-conflict', 'Provider Conflict') RETURNING id
+			`).Scan(&userID)
+			_, _ = pool.Exec(ctx, `
+				INSERT INTO auth_identities (user_id, provider, subject)
+				VALUES ($1, 'discord', 'different-authoritative-subject')
+			`, userID)
+			resolvedID, err := store.UpsertUser(ctx, "discord-user-provider-conflict", "Must Also Fail Closed")
+
+			then "the store fails closed without replacing the per-user provider mapping" {
+				expect err is library.ErrDiscordIdentityConflict
+				expect resolvedID == int64(0)
+				var subject string
+				expect pool.QueryRow(ctx, `
+					SELECT subject FROM auth_identities
+					WHERE user_id=$1 AND provider='discord'
+				`, userID).Scan(&subject) == nil
+				expect subject == "different-authoritative-subject"
+			}
+		}
+
+		when "a repeated identity upsert follows existing watch history" {
+			userID, firstErr := store.UpsertUser(ctx, "discord-history-preserved", "History Viewer")
+			writeErr := store.UpsertWatchHistoryForUser(ctx, userID, library.WatchHistory{MediaItemID: item.ID, PositionMS: 33333})
+			repeatedID, secondErr := store.UpsertUser(ctx, "discord-history-preserved", "History Viewer Renamed")
+			history, historyErr := store.GetWatchHistoryForUser(ctx, repeatedID, item.ID)
+
+			then "the internal id and foreign-key-owned history remain unchanged" {
+				expect firstErr == nil
+				expect writeErr == nil
+				expect secondErr == nil
+				expect repeatedID == userID
+				expect historyErr == nil
+				expect history not_nil
+				expect history.PositionMS == int64(33333)
+			}
+		}
+
+		when "looking up a user by discord id without creating one" {
+			userID, _ := store.UpsertUser(ctx, "discord-user-5", "Cypher")
+			user, err := store.GetUserByDiscordID(ctx, "discord-user-5")
+
+			then "succeeds" {
+				expect err == nil
+				expect user not_nil
+			}
+			then "matches the upserted id" {
+				expect user.ID == userID
+			}
+		}
+
+		when "looking up a user that does not exist" {
+			user, err := store.GetUserByDiscordID(ctx, "discord-user-does-not-exist")
+
+			then "returns nil without error" {
+				expect err == nil
+				expect user == nil
+			}
+		}
+
+		when "recording watch progress for a specific user" {
+			userID, _ := store.UpsertUser(ctx, "discord-user-2", "Trinity")
+			upsertErr := store.UpsertWatchHistoryForUser(ctx, userID, library.WatchHistory{MediaItemID: item.ID, PositionMS: 30000, Completed: false})
+			history, getErr := store.GetWatchHistoryForUser(ctx, userID, item.ID)
+
+			then "succeeds" {
+				expect upsertErr == nil
+				expect getErr == nil
+			}
+			then "has correct position for that user" {
+				expect history not_nil
+				expect history.PositionMS == int64(30000)
+			}
+		}
+
+		when "a different user has no watch history for the same item" {
+			otherUserID, _ := store.UpsertUser(ctx, "discord-user-3", "Morpheus")
+			history, err := store.GetWatchHistoryForUser(ctx, otherUserID, item.ID)
+
+			then "returns nil without error" {
+				expect err == nil
+				expect history == nil
+			}
+		}
+
+		when "the anonymous bucket is unaffected by per-user writes" {
+			history, err := store.GetWatchHistory(ctx, item.ID)
+
+			then "keeps its own state" {
+				expect err == nil
+				expect history not_nil
+				expect history.PositionMS == int64(120000)
+			}
+		}
+
+		when "updating watch progress for the same user and item" {
+			userID, _ := store.UpsertUser(ctx, "discord-user-4", "Tank")
+			_ = store.UpsertWatchHistoryForUser(ctx, userID, library.WatchHistory{MediaItemID: item.ID, PositionMS: 10000, Completed: false})
+			_ = store.UpsertWatchHistoryForUser(ctx, userID, library.WatchHistory{MediaItemID: item.ID, PositionMS: 50000, Completed: false})
+			history, err := store.GetWatchHistoryForUser(ctx, userID, item.ID)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "reflects the latest position, not a duplicate row" {
+				expect history not_nil
+				expect history.PositionMS == int64(50000)
+			}
+		}
+
+		when "listing history for a specific user" {
+			userID, _ := store.UpsertUser(ctx, "discord-user-2", "Trinity")
+			items, err := store.ListWatchHistoryForUser(ctx, userID, 10)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "returns only that user's item" {
+				expect len(items) == 1
+				expect items[0].MediaItemID == item.ID
+			}
+		}
+
+		when "listing continue-watching for a user with in-progress state" {
+			userID, _ := store.UpsertUser(ctx, "discord-user-2", "Trinity")
+			items, err := store.ListContinueWatchingForUser(ctx, userID, 10)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "includes the in-progress item" {
+				expect len(items) >= 1
+			}
+		}
+
+		when "marking that user's item completed removes it from continue-watching" {
+			userID, _ := store.UpsertUser(ctx, "discord-user-2", "Trinity")
+			_ = store.UpsertWatchHistoryForUser(ctx, userID, library.WatchHistory{MediaItemID: item.ID, PositionMS: 7200000, Completed: true})
+			items, err := store.ListContinueWatchingForUser(ctx, userID, 10)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "no longer lists the completed item" {
+				expect len(items) == 0
+			}
+		}
+	}
+
+	given "cache stats" {
+		when "querying with no cache entries" {
+			stats, err := store.CacheStats(ctx)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "returns zero values" {
+				expect stats.SizeBytes == int64(0)
+				expect stats.Entries == int64(0)
+			}
+		}
+	}
+
+	given "an active physical cache variant" {
+		when "the same path is refreshed with unknown zero inventory" {
+			_, _ = store.UpsertCacheVariant(ctx, library.CacheVariantRecord{
+				MediaItemID: item.ID,
+				Quality: "720p",
+				Generation: 1,
+				CachePath: "/cache/cache-ledger-source/720p-g1",
+				SegmentCount: 42,
+				SizeBytes: 9001,
+				InventoryMeta: []byte(`{"variant_kind":"ts","delivery_mode":"vod"}`),
+			})
+			refreshed, err := store.UpsertCacheVariant(ctx, library.CacheVariantRecord{
+				MediaItemID: item.ID,
+				Quality: "720p",
+				Generation: 1,
+				CachePath: "/cache/cache-ledger-source/720p-g1",
+				SegmentCount: 0,
+				SizeBytes: 0,
+			})
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "preserves known nonzero inventory" {
+				expect refreshed.SegmentCount == 42
+				expect refreshed.SizeBytes == int64(9001)
+				expect strings.Contains(string(refreshed.InventoryMeta), `"variant_kind": "ts"`)
+				expect strings.Contains(string(refreshed.InventoryMeta), `"delivery_mode": "vod"`)
+			}
+		}
+
+		when "two generations share the same media item and quality" {
+			first, firstErr := store.UpsertCacheVariant(ctx, library.CacheVariantRecord{
+				MediaItemID: item.ID,
+				Quality: "1080p",
+				Generation: 1,
+				CachePath: "/cache/cache-ledger-source/1080p-g1",
+				SegmentCount: 10,
+				SizeBytes: 1000,
+			})
+			second, secondErr := store.UpsertCacheVariant(ctx, library.CacheVariantRecord{
+				MediaItemID: item.ID,
+				Quality: "1080p",
+				Generation: 2,
+				CachePath: "/cache/cache-ledger-source/1080p-g2",
+				SegmentCount: 11,
+				SizeBytes: 2000,
+			})
+			variants, listErr := store.ListCacheVariants(ctx, library.CacheVariantListOptions{
+				MediaItemID: item.ID,
+				Quality: "1080p",
+				Limit: 10,
+			})
+			stats, statsErr := store.ActiveCacheVariantStats(ctx)
+
+			then "records both physical variants" {
+				expect firstErr == nil
+				expect secondErr == nil
+				expect listErr == nil
+				expect first.ID != second.ID
+				expect len(variants) == 2
+			}
+			then "active stats count variant rows" {
+				expect statsErr == nil
+				expect stats.Entries >= int64(2)
+				expect stats.SizeBytes >= int64(3000)
+			}
+		}
+
+		when "listing variants with a keyset cursor and an excessive limit" {
+			all, _ := store.ListCacheVariants(ctx, library.CacheVariantListOptions{Limit: 10})
+			page, err := store.ListCacheVariants(ctx, library.CacheVariantListOptions{
+				Limit: 10000,
+				AfterCachePath: all[0].CachePath,
+				AfterID: all[0].ID,
+			})
+
+			then "returns the stable next page within the maximum bound" {
+				expect err == nil
+				expect len(page) <= library.MaxCacheVariantListLimit
+				expect page[0].ID != all[0].ID
+			}
+		}
+
+		when "an existing variant receives a cheap serving touch" {
+			original, _ := store.UpsertCacheVariant(ctx, library.CacheVariantRecord{
+				MediaItemID: item.ID,
+				Quality: "touch-cheap",
+				Generation: 1,
+				CachePath: "/cache/cache-ledger-source/touch-cheap-g1",
+				SegmentCount: 14,
+				SizeBytes: 1400,
+			})
+			touchErr := store.TouchCacheVariant(ctx, item.ID, "touch-cheap", original.CachePath)
+			rows, listErr := store.ListCacheVariants(ctx, library.CacheVariantListOptions{
+				MediaItemID: item.ID,
+				Quality: "touch-cheap",
+				Limit: 1,
+			})
+
+			then "updates the serving timestamp without losing inventory" {
+				expect touchErr == nil
+				expect listErr == nil
+				expect len(rows) == 1
+				expect rows[0].SegmentCount == 14
+				expect rows[0].SizeBytes == int64(1400)
+				expect rows[0].LastServedAt != nil
+			}
+		}
+
+		when "a legacy delete wrapper sees multiple generations for one quality" {
+			_, _ = store.UpsertCacheVariant(ctx, library.CacheVariantRecord{
+				MediaItemID: item.ID,
+				Quality: "legacy-del",
+				Generation: 1,
+				CachePath: "/cache/cache-ledger-source/legacy-del-g1",
+				SegmentCount: 6,
+				SizeBytes: 600,
+			})
+			_, _ = store.UpsertCacheVariant(ctx, library.CacheVariantRecord{
+				MediaItemID: item.ID,
+				Quality: "legacy-del",
+				Generation: 2,
+				CachePath: "/cache/cache-ledger-source/legacy-del-g2",
+				SegmentCount: 7,
+				SizeBytes: 700,
+			})
+			err := store.DeleteCacheEntry(ctx, item.ID, "legacy-del")
+			rows, listErr := store.ListCacheVariants(ctx, library.CacheVariantListOptions{
+				MediaItemID: item.ID,
+				Quality: "legacy-del",
+				IncludeDeleted: true,
+				Limit: 10,
+			})
+			active := 0
+			deleted := 0
+			for _, row := range rows {
+				if row.State == "active" {
+					active++
+				}
+				if row.State == "deleted" {
+					deleted++
+				}
+			}
+
+			then "retires only one ledger row" {
+				expect err == nil
+				expect listErr == nil
+				expect active == 1
+				expect deleted == 1
+			}
+		}
+	}
+
+	given "an orphan cache variant ready for deletion" {
+		when "a worker acquires and finalizes a deletion lease" {
+			orphan, _ := store.UpsertCacheVariant(ctx, library.CacheVariantRecord{
+				MediaItemID: item.ID,
+				Quality: "480p",
+				Generation: 1,
+				CachePath: "/cache/cache-ledger-source/480p-g1",
+				SegmentCount: 5,
+				SizeBytes: 500,
+			})
+			_ = store.MarkCacheVariantOrphan(ctx, orphan.ID, time.Now().Add(-time.Minute))
+			leased, leaseErr := store.AcquireCacheVariantDeletionLease(ctx, "lease-a", time.Minute, 10)
+			wrongErr := store.FinalizeCacheVariantDeletionLease(ctx, leased[0].ID, "lease-b")
+			finalErr := store.FinalizeCacheVariantDeletionLease(ctx, leased[0].ID, "lease-a")
+			deletedRows, listErr := store.ListCacheVariants(ctx, library.CacheVariantListOptions{
+				IncludeDeleted: true,
+				AfterCachePath: leased[0].CachePath,
+				AfterID: leased[0].ID - 1,
+				Limit: 1,
+			})
+
+			then "fences finalize by the matching unexpired lease id" {
+				expect leaseErr == nil
+				expect len(leased) == 1
+				expect errors.Is(wrongErr, library.ErrCacheVariantLeaseNotHeld)
+				expect finalErr == nil
+			}
+			then "marks the variant deleted without removing the row" {
+				expect listErr == nil
+				expect len(deletedRows) == 1
+				expect deletedRows[0].State == "deleted"
+				expect deletedRows[0].DeleteState == "none"
+			}
+		}
+
+		when "a worker aborts a deletion lease" {
+			orphan, _ := store.UpsertCacheVariant(ctx, library.CacheVariantRecord{
+				MediaItemID: item.ID,
+				Quality: "360p",
+				Generation: 1,
+				CachePath: "/cache/cache-ledger-source/360p-g1",
+				SegmentCount: 4,
+				SizeBytes: 400,
+			})
+			_ = store.MarkCacheVariantMissing(ctx, orphan.CachePath, time.Now().Add(-time.Minute))
+			leased, leaseErr := store.AcquireCacheVariantDeletionLease(ctx, "lease-abort", time.Minute, 1)
+			abortErr := store.AbortCacheVariantDeletionLease(ctx, leased[0].ID, "lease-abort")
+			released, reacquireErr := store.AcquireCacheVariantDeletionLease(ctx, "lease-retry", time.Minute, 1)
+
+			then "puts the row back in planned state for retry" {
+				expect leaseErr == nil
+				expect abortErr == nil
+				expect reacquireErr == nil
+				expect len(released) == 1
+				expect released[0].ID == leased[0].ID
+				expect released[0].LeaseID == "lease-retry"
+			}
+		}
+
+		when "an immediate orphan marker is computed by the database clock" {
+			orphan, _ := store.UpsertCacheVariant(ctx, library.CacheVariantRecord{
+				MediaItemID: item.ID,
+				Quality: "db-clock-now",
+				Generation: 1,
+				CachePath: "/cache/cache-ledger-source/db-clock-now-g1",
+				SegmentCount: 4,
+				SizeBytes: 400,
+			})
+			markErr := store.MarkCacheVariantOrphanAfter(ctx, orphan.ID, orphan.LastSeenAt, 0)
+			leased, leaseErr := store.AcquireCacheVariantDeletionLeaseForVariant(ctx, orphan.ID, "lease-db-clock-now", time.Minute)
+
+			then "the row is immediately leaseable without trusting the app clock" {
+				expect markErr == nil
+				expect leaseErr == nil
+				expect leased.ID == orphan.ID
+			}
+		}
+
+		when "a future orphan marker is computed by the database clock" {
+			orphan, _ := store.UpsertCacheVariant(ctx, library.CacheVariantRecord{
+				MediaItemID: item.ID,
+				Quality: "db-clock-later",
+				Generation: 1,
+				CachePath: "/cache/cache-ledger-source/db-clock-later-g1",
+				SegmentCount: 4,
+				SizeBytes: 400,
+			})
+			markErr := store.MarkCacheVariantMissingAfter(ctx, orphan.CachePath, time.Hour)
+			_, leaseErr := store.AcquireCacheVariantDeletionLeaseForVariant(ctx, orphan.ID, "lease-db-clock-later", time.Minute)
+
+			then "the row is not leaseable before the database due time" {
+				expect markErr == nil
+				expect errors.Is(leaseErr, library.ErrCacheVariantLeaseNotHeld)
+			}
+		}
+
+		when "a touch holds the row before lease acquisition" {
+			orphan, _ := store.UpsertCacheVariant(ctx, library.CacheVariantRecord{
+				MediaItemID: item.ID,
+				Quality: "touch-first",
+				Generation: 1,
+				CachePath: "/cache/cache-ledger-source/touch-first-g1",
+				SegmentCount: 3,
+				SizeBytes: 300,
+			})
+			_ = store.MarkCacheVariantOrphan(ctx, orphan.ID, time.Now().Add(-time.Minute))
+			tx, _ := pool.Begin(ctx)
+			_, _ = tx.Exec(ctx, `SELECT id FROM transcode_cache_variants WHERE id = $1 FOR UPDATE`, orphan.ID)
+			blocked, leaseErr := store.AcquireCacheVariantDeletionLeaseForVariant(ctx, orphan.ID, "lease-blocked", time.Minute)
+			_ = tx.Rollback(ctx)
+
+			then "the skipped locked row vetoes deletion" {
+				expect errors.Is(leaseErr, library.ErrCacheVariantLeaseNotHeld)
+				expect blocked.ID == int64(0)
+			}
+		}
+
+		when "a live lease is touched by an upsert" {
+			orphan, _ := store.UpsertCacheVariant(ctx, library.CacheVariantRecord{
+				MediaItemID: item.ID,
+				Quality: "touch-during-lease",
+				Generation: 1,
+				CachePath: "/cache/cache-ledger-source/touch-during-lease-g1",
+				SegmentCount: 8,
+				SizeBytes: 800,
+			})
+			_ = store.MarkCacheVariantOrphan(ctx, orphan.ID, time.Now().Add(-time.Minute))
+			leased, _ := store.AcquireCacheVariantDeletionLeaseForVariant(ctx, orphan.ID, "lease-touch", time.Minute)
+			_, touchErr := store.UpsertCacheVariant(ctx, library.CacheVariantRecord{
+				MediaItemID: item.ID,
+				Quality: "touch-during-lease",
+				Generation: 1,
+				CachePath: leased.CachePath,
+				SegmentCount: 9,
+				SizeBytes: 900,
+			})
+			rows, listErr := store.ListCacheVariants(ctx, library.CacheVariantListOptions{
+				IncludeDeleted: true,
+				AfterCachePath: leased.CachePath,
+				AfterID: leased.ID - 1,
+				Limit: 1,
+			})
+
+			then "the touch cannot silently clear the active lease" {
+				expect errors.Is(touchErr, library.ErrCacheVariantDeletionLeased)
+				expect listErr == nil
+				expect len(rows) == 1
+				expect rows[0].DeleteState == "leased"
+				expect rows[0].LeaseID == "lease-touch"
+			}
+		}
+
+		when "a lease expires before removal revalidation" {
+			orphan, _ := store.UpsertCacheVariant(ctx, library.CacheVariantRecord{
+				MediaItemID: item.ID,
+				Quality: "expired-revalidate",
+				Generation: 1,
+				CachePath: "/cache/cache-ledger-source/expired-revalidate-g1",
+				SegmentCount: 2,
+				SizeBytes: 200,
+			})
+			_ = store.MarkCacheVariantOrphan(ctx, orphan.ID, time.Now().Add(-time.Minute))
+			leased, _ := store.AcquireCacheVariantDeletionLeaseForVariant(ctx, orphan.ID, "lease-expire", time.Minute)
+			_, _ = pool.Exec(ctx, `UPDATE transcode_cache_variants SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1`, leased.ID)
+			_, revalidateErr := store.RevalidateCacheVariantDeletionLease(ctx, leased.ID, "lease-expire", time.Minute)
+
+			then "the guard rejects the stale lease before filesystem removal" {
+				expect errors.Is(revalidateErr, library.ErrCacheVariantLeaseNotHeld)
+			}
+		}
+	}
+
+	given "count items" {
+		when "counting" {
+			count, err := store.CountItems(ctx)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "has at least 1 item" {
+				expect count >= int64(1)
+			}
+		}
+	}
+
+	given "metadata refresh state" {
+		var snapshot library.MetadataRefreshSnapshot
+		var candidates []library.MetadataRefreshCandidate
+		var queryErr error
+		var upsertErr error
+
+		when "querying candidates without artwork metadata" {
+			extraItem := &library.MediaItem{
+				Path: "/media/no-artwork.mp4", Title: "No Artwork",
+				DurationMs: 120000, Container: "mp4",
+				Metadata: &library.Metadata{
+					Source: "manual",
+					RawTitle: "No Artwork",
+					ResolvedTitle: "No Artwork",
+				},
+			}
+			upsertErr = store.UpsertItem(ctx, extraItem)
+			snapshot, queryErr = store.MetadataRefreshState(ctx)
+			candidates, queryErr = store.ListMetadataRefreshCandidates(ctx, 0, 10)
+
+			then "finds missing artwork candidates" {
+				expect upsertErr == nil
+				expect queryErr == nil
+				expect snapshot.MissingArtwork
+				expect len(candidates) >= 1
+			}
+		}
+	}
+}

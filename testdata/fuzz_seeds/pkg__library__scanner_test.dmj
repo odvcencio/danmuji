@@ -1,0 +1,70 @@
+package library
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+type scannerTestIngester struct {
+	paths []string
+}
+
+func (s *scannerTestIngester) IngestPath(ctx context.Context, path string) (*MediaItem, error) {
+	s.paths = append(s.paths, path)
+	return &MediaItem{Title: filepath.Base(path), Container: filepath.Ext(path)}, nil
+}
+
+@serial
+unit "Scanner InitialScan skips managed cache directories" {
+	root := t.TempDir()
+	realMovie := filepath.Join(root, "movies", "movie.mp4")
+	err := os.MkdirAll(filepath.Dir(realMovie), 0o755)
+	expect err == nil
+	err = os.WriteFile(realMovie, []byte("movie"), 0o644)
+	expect err == nil
+
+	managedCacheMovie := filepath.Join(root, "movies", ".goetrope", "cache", "cached.mp4")
+	err = os.MkdirAll(filepath.Dir(managedCacheMovie), 0o755)
+	expect err == nil
+	err = os.WriteFile(managedCacheMovie, []byte("cached"), 0o644)
+	expect err == nil
+
+	artifactMovie := filepath.Join(root, "movies", ".goetrope-artifacts", "artifact.mp4")
+	err = os.MkdirAll(filepath.Dir(artifactMovie), 0o755)
+	expect err == nil
+	err = os.WriteFile(artifactMovie, []byte("artifact"), 0o644)
+	expect err == nil
+
+	overrideRoot := filepath.Join(root, ".goetrope-cache")
+	t.Setenv("GOETROPE_CACHE_ROOT", overrideRoot)
+	overrideCacheMovie := filepath.Join(overrideRoot, "shadow.mp4")
+	err = os.MkdirAll(filepath.Dir(overrideCacheMovie), 0o755)
+	expect err == nil
+	err = os.WriteFile(overrideCacheMovie, []byte("shadow"), 0o644)
+	expect err == nil
+
+	artifactRoot := filepath.Join(root, "durable-artifacts")
+	t.Setenv("GOETROPE_ARTIFACT_ROOT", artifactRoot)
+	overrideArtifactMovie := filepath.Join(artifactRoot, "derived.mp4")
+	err = os.MkdirAll(filepath.Dir(overrideArtifactMovie), 0o755)
+	expect err == nil
+	err = os.WriteFile(overrideArtifactMovie, []byte("derived"), 0o644)
+	expect err == nil
+
+	ingester := &scannerTestIngester{}
+	scanner := NewScanner([]string{root}, ingester)
+
+	when "running the initial scan" {
+		err := scanner.InitialScan(context.Background())
+
+		then "succeeds" {
+			expect err == nil
+		}
+		then "indexes only the real media file" {
+			expect len(ingester.paths) == 1
+			expect ingester.paths[0] == realMovie
+		}
+	}
+}

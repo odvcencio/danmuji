@@ -1,0 +1,249 @@
+package games
+
+import (
+    "encoding/json"
+    "net/http"
+    "net/http/httptest"
+    "testing"
+)
+
+unit "Game Manager chess lifecycle" {
+    given "a mock chess API server returning e7e5" {
+        srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            w.Header().Set("Content-Type", "application/json")
+            resp := map[string]string{
+                "from": "e7",
+                "to":   "e5",
+                "san":  "e5",
+                "fen":  "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq e6 0 2",
+            }
+            _ = json.NewEncoder(w).Encode(resp)
+        }))
+        defer srv.Close()
+
+        m := newGameManagerWithChessClient(newChessFixtureClient(srv), nil)
+        createMsg := GameCreateMessage{
+            Type:     GameMsgCreate,
+            GameType: "chess",
+            Mode:     "vs_cpu",
+        }
+        state, err := m.CreateGame("room1", createMsg, "alice")
+
+        then "create succeeds" {
+            expect err == nil
+        }
+        then "initial state has FEN" {
+            expect state.FEN != ""
+        }
+        then "initial turn is white" {
+            expect state.Turn == "white"
+        }
+        then "status is waiting (no black player)" {
+            expect state.Status == "waiting"
+        }
+
+        when "alice makes move e2e4" {
+            moveMsg := GameMoveMessage{
+                Type: GameMsgMove,
+                Move: "e2e4",
+            }
+            updatedState, endMsg, moveErr := m.HandleMove("room1", "alice", moveMsg)
+
+            then "move succeeds" {
+                expect moveErr == nil
+            }
+            then "end message is nil (game not over)" {
+                expect endMsg == nil
+            }
+            then "state is not nil" {
+                expect updatedState != nil
+            }
+            then "FEN has changed (CPU also moved)" {
+                expect updatedState.FEN != state.FEN
+            }
+        }
+    }
+}
+
+unit "Game Manager yahtzee lifecycle" {
+    given "a classic yahtzee game with creator alice" {
+        m := NewGameManager("", nil)
+        createMsg := GameCreateMessage{
+            Type:     GameMsgCreate,
+            GameType: "yahtzee",
+            Mode:     "classic",
+        }
+        state, err := m.CreateGame("room2", createMsg, "alice")
+
+        then "create succeeds" {
+            expect err == nil
+        }
+        then "initial status is waiting" {
+            expect state.Status == "waiting"
+        }
+        then "alice is in the players list" {
+            expect len(state.Players) == 1
+        }
+
+        when "bob joins" {
+            joinMsg := GameJoinMessage{
+                Type: GameMsgJoin,
+            }
+            joinState, joinErr := m.JoinGame("room2", "bob", joinMsg)
+
+            then "join succeeds" {
+                expect joinErr == nil
+            }
+            then "two players now" {
+                expect len(joinState.Players) == 2
+            }
+
+            when "alice rolls" {
+                rollMsg := GameMoveMessage{
+                    Type:   GameMsgMove,
+                    Action: "roll",
+                }
+                rollState, _, rollErr := m.HandleMove("room2", "alice", rollMsg)
+
+                then "roll succeeds" {
+                    expect rollErr == nil
+                }
+                then "state is not nil" {
+                    expect rollState != nil
+                }
+                then "game is active" {
+                    expect rollState.Status == "active"
+                }
+
+                when "alice holds die 0" {
+                    holdMsg := GameMoveMessage{
+                        Type:    GameMsgMove,
+                        Action:  "hold",
+                        Indices: []int{0},
+                    }
+                    _, _, holdErr := m.HandleMove("room2", "alice", holdMsg)
+
+                    then "hold succeeds" {
+                        expect holdErr == nil
+                    }
+                }
+
+                when "alice scores chance" {
+                    scoreMsg := GameMoveMessage{
+                        Type:     GameMsgMove,
+                        Action:   "score",
+                        Category: "chance",
+                    }
+                    scoreState, _, scoreErr := m.HandleMove("room2", "alice", scoreMsg)
+
+                    then "score succeeds" {
+                        expect scoreErr == nil
+                    }
+                    then "current player advances to bob" {
+                        expect scoreState.CurrentPlayer == "bob"
+                    }
+                }
+            }
+        }
+    }
+}
+
+unit "Game Manager validation" {
+    given "a manager with an existing chess game in room3" {
+        m := NewGameManager("", nil)
+        createMsg := GameCreateMessage{
+            Type:     GameMsgCreate,
+            GameType: "chess",
+            Mode:     "classic",
+        }
+        _, _ = m.CreateGame("room3", createMsg, "alice")
+
+        when "another chess game is created in the same room" {
+            _, err := m.CreateGame("room3", createMsg, "bob")
+
+            then "duplicate creation returns error" {
+                expect err != nil
+            }
+        }
+    }
+
+    given "a manager with no games" {
+        m := NewGameManager("", nil)
+
+        when "joining a nonexistent room" {
+            joinMsg := GameJoinMessage{
+                Type: GameMsgJoin,
+            }
+            _, err := m.JoinGame("nonexistent", "alice", joinMsg)
+
+            then "join returns error" {
+                expect err != nil
+            }
+        }
+
+        when "making a move in a nonexistent room" {
+            moveMsg := GameMoveMessage{
+                Type:   GameMsgMove,
+                Action: "roll",
+            }
+            _, _, err := m.HandleMove("nonexistent", "alice", moveMsg)
+
+            then "move returns error" {
+                expect err != nil
+            }
+        }
+    }
+
+    given "a manager with a yahtzee game in room4" {
+        m := NewGameManager("", nil)
+        createMsg := GameCreateMessage{
+            Type:     GameMsgCreate,
+            GameType: "yahtzee",
+            Mode:     "classic",
+        }
+        _, _ = m.CreateGame("room4", createMsg, "alice")
+
+        when "RemoveRoom is called" {
+            m.RemoveRoom("room4")
+
+            then "GameState returns nil after removal" {
+                state := m.GameState("room4", "yahtzee")
+                expect state == nil
+            }
+        }
+    }
+}
+
+unit "Game Manager state query" {
+    given "a fresh manager" {
+        m := NewGameManager("", nil)
+
+        then "GameState returns nil for nonexistent room" {
+            state := m.GameState("nowhere", "chess")
+            expect state == nil
+        }
+    }
+
+    given "a manager with a chess game in room5" {
+        m := NewGameManager("", nil)
+        createMsg := GameCreateMessage{
+            Type:     GameMsgCreate,
+            GameType: "chess",
+            Mode:     "classic",
+        }
+        _, _ = m.CreateGame("room5", createMsg, "alice")
+
+        then "GameState returns correct state for chess" {
+            state := m.GameState("room5", "chess")
+            expect state != nil
+        }
+        then "GameState returns chess game type" {
+            state := m.GameState("room5", "chess")
+            expect state.GameType == "chess"
+        }
+        then "GameState returns nil for yahtzee in chess-only room" {
+            state := m.GameState("room5", "yahtzee")
+            expect state == nil
+        }
+    }
+}

@@ -1,0 +1,66 @@
+package auth
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"testing"
+)
+
+unit "Discord signing-key rotation" {
+	then "the service copies caller buffers and verifies a prior key" {
+		verified := discordRotationCopiesAndVerifies()
+		expect verified
+	}
+
+	then "empty verification keys cannot authenticate an empty-key HMAC" {
+		accepted := discordAcceptsEmptyKeySignature()
+		reject accepted
+	}
+
+	then "an empty active authority cannot mint a session cookie" {
+		err, cookies := discordEmptyAuthorityMint()
+		expect err is ErrDiscordSessionInvalid
+		expect cookies == 0
+	}
+}
+
+unit "room-grant signing-key boundaries" {
+	then "the service copies caller buffers and verifies a prior key" {
+		verified := roomGrantRotationCopiesAndVerifies()
+		expect verified
+	}
+
+	then "empty verification keys cannot authenticate an empty-key HMAC" {
+		accepted := roomGrantAcceptsEmptyKeySignature()
+		reject accepted
+	}
+
+	then "an empty byte authority cannot mint" {
+		minted := roomGrantEmptyAuthorityMints()
+		reject minted
+	}
+
+	then "configuration and live service render only redacted authority" {
+		activeMarker := "ROOM_ACTIVE_MARKER_47"
+		verifyMarker := "ROOM_VERIFY_MARKER_48"
+		cfg := RoomGrantConfig{Key: []byte(activeMarker), VerifyKeys: [][]byte{[]byte(verifyMarker)}}
+		service := NewRoomGrantService(cfg)
+		defer service.Close()
+		configJSON, configJSONErr := json.Marshal(cfg)
+		serviceJSON, serviceJSONErr := json.Marshal(service)
+		configRendered := fmt.Sprintf("%v %+v %#v %s", cfg, cfg, cfg, configJSON)
+		serviceRendered := fmt.Sprintf("%v %+v %#v %s", service, service, service, serviceJSON)
+		expect configJSONErr == nil
+		expect serviceJSONErr == nil
+		expect strings.Contains(configRendered, "[redacted]")
+		expect strings.Contains(serviceRendered, "[redacted]")
+		for _, rendered := range []string{configRendered, serviceRendered} {
+			reject strings.Contains(rendered, activeMarker)
+			reject strings.Contains(rendered, verifyMarker)
+			reject strings.Contains(rendered, base64.StdEncoding.EncodeToString([]byte(activeMarker)))
+			reject strings.Contains(rendered, base64.StdEncoding.EncodeToString([]byte(verifyMarker)))
+		}
+	}
+}

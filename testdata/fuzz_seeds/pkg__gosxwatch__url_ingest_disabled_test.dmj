@@ -1,0 +1,122 @@
+package gosxwatch
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/api"
+	"github.com/odvcencio/goetrope/pkg/ingest"
+	"github.com/odvcencio/goetrope/pkg/library"
+)
+
+// disabledGoSXURLIngestAdminKey is an arbitrary admin credential used only
+// to drive api.NewAdminVerifier/api.WithAdminVerifierContext in this test;
+// it verifies against no real deployment.
+const disabledGoSXURLIngestAdminKey = "gosxwatch-test-admin-key"
+
+// disabledGoSXURLIngestAdminRequest grants r the same real
+// X-Goetrope-Admin-Key admin-key verification api.HasAdminAccess consults in
+// production (see requestWithAdminAccess in handler_test.go), replacing the
+// pre-SEC-007/GAP-01 RemoteAddr=127.0.0.1 loopback shortcut this test used
+// before network position stopped being an admin-authority signal. This
+// test asserts the URL-ingest activation fence itself -- it needs
+// canManageModeratorMutations to actually grant access so the request
+// reaches handleControlIngest's fence check, not the earlier forbidden
+// branch.
+func disabledGoSXURLIngestAdminRequest(r *http.Request) *http.Request {
+	verifier := api.NewAdminVerifier([]byte(disabledGoSXURLIngestAdminKey))
+	r.Header.Set("X-Goetrope-Admin-Key", disabledGoSXURLIngestAdminKey)
+	return api.WithAdminVerifierContext(r, verifier)
+}
+
+type disabledGoSXURLIngestSpecPipeline struct {
+	pathCalls int
+	urlCalls int
+	lastSource string
+}
+
+func (p *disabledGoSXURLIngestSpecPipeline) Snapshot() ingest.PipelineSnapshot {
+	if p.lastSource == "" {
+		return ingest.PipelineSnapshot{}
+	}
+	return ingest.PipelineSnapshot{TotalIngests: 1, Recent: []ingest.IngestEvent{{Source: p.lastSource}}}
+}
+func (p *disabledGoSXURLIngestSpecPipeline) IngestPath(context.Context, string) (*library.MediaItem, error) {
+	p.pathCalls++
+	p.lastSource = "unexpected-path-source"
+	return nil, errors.New("unexpected path ingest")
+}
+func (p *disabledGoSXURLIngestSpecPipeline) IngestURL(context.Context, string) (*library.MediaItem, error) {
+	p.urlCalls++
+	p.lastSource = "unexpected-url-source"
+	return nil, errors.New("URL_MARKER_83 downstream failure")
+}
+
+func assertGoSXURLIngestUnavailable(t *testing.T, target string, forbidden ...string) {
+	t.Helper()
+	pipeline := &disabledGoSXURLIngestSpecPipeline{}
+	setConfig(Config{BasePath: DefaultBasePath, Ingest: pipeline})
+	form := "target=" + url.QueryEscape(target)
+	req := httptest.NewRequest(http.MethodPost, DefaultBasePath+"/control/ingest", strings.NewReader(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req = disabledGoSXURLIngestAdminRequest(req)
+	rec := httptest.NewRecorder()
+	handleControlIngest(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	location := rec.Header().Get("Location")
+	parsed, err := url.Parse(location)
+	if err != nil {
+		t.Fatalf("redirect parse: %v", err)
+	}
+	query := parsed.Query()
+	if query.Get("control_action") != "ingest" || query.Get("control_state") != "unavailable" || query.Get("detail") != "feature_unavailable" {
+		t.Fatalf("redirect query = %v", query)
+	}
+	if query.Get("target") != "" || pipeline.pathCalls != 0 || pipeline.urlCalls != 0 {
+		t.Fatalf("target=%q path_calls=%d url_calls=%d", query.Get("target"), pipeline.pathCalls, pipeline.urlCalls)
+	}
+	snapshot := pipeline.Snapshot()
+	if snapshot.TotalIngests != 0 || len(snapshot.Recent) != 0 {
+		t.Fatalf("rejected URL reached snapshot: %+v", snapshot)
+	}
+	for _, value := range forbidden {
+		if strings.Contains(location, value) {
+			t.Fatalf("redirect reflected %q: %s", value, location)
+		}
+	}
+}
+
+// assertGoSXURLIngestUnavailable calls setConfig to mutate package-level
+// global state (see watch_runtime_test.dmj's "GoSX watch page serves a
+// forward-buffer hlsConfig for the live channel" unit, which opts out of
+// auto-parallelization for the same reason); this unit must do the same so
+// it never races another parallel unit's setConfig/NewHandler/ServeHTTP.
+@serial
+unit "GoSX URL ingest activation fence" {
+	then "a submitted URL redirects with fixed unavailable state and never reaches the pipeline or redirect query" {
+		marker := "https://user:secret@private.example/media/item?token=URL_MARKER_83"
+		assertGoSXURLIngestUnavailable(t, marker, marker, "private.example", "URL_MARKER_83", "secret")
+	}
+
+	then "mixed-case HTTP schemes with userinfo hosts ports and queries take the same fixed fence" {
+		assertGoSXURLIngestUnavailable(t,
+			"HTTPS://user:password@private.example/media?token=MIXED_URL_MARKER_91",
+			"private.example", "user", "password", "token", "MIXED_URL_MARKER_91")
+		assertGoSXURLIngestUnavailable(t,
+			"HtTp://PRIVATE.EXAMPLE:5432/path?secret=MIXED_URL_MARKER_92",
+			"PRIVATE.EXAMPLE", "5432", "secret", "MIXED_URL_MARKER_92")
+		assertGoSXURLIngestUnavailable(t,
+			"hTTps:opaque-path?secret=MIXED_URL_MARKER_93",
+			"opaque-path", "secret", "MIXED_URL_MARKER_93")
+		assertGoSXURLIngestUnavailable(t,
+			"HTTP://[::1]:9090/internal?key=MIXED_URL_MARKER_94",
+			"9090", "internal", "MIXED_URL_MARKER_94")
+	}
+}

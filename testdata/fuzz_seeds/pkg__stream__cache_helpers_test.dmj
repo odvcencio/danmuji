@@ -1,0 +1,364 @@
+package stream_test
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/stream"
+)
+
+@serial
+unit "TranscodeCacheDir" {
+	given "a real file on disk" {
+		tmp, err := os.CreateTemp("", "cache-helpers-*.mp4")
+		expect err == nil
+		tmpPath := tmp.Name()
+		tmp.Close()
+		defer os.Remove(tmpPath)
+
+		when "calling TranscodeCacheDir" {
+			dir, err := stream.TranscodeCacheDir(tmpPath, "h264-1080p", 4.0)
+
+			then "succeeds without error" {
+				expect err == nil
+			}
+			then "returns a non-empty path" {
+				expect dir != ""
+			}
+			then "path is under .goetrope/cache" {
+				expect strings.Contains(dir, ".goetrope")
+				expect strings.Contains(dir, "cache")
+			}
+			then "path ends with quality" {
+				expect strings.HasSuffix(dir, "h264-1080p")
+			}
+			then "path is under the file's directory" {
+				expect strings.HasPrefix(dir, filepath.Dir(tmpPath))
+			}
+		}
+
+		when "calling TranscodeCacheDir with empty quality" {
+			dir, err := stream.TranscodeCacheDir(tmpPath, "", 4.0)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "defaults quality to original" {
+				expect strings.HasSuffix(dir, "original")
+			}
+		}
+
+		when "calling TranscodeCacheDir with different segment durations" {
+			dir4, err4 := stream.TranscodeCacheDir(tmpPath, "h264-1080p", 4.0)
+			dir6, err6 := stream.TranscodeCacheDir(tmpPath, "h264-1080p", 6.0)
+
+			then "both succeed" {
+				expect err4 == nil
+				expect err6 == nil
+			}
+			then "different durations produce different cache dirs" {
+				expect dir4 != dir6
+			}
+		}
+	}
+
+	given "a nonexistent file" {
+		when "calling TranscodeCacheDir" {
+			_, err := stream.TranscodeCacheDir("/nonexistent/path/movie.mp4", "h264-1080p", 4.0)
+
+			then "returns an error" {
+				expect err != nil
+			}
+		}
+	}
+
+	given "two files with the same basename in different directories" {
+		root := t.TempDir()
+		dirA := filepath.Join(root, "a")
+		dirB := filepath.Join(root, "b")
+		err := os.MkdirAll(dirA, 0o755)
+		expect err == nil
+		err = os.MkdirAll(dirB, 0o755)
+		expect err == nil
+		pathA := filepath.Join(dirA, "movie.mp4")
+		pathB := filepath.Join(dirB, "movie.mp4")
+		err = os.WriteFile(pathA, []byte("a"), 0o644)
+		expect err == nil
+		err = os.WriteFile(pathB, []byte("b"), 0o644)
+		expect err == nil
+
+		when "calling TranscodeCacheDir for both" {
+			dirAValue, errA := stream.TranscodeCacheDir(pathA, "h264-1080p", 4.0)
+			dirBValue, errB := stream.TranscodeCacheDir(pathB, "h264-1080p", 4.0)
+
+			then "both succeed" {
+				expect errA == nil
+				expect errB == nil
+			}
+			then "cache dirs stay unique" {
+				expect dirAValue != dirBValue
+			}
+		}
+	}
+
+	given "a configured cache root override" {
+		root := t.TempDir()
+		cacheRoot := filepath.Join(root, ".goetrope-cache")
+		previousCacheRoot, hadCacheRoot := os.LookupEnv("GOETROPE_CACHE_ROOT")
+		err := os.Setenv("GOETROPE_CACHE_ROOT", cacheRoot)
+		expect err == nil
+		defer func() {
+			if hadCacheRoot {
+				_ = os.Setenv("GOETROPE_CACHE_ROOT", previousCacheRoot)
+				return
+			}
+			_ = os.Unsetenv("GOETROPE_CACHE_ROOT")
+		}()
+
+		tmpDir := filepath.Join(root, "media")
+		err = os.MkdirAll(tmpDir, 0o755)
+		expect err == nil
+		tmpPath := filepath.Join(tmpDir, "movie.mp4")
+		err = os.WriteFile(tmpPath, []byte("movie"), 0o644)
+		expect err == nil
+
+		when "calling TranscodeCacheDir" {
+			dir, err := stream.TranscodeCacheDir(tmpPath, "h264-720p", 4.0)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "uses the configured cache root" {
+				expect strings.HasPrefix(dir, cacheRoot)
+			}
+			then "still ends with quality" {
+				expect strings.HasSuffix(dir, "h264-720p")
+			}
+		}
+	}
+}
+
+unit "TranscodePlaylistPath" {
+	given "a real file" {
+		tmp, err := os.CreateTemp("", "playlist-*.mp4")
+		expect err == nil
+		tmpPath := tmp.Name()
+		tmp.Close()
+		defer os.Remove(tmpPath)
+
+		when "calling TranscodePlaylistPath" {
+			path, err := stream.TranscodePlaylistPath(tmpPath, "h264-720p", 4.0)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "path ends with playlist.m3u8" {
+				expect strings.HasSuffix(path, "playlist.m3u8")
+			}
+			then "path is under .goetrope/cache" {
+				expect strings.Contains(path, ".goetrope")
+			}
+		}
+	}
+}
+
+@serial
+unit "LookupTranscodePlaylistPath" {
+	given "a configured cache root with an existing cached playlist" {
+		root := t.TempDir()
+		cacheRoot := filepath.Join(root, ".goetrope-cache")
+		previousCacheRoot, hadCacheRoot := os.LookupEnv("GOETROPE_CACHE_ROOT")
+		err := os.Setenv("GOETROPE_CACHE_ROOT", cacheRoot)
+		expect err == nil
+		defer func() {
+			if hadCacheRoot {
+				_ = os.Setenv("GOETROPE_CACHE_ROOT", previousCacheRoot)
+				return
+			}
+			_ = os.Unsetenv("GOETROPE_CACHE_ROOT")
+		}()
+
+		mediaDir := filepath.Join(root, "media")
+		err = os.MkdirAll(mediaDir, 0o755)
+		expect err == nil
+		mediaPath := filepath.Join(mediaDir, "movie.mp4")
+		err = os.WriteFile(mediaPath, []byte("movie"), 0o644)
+		expect err == nil
+
+		playlistPath, err := stream.TranscodePlaylistPath(mediaPath, "h264-720p", 4.0)
+		expect err == nil
+		err = os.MkdirAll(filepath.Dir(playlistPath), 0o755)
+		expect err == nil
+		err = os.WriteFile(playlistPath, []byte("#EXTM3U"), 0o644)
+		expect err == nil
+
+		when "looking up the cached playlist" {
+			foundPath, ok, err := stream.LookupTranscodePlaylistPath(mediaPath, "h264-720p", 4.0)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "reports the playlist as found" {
+				expect ok
+			}
+			then "returns the cached playlist path" {
+				expect foundPath == playlistPath
+			}
+		}
+	}
+}
+
+@serial
+unit "LookupTranscodeAssetPath" {
+	given "a configured cache root with an existing cached asset" {
+		root := t.TempDir()
+		cacheRoot := filepath.Join(root, ".goetrope-cache")
+		previousCacheRoot, hadCacheRoot := os.LookupEnv("GOETROPE_CACHE_ROOT")
+		err := os.Setenv("GOETROPE_CACHE_ROOT", cacheRoot)
+		expect err == nil
+		defer func() {
+			if hadCacheRoot {
+				_ = os.Setenv("GOETROPE_CACHE_ROOT", previousCacheRoot)
+				return
+			}
+			_ = os.Unsetenv("GOETROPE_CACHE_ROOT")
+		}()
+
+		mediaDir := filepath.Join(root, "media")
+		err = os.MkdirAll(mediaDir, 0o755)
+		expect err == nil
+		mediaPath := filepath.Join(mediaDir, "movie.mp4")
+		err = os.WriteFile(mediaPath, []byte("movie"), 0o644)
+		expect err == nil
+
+		assetPath, err := stream.TranscodeAssetPath(mediaPath, "original", "playlist.m4s", 1.0)
+		expect err == nil
+		err = os.MkdirAll(filepath.Dir(assetPath), 0o755)
+		expect err == nil
+		err = os.WriteFile(assetPath, []byte("asset"), 0o644)
+		expect err == nil
+
+		when "looking up the cached asset" {
+			foundPath, ok, err := stream.LookupTranscodeAssetPath(mediaPath, "original", "playlist.m4s", 1.0)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "reports the asset as found" {
+				expect ok
+			}
+			then "returns the cached asset path" {
+				expect foundPath == assetPath
+			}
+		}
+	}
+}
+
+unit "TranscodeSegmentPath" {
+	given "a real file" {
+		tmp, err := os.CreateTemp("", "segment-*.mp4")
+		expect err == nil
+		tmpPath := tmp.Name()
+		tmp.Close()
+		defer os.Remove(tmpPath)
+
+		when "calling TranscodeSegmentPath for segment 0" {
+			path, err := stream.TranscodeSegmentPath(tmpPath, "h264-1080p", 0, 4.0)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "path ends with seg00000.ts" {
+				expect strings.HasSuffix(path, "seg00000.ts")
+			}
+		}
+
+		when "calling TranscodeSegmentPath for segment 42" {
+			path, err := stream.TranscodeSegmentPath(tmpPath, "h264-1080p", 42, 4.0)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "path ends with seg00042.ts" {
+				expect strings.HasSuffix(path, "seg00042.ts")
+			}
+		}
+	}
+}
+
+unit "TranscodeAssetPath" {
+	given "a real file" {
+		tmp, err := os.CreateTemp("", "asset-*.mp4")
+		expect err == nil
+		tmpPath := tmp.Name()
+		tmp.Close()
+		defer os.Remove(tmpPath)
+
+		when "requesting a valid asset name" {
+			path, err := stream.TranscodeAssetPath(tmpPath, "h264-1080p", "thumbnail.jpg", 4.0)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "path ends with asset name" {
+				expect strings.HasSuffix(path, "thumbnail.jpg")
+			}
+		}
+
+		when "requesting an asset name with path separators" {
+			_, err := stream.TranscodeAssetPath(tmpPath, "h264-1080p", "../secret.txt", 4.0)
+
+			then "returns an error" {
+				expect err != nil
+			}
+		}
+	}
+}
+
+unit "TranscodeVariantAvailable" {
+	given "a real file with no transcoded variants" {
+		tmp, err := os.CreateTemp("", "variant-*.mp4")
+		expect err == nil
+		tmpPath := tmp.Name()
+		tmp.Close()
+		defer os.Remove(tmpPath)
+
+		then "original quality is always available" {
+			expect stream.TranscodeVariantAvailable(tmpPath, "original", 4.0)
+		}
+		then "empty quality is always available" {
+			expect stream.TranscodeVariantAvailable(tmpPath, "", 4.0)
+		}
+		then "nonexistent transcoded quality is unavailable" {
+			reject stream.TranscodeVariantAvailable(tmpPath, "h264-1080p", 4.0)
+		}
+	}
+
+	given "a real file with segment-only transcoded cache" {
+		tmp, err := os.CreateTemp("", "variant-segments-*.mp4")
+		expect err == nil
+		tmpPath := tmp.Name()
+		tmp.Close()
+		defer os.Remove(tmpPath)
+
+		dir, err := stream.TranscodeCacheDir(tmpPath, "h264-720p", 4.0)
+		expect err == nil
+		err = os.MkdirAll(dir, 0o755)
+		expect err == nil
+		err = os.WriteFile(filepath.Join(dir, "seg00000.ts"), []byte("segment"), 0o644)
+		expect err == nil
+
+		then "segment-only transcoded quality is available" {
+			expect stream.TranscodeVariantAvailable(tmpPath, "h264-720p", 4.0)
+		}
+		then "segment set can be discovered" {
+			segments, ext, ok, err := stream.LookupTranscodeSegmentSet(tmpPath, "h264-720p", 4.0)
+			expect err == nil
+			expect ok
+			expect len(segments) == 1
+			expect ext == ".ts"
+		}
+	}
+}

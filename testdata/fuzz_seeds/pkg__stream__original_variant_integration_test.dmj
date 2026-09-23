@@ -1,0 +1,113 @@
+package stream_test
+
+import (
+	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/stream"
+)
+
+integration "EnsureCachedOriginalVariant MKV" {
+	given "a synthetic MKV source with H264 and AAC" {
+		ffmpegPath, lookErr := exec.LookPath("ffmpeg")
+		if lookErr != nil {
+			t.Skip("ffmpeg not installed")
+		}
+
+		tmpDir, mkdirErr := os.MkdirTemp("", "original-cache-mkv-*")
+		expect mkdirErr == nil
+		defer os.RemoveAll(tmpDir)
+
+		sourcePath := filepath.Join(tmpDir, "clip.mkv")
+		cmd := exec.Command(
+			ffmpegPath,
+			"-y",
+			"-v", "error",
+			"-f", "lavfi",
+			"-i", "testsrc=size=640x360:rate=24",
+			"-f", "lavfi",
+			"-i", "sine=frequency=1000:sample_rate=48000",
+			"-t", "2",
+			"-c:v", "libx264",
+			"-pix_fmt", "yuv420p",
+			"-c:a", "aac",
+			sourcePath,
+		)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("ffmpeg synthetic mkv source: %v\n%s", err, output)
+		}
+
+		when "caching the original VOD variant" {
+			playlistPath, format, err := stream.EnsureCachedOriginalVariant(context.Background(), sourcePath, stream.DefaultSegmentDuration, false)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "uses the fMP4 original path" {
+				expect format == stream.OriginalVariantFormatFMP4
+			}
+			then "writes the playlist" {
+				expect playlistPath != ""
+				_, statErr := os.Stat(playlistPath)
+				expect statErr == nil
+			}
+			then "writes the init segment" {
+				initPath := filepath.Join(filepath.Dir(playlistPath), "init.mp4")
+				_, statErr := os.Stat(initPath)
+				expect statErr == nil
+			}
+		}
+	}
+}
+
+unit "LookupCachedOriginalVariant" {
+	given "an uncached source file" {
+		tmp, err := os.CreateTemp("", "lookup-original-*.mp4")
+		expect err == nil
+		sourcePath := tmp.Name()
+		tmp.Close()
+		defer os.Remove(sourcePath)
+
+		when "checking the cache" {
+			playlistPath, format, ok := stream.LookupCachedOriginalVariant(sourcePath, stream.DefaultSegmentDuration, false)
+
+			then "reports no cached variant" {
+				reject ok
+				expect playlistPath == ""
+				expect format == stream.OriginalVariantFormatUnknown
+			}
+		}
+	}
+
+	given "a cached ts original variant" {
+		tmp, err := os.CreateTemp("", "lookup-original-cached-*.mp4")
+		expect err == nil
+		sourcePath := tmp.Name()
+		tmp.Close()
+		defer os.Remove(sourcePath)
+
+		playlistPath, err := stream.TranscodePlaylistPath(sourcePath, "original", stream.DefaultSegmentDuration)
+		expect err == nil
+		segmentPath, err := stream.TranscodeSegmentPath(sourcePath, "original", 0, stream.DefaultSegmentDuration)
+		expect err == nil
+		err = os.MkdirAll(filepath.Dir(playlistPath), 0o755)
+		expect err == nil
+		err = os.WriteFile(playlistPath, []byte("#EXTM3U\n"), 0o644)
+		expect err == nil
+		err = os.WriteFile(segmentPath, []byte("segment"), 0o644)
+		expect err == nil
+
+		when "checking the cache" {
+			gotPath, format, ok := stream.LookupCachedOriginalVariant(sourcePath, stream.DefaultSegmentDuration, false)
+
+			then "returns the cached ts variant" {
+				expect ok
+				expect gotPath == playlistPath
+				expect format == stream.OriginalVariantFormatTS
+			}
+		}
+	}
+}

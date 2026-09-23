@@ -1,0 +1,228 @@
+package mp4_test
+
+import (
+	"bytes"
+	"encoding/binary"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/container/mp4"
+)
+
+benchmark "ReadBoxes synthetic moov" {
+	setup {
+		var buf bytes.Buffer
+		for i := 0; i < 100; i++ {
+			binary.Write(&buf, binary.BigEndian, uint32(108))
+			buf.Write([]byte("free"))
+			buf.Write(make([]byte, 100))
+		}
+		data := buf.Bytes()
+	}
+	measure {
+		reader := bytes.NewReader(data)
+		mp4.ReadBoxes(reader, int64(len(data)))
+	}
+	report_allocs
+}
+
+benchmark "ConvertToAnnexB 1KB sample" {
+	setup {
+		data := make([]byte, 4+1000)
+		binary.BigEndian.PutUint32(data[0:4], 1000)
+	}
+	measure {
+		mp4.ConvertToAnnexB(data, 4)
+	}
+	report_allocs
+}
+
+benchmark "ConvertToAnnexB 100KB sample" {
+	setup {
+		naluSize := 10000
+		naluCount := 10
+		data := make([]byte, 0, naluCount*(4+naluSize))
+		for i := 0; i < naluCount; i++ {
+			lenBuf := make([]byte, 4)
+			binary.BigEndian.PutUint32(lenBuf, uint32(naluSize))
+			data = append(data, lenBuf...)
+			data = append(data, make([]byte, naluSize)...)
+		}
+	}
+	measure {
+		mp4.ConvertToAnnexB(data, 4)
+	}
+	report_allocs
+}
+
+benchmark "PrependParamSets" {
+	setup {
+		ps := &mp4.ParamSets{
+			SPS: [][]byte{make([]byte, 30)},
+			PPS: [][]byte{make([]byte, 10)},
+		}
+		naluData := make([]byte, 5000)
+	}
+	measure {
+		mp4.PrependParamSets(ps, naluData)
+	}
+	report_allocs
+}
+
+benchmark "BuildSampleIndex 1000 samples" {
+	setup {
+		st := &mp4.SampleTable{
+			Timescale:   90000,
+			Sizes:       make([]uint32, 1000),
+			Offsets:     []int64{0},
+			Stts:        []mp4.SttsEntry{{Count: 1000, Delta: 3000}},
+			Stsc:        []mp4.StscEntry{{FirstChunk: 1, SamplesPerChunk: 1000}},
+			SyncSamples: []uint32{1, 101, 201, 301, 401, 501, 601, 701, 801, 901},
+		}
+		for i := range st.Sizes {
+			st.Sizes[i] = 5000
+		}
+	}
+	measure {
+		mp4.BuildSampleIndex(st)
+	}
+	report_allocs
+}
+
+benchmark "ComputeSegmentBoundaries 1000 samples" {
+	setup {
+		st := &mp4.SampleTable{
+			Timescale:   90000,
+			Sizes:       make([]uint32, 1000),
+			Offsets:     []int64{0},
+			Stts:        []mp4.SttsEntry{{Count: 1000, Delta: 3000}},
+			Stsc:        []mp4.StscEntry{{FirstChunk: 1, SamplesPerChunk: 1000}},
+			SyncSamples: []uint32{1, 101, 201, 301, 401, 501, 601, 701, 801, 901},
+		}
+		for i := range st.Sizes {
+			st.Sizes[i] = 5000
+		}
+		idx := mp4.BuildSampleIndex(st)
+	}
+	measure {
+		mp4.ComputeSegmentBoundaries(idx, 90000, 4.0)
+	}
+	report_allocs
+}
+
+benchmark "Probe synthetic MP4" {
+	setup {
+		mp4Data := buildSyntheticMP4ForBench(100, 200)
+		reader := bytes.NewReader(mp4Data)
+	}
+	measure {
+		reader.Seek(0, 0)
+		mp4.Probe(reader)
+	}
+	report_allocs
+}
+
+// buildSyntheticMP4ForBench creates a minimal MP4 for benchmarking.
+func buildSyntheticMP4ForBench(numSamples int, sampleSize int) []byte {
+	var buf bytes.Buffer
+	ftyp := benchBox("ftyp", []byte("isom\x00\x00\x00\x00isom"))
+
+	mdatBody := make([]byte, numSamples*sampleSize)
+	for i := 0; i < numSamples; i++ {
+		off := i * sampleSize
+		binary.BigEndian.PutUint32(mdatBody[off:off+4], uint32(sampleSize-4))
+		if sampleSize > 4 { mdatBody[off+4] = 0x65 }
+	}
+	mdat := benchBox("mdat", mdatBody)
+
+	ftypSize := len(ftyp)
+
+	avcCBody := []byte{0x01, 0x64, 0x00, 0x1F, 0xFF, 0xE1, 0x00, 0x04, 0x67, 0x64, 0x00, 0x1F, 0x01, 0x00, 0x02, 0x68, 0xCE}
+	avcC := benchBox("avcC", avcCBody)
+	avc1Base := make([]byte, 70)
+	binary.BigEndian.PutUint16(avc1Base[24:26], 1920)
+	binary.BigEndian.PutUint16(avc1Base[26:28], 1080)
+	avc1 := benchBox("avc1", append(avc1Base, avcC...))
+	stsdBody := make([]byte, 8)
+	binary.BigEndian.PutUint32(stsdBody[4:8], 1)
+	stsd := benchBox("stsd", append(stsdBody, avc1...))
+
+	stszBody := make([]byte, 12+numSamples*4)
+	binary.BigEndian.PutUint32(stszBody[8:12], uint32(numSamples))
+	for i := 0; i < numSamples; i++ {
+		binary.BigEndian.PutUint32(stszBody[12+i*4:16+i*4], uint32(sampleSize))
+	}
+	stsz := benchBox("stsz", stszBody)
+
+	stcoBody := make([]byte, 12)
+	binary.BigEndian.PutUint32(stcoBody[4:8], 1)
+	stco := benchBox("stco", stcoBody)
+
+	stscBody := make([]byte, 20)
+	binary.BigEndian.PutUint32(stscBody[4:8], 1)
+	binary.BigEndian.PutUint32(stscBody[8:12], 1)
+	binary.BigEndian.PutUint32(stscBody[12:16], uint32(numSamples))
+	binary.BigEndian.PutUint32(stscBody[16:20], 1)
+	stsc := benchBox("stsc", stscBody)
+
+	sttsBody := make([]byte, 16)
+	binary.BigEndian.PutUint32(sttsBody[4:8], 1)
+	binary.BigEndian.PutUint32(sttsBody[8:12], uint32(numSamples))
+	binary.BigEndian.PutUint32(sttsBody[12:16], 3000)
+	stts := benchBox("stts", sttsBody)
+
+	stssBody := make([]byte, 12)
+	binary.BigEndian.PutUint32(stssBody[4:8], 1)
+	binary.BigEndian.PutUint32(stssBody[8:12], 1)
+	stss := benchBox("stss", stssBody)
+
+	var stblBody bytes.Buffer
+	stblBody.Write(stsd)
+	stblBody.Write(stsz)
+	stblBody.Write(stco)
+	stblBody.Write(stsc)
+	stblBody.Write(stts)
+	stblBody.Write(stss)
+	stbl := benchContainerBox("stbl", stblBody.Bytes())
+
+	mdhdBody := make([]byte, 24)
+	binary.BigEndian.PutUint32(mdhdBody[12:16], 90000)
+	binary.BigEndian.PutUint32(mdhdBody[16:20], uint32(numSamples)*3000)
+	mdhd := benchBox("mdhd", mdhdBody)
+
+	hdlrBody := make([]byte, 24)
+	copy(hdlrBody[8:12], "vide")
+	hdlr := benchBox("hdlr", hdlrBody)
+
+	minf := benchContainerBox("minf", stbl)
+	var mdiaBody bytes.Buffer
+	mdiaBody.Write(mdhd)
+	mdiaBody.Write(hdlr)
+	mdiaBody.Write(minf)
+	mdia := benchContainerBox("mdia", mdiaBody.Bytes())
+	trak := benchContainerBox("trak", mdia)
+	moov := benchContainerBox("moov", trak)
+
+	mdatOffset := uint32(ftypSize + len(moov) + 8)
+	for i := 0; i < len(moov)-12; i++ {
+		if string(moov[i+4:i+8]) == "stco" {
+			binary.BigEndian.PutUint32(moov[i+8+8:i+8+12], mdatOffset)
+			break
+		}
+	}
+
+	buf.Write(ftyp)
+	buf.Write(moov)
+	buf.Write(mdat)
+	return buf.Bytes()
+}
+
+func benchBox(boxType string, data []byte) []byte {
+	hdr := make([]byte, 8)
+	binary.BigEndian.PutUint32(hdr[0:4], uint32(8+len(data)))
+	copy(hdr[4:8], boxType)
+	return append(hdr, data...)
+}
+
+func benchContainerBox(boxType string, children []byte) []byte {
+	return benchBox(boxType, children)
+}

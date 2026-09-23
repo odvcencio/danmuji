@@ -1,0 +1,51 @@
+package transcode
+
+import "testing"
+
+unit "worker media-root authorization" {
+	given "a worker with two configured roots" {
+		state := WorkerState{MediaRoots: []string{"/media/movies", "/media/shows"}}
+
+		then "clean descendants in either root are authorized" {
+			expect workerCanAccessSource(state, "/media/movies/film.mp4")
+			expect workerCanAccessSource(state, "/media/shows/series/episode.mkv")
+		}
+
+		then "prefix confusion and traversal are rejected" {
+			reject workerCanAccessSource(state, "/media/movies-archive/film.mp4")
+			reject workerCanAccessSource(state, "/media/movies/../private/film.mp4")
+		}
+	}
+
+	given "a worker with no configured roots" {
+		then "no source is authorized" {
+			reject workerCanAccessSource(WorkerState{}, "/media/movie.mp4")
+			reject workerCanAccessSource(WorkerState{}, "")
+		}
+	}
+
+	given "a legacy remote worker with one media root" {
+		state := WorkerState{MediaRoot: "/media"}
+
+		then "the singular root remains compatible" {
+			expect workerCanAccessSource(state, "/media/movie.mp4")
+			reject workerCanAccessSource(state, "/other/movie.mp4")
+		}
+	}
+
+	given "a caller-owned root slice" {
+		roots := []string{"/media"}
+		coord := NewCoordinator()
+		coord.RegisterWorker(WorkerState{WorkerID: "copy-test", MediaRoots: roots})
+		roots[0] = "/outside"
+
+		then "registration and snapshots cannot be mutated through shared slices" {
+			workers := coord.ListWorkers()
+			expect len(workers) == 1
+			expect workers[0].MediaRoots[0] == "/media"
+			workers[0].MediaRoots[0] = "/mutated"
+			again := coord.ListWorkers()
+			expect again[0].MediaRoots[0] == "/media"
+		}
+	}
+}

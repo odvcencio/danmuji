@@ -1,0 +1,102 @@
+package randomchannel
+
+import (
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/stream"
+	"github.com/odvcencio/goetrope/pkg/theatre"
+)
+
+unit "Feed model playlist rebase" {
+	given "a completed first item is dropped from the playlist" {
+		svc := feedModelTestService(t, true)
+		svc.setFeedPlaylist(PlayoutPlaylist{
+			ItemIDs:      []int64{1, 2},
+			ItemDuration: []float64{100, 50},
+		})
+		oldRoom := &theatre.Room{
+			RoomCode:           RoomCode,
+			Playlist:           []int64{1, 2},
+			CurrentItemIndex:   1,
+			PlaybackPositionMs: 5_000,
+		}
+		svc.feedResumeFromPersisted(oldRoom)
+
+		svc.setFeedPlaylist(PlayoutPlaylist{
+			ItemIDs:      []int64{2},
+			ItemDuration: []float64{50},
+		})
+		newRoom := &theatre.Room{
+			RoomCode:         RoomCode,
+			Playlist:         []int64{2},
+			CurrentItemIndex: 0,
+		}
+		for idx := 0; idx < 30; idx++ {
+			svc.feedManifest().OnSegmentReceived(2, "h264-720p", idx, stream.LowLatencySegmentDuration)
+		}
+		svc.playback.Set(RoomCode, theatre.PlaybackState{
+			Position:  5,
+			Playing:   true,
+			Timestamp: svc.now().UnixMilli(),
+		})
+
+		when "reading the new first item position" {
+			position, playing := svc.currentPosition(newRoom)
+
+			then "keeps the item-relative position instead of jumping to the old global floor" {
+				expect position >= 5
+				expect position < 6
+			}
+
+			then "stays playing" {
+				expect playing
+			}
+		}
+	}
+
+	given "the playlist is replaced by an unrelated queue" {
+		svc := feedModelTestService(t, true)
+		svc.setFeedPlaylist(PlayoutPlaylist{
+			ItemIDs:      []int64{1, 2},
+			ItemDuration: []float64{100, 50},
+		})
+		oldRoom := &theatre.Room{
+			RoomCode:           RoomCode,
+			Playlist:           []int64{1, 2},
+			CurrentItemIndex:   1,
+			PlaybackPositionMs: 5_000,
+		}
+		svc.feedResumeFromPersisted(oldRoom)
+
+		svc.setFeedPlaylist(PlayoutPlaylist{
+			ItemIDs:      []int64{3},
+			ItemDuration: []float64{60},
+		})
+		newRoom := &theatre.Room{
+			RoomCode:         RoomCode,
+			Playlist:         []int64{3},
+			CurrentItemIndex: 0,
+		}
+		for idx := 0; idx < 30; idx++ {
+			svc.feedManifest().OnSegmentReceived(3, "h264-720p", idx, stream.LowLatencySegmentDuration)
+		}
+		svc.playback.Set(RoomCode, theatre.PlaybackState{
+			Position:  5,
+			Playing:   true,
+			Timestamp: svc.now().UnixMilli(),
+		})
+
+		when "reading the replacement queue position" {
+			position, playing := svc.currentPosition(newRoom)
+
+			then "does not carry the old queue floor into the replacement" {
+				expect position >= 5
+				expect position < 6
+			}
+
+			then "stays playing" {
+				expect playing
+			}
+		}
+	}
+}

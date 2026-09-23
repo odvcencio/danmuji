@@ -1,0 +1,103 @@
+package transcode
+
+import "testing"
+
+unit "publication CAS preserves distinct assets" {
+	given "one active attempt publishing two different assets concurrently" {
+		when "both filesystem callbacks overlap" {
+			then "each digest remains idempotently recorded" {
+				assertDistinctAssetPublicationCAS(t)
+			}
+		}
+	}
+}
+
+unit "stale publication rollback is identity-safe" {
+	given "a publication renamed bytes before its attempt is fenced" {
+		when "a superseding attempt replaces the path with identical bytes" {
+			then "stale rollback leaves the superseding inode intact" {
+				assertStaleAfterRenameSameBytesSupersession(t)
+			}
+		}
+	}
+}
+
+unit "failed marker promotion is recovered" {
+	given "a marker is durably created before a segment rename" {
+		when "the pre-rename promotion fails" {
+			then "the orphan media marker is removed" {
+				assertFailedPromotionRemovesMarker(t)
+			}
+		}
+	}
+}
+
+unit "strict promotion rejects reverse-order supersession" {
+	given "attempt A is stalled before its final canonical rename" {
+		when "attempt B supersedes A before A resumes" {
+			then "A cannot overwrite B's canonical inode" {
+				assertReverseOrderSupersessionCannotOverwrite(t)
+			}
+		}
+	}
+}
+
+unit "strict promotion action leaves coordinator cancellation unblocked" {
+	given "a strict promotion action is stalled under the canonical path lock" {
+		when "the active attempt is cancelled before the action returns" {
+			then "cancellation completes and the stale canonical output is rolled back" {
+				assertStrictPromotionActionDoesNotHoldCoordinatorLock(t)
+			}
+		}
+	}
+}
+
+unit "failed post-rename sync preserves superseding marker" {
+	given "attempt A fails after rename while B waits on the canonical lock" {
+		when "A rolls back before releasing the path" {
+			then "B retains its output and marker generation" {
+				assertFailedPostRenameSyncKeepsSupersedingMarker(t)
+			}
+		}
+	}
+}
+
+unit "concurrent marker creation is serialized" {
+	given "two coordinators publish one canonical asset concurrently" {
+		when "both callbacks claim the media marker" {
+			then "one durable marker remains without publication errors" {
+				assertConcurrentMarkerCreationIsSerialized(t)
+			}
+		}
+	}
+}
+
+unit "unexpected marker stat fails closed" {
+	given "the marker path is occupied by a non-regular inode" {
+		when "a strict segment push probes the marker" {
+			then "the canonical segment is not published" {
+				assertUnexpectedMarkerStatFailsClosed(t)
+			}
+		}
+	}
+}
+
+unit "marker post-create failures remove the exact inode" {
+	given "a strict publication creates its media marker before promotion" {
+		when "write, sync, close, marker-directory sync, or post-create stat fails" {
+			then "rollback removes the created marker and leaves no segment" {
+				assertMarkerPostCreateFailuresRemoveExactInode(t)
+			}
+		}
+	}
+}
+
+unit "cross-process promotion lock simulation" {
+	given "another coordinator process uses the same canonical lock path" {
+		when "the first process holds the lock" {
+			then "the second process waits for release" {
+				assertCrossProcessPromotionLockSimulation(t)
+			}
+		}
+	}
+}

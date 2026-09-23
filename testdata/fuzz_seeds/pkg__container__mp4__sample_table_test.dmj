@@ -1,0 +1,195 @@
+package mp4_test
+
+import (
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/container/mp4"
+)
+
+unit "BuildSampleIndex offset computation" {
+	// Verifies that the stsc (sample-to-chunk) table is correctly used to
+	// compute per-sample file offsets. This is the most complex part of
+	// sample table parsing and incorrect offsets would cause reading wrong
+	// data from the file.
+
+	given "2 chunks with 3 and 2 samples respectively" {
+		st := &mp4.SampleTable{
+			Timescale: 1000,
+			Sizes:     []uint32{500, 600, 700, 800, 900},
+			Offsets:   []int64{1000, 5000},
+			Stts:      []mp4.SttsEntry{{Count: 5, Delta: 1000}},
+			Stsc: []mp4.StscEntry{
+				{FirstChunk: 1, SamplesPerChunk: 3, SampleDescIndex: 1},
+				{FirstChunk: 2, SamplesPerChunk: 2, SampleDescIndex: 1},
+			},
+			SyncSamples: []uint32{1},
+		}
+
+		when "building the sample index" {
+			idx := mp4.BuildSampleIndex(st)
+
+			then "produces 5 samples" {
+				expect len(idx) == 5
+			}
+
+			then "first chunk samples have correct offsets" {
+				// Chunk 1 starts at 1000, samples are contiguous
+				expect idx[0].Offset == 1000
+				expect idx[1].Offset == 1500  // 1000 + 500
+				expect idx[2].Offset == 2100  // 1500 + 600
+			}
+
+			then "second chunk samples have correct offsets" {
+				// Chunk 2 starts at 5000
+				expect idx[3].Offset == 5000
+				expect idx[4].Offset == 5800  // 5000 + 800
+			}
+
+			then "sample sizes are preserved" {
+				expect idx[0].Size == 500
+				expect idx[1].Size == 600
+				expect idx[2].Size == 700
+				expect idx[3].Size == 800
+				expect idx[4].Size == 900
+			}
+		}
+	}
+}
+
+unit "BuildSampleIndex DTS computation" {
+	given "variable frame durations via stts" {
+		st := &mp4.SampleTable{
+			Timescale: 90000,
+			Sizes:     []uint32{100, 100, 100, 100, 100},
+			Offsets:   []int64{0},
+			Stts: []mp4.SttsEntry{
+				{Count: 3, Delta: 3000}, // first 3 samples at 3000 ticks each
+				{Count: 2, Delta: 6000}, // next 2 at 6000 ticks each
+			},
+			Stsc: []mp4.StscEntry{{FirstChunk: 1, SamplesPerChunk: 5}},
+		}
+
+		when "building the index" {
+			idx := mp4.BuildSampleIndex(st)
+
+			then "DTS values accumulate correctly" {
+				expect idx[0].DTS == 0
+				expect idx[1].DTS == 3000
+				expect idx[2].DTS == 6000
+				expect idx[3].DTS == 9000   // switches to delta=6000
+				expect idx[4].DTS == 15000  // 9000 + 6000
+			}
+		}
+	}
+}
+
+unit "BuildSampleIndex keyframe detection" {
+	given "a sample table with explicit sync samples" {
+		st := &mp4.SampleTable{
+			Timescale:   90000,
+			Sizes:       make([]uint32, 10),
+			Offsets:     []int64{0},
+			Stts:        []mp4.SttsEntry{{Count: 10, Delta: 3000}},
+			Stsc:        []mp4.StscEntry{{FirstChunk: 1, SamplesPerChunk: 10}},
+			SyncSamples: []uint32{1, 5, 10}, // 1-based
+		}
+		for i := range st.Sizes {
+			st.Sizes[i] = 100
+		}
+
+		when "building the index" {
+			idx := mp4.BuildSampleIndex(st)
+
+			then "keyframes are at the correct positions" {
+				expect idx[0].Keyframe   // sample 1 (0-indexed: 0)
+				reject idx[1].Keyframe
+				reject idx[2].Keyframe
+				reject idx[3].Keyframe
+				expect idx[4].Keyframe   // sample 5 (0-indexed: 4)
+				reject idx[5].Keyframe
+				expect idx[9].Keyframe   // sample 10 (0-indexed: 9)
+			}
+		}
+	}
+
+	given "no stss box (all samples are keyframes)" {
+		st := &mp4.SampleTable{
+			Timescale: 90000,
+			Sizes:     []uint32{100, 100, 100},
+			Offsets:   []int64{0},
+			Stts:      []mp4.SttsEntry{{Count: 3, Delta: 3000}},
+			Stsc:      []mp4.StscEntry{{FirstChunk: 1, SamplesPerChunk: 3}},
+			// SyncSamples is nil — means all samples are sync points
+		}
+
+		when "building the index" {
+			idx := mp4.BuildSampleIndex(st)
+
+			then "every sample is a keyframe" {
+				for _, s := range idx {
+					expect s.Keyframe
+				}
+			}
+		}
+	}
+}
+
+unit "ComputeSegmentBoundaries" {
+	given "keyframes every 30 frames at 30fps with 4s target segments" {
+		st := &mp4.SampleTable{
+			Timescale:   90000,
+			Sizes:       make([]uint32, 240),
+			Offsets:     []int64{0},
+			Stts:        []mp4.SttsEntry{{Count: 240, Delta: 3000}}, // 30fps
+			Stsc:        []mp4.StscEntry{{FirstChunk: 1, SamplesPerChunk: 240}},
+			SyncSamples: []uint32{1, 31, 61, 91, 121, 151, 181, 211}, // every 30 frames = 1s
+		}
+		for i := range st.Sizes {
+			st.Sizes[i] = 1000
+		}
+
+		idx := mp4.BuildSampleIndex(st)
+		segs := mp4.ComputeSegmentBoundaries(idx, st.Timescale, 4.0)
+
+		then "first segment starts at sample 0" {
+			expect len(segs) > 0
+			expect segs[0].StartSample == 0
+		}
+		then "segments are keyframe-aligned" {
+			for _, seg := range segs {
+				expect idx[seg.StartSample].Keyframe
+			}
+		}
+		then "last segment covers remaining samples" {
+			lastSeg := segs[len(segs)-1]
+			expect lastSeg.EndSample == 240
+		}
+		then "no gap between segments" {
+			for i := 1; i < len(segs); i++ {
+				expect segs[i].StartSample == segs[i-1].EndSample
+			}
+		}
+	}
+
+	given "a single keyframe (one-GOP content)" {
+		st := &mp4.SampleTable{
+			Timescale:   90000,
+			Sizes:       []uint32{1000, 500, 500},
+			Offsets:     []int64{0},
+			Stts:        []mp4.SttsEntry{{Count: 3, Delta: 3000}},
+			Stsc:        []mp4.StscEntry{{FirstChunk: 1, SamplesPerChunk: 3}},
+			SyncSamples: []uint32{1},
+		}
+
+		idx := mp4.BuildSampleIndex(st)
+		segs := mp4.ComputeSegmentBoundaries(idx, st.Timescale, 4.0)
+
+		then "produces exactly one segment" {
+			expect len(segs) == 1
+		}
+		then "segment covers all samples" {
+			expect segs[0].StartSample == 0
+			expect segs[0].EndSample == 3
+		}
+	}
+}

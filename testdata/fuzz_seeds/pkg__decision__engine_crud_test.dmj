@@ -1,0 +1,201 @@
+package decision_test
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/decision"
+)
+
+unit "Engine policy CRUD" {
+	given "an engine with a test policy" {
+		tmpDir, err := os.MkdirTemp("", "engine-crud-*")
+		expect err == nil
+		defer os.RemoveAll(tmpDir)
+
+		policySource := `feature cache from "cache-state" {
+    volume_usage_pct: number
+    served_within_7d: bool
+}
+
+rule KeepByDefault priority 0 {
+    when {
+        cache.volume_usage_pct <= 90
+    }
+    then KeepCacheEntry {
+        reason: "below threshold",
+    }
+}
+`
+		writeErr := os.WriteFile(filepath.Join(tmpDir, "cache.arb"), []byte(policySource), 0o644)
+		expect writeErr == nil
+
+		engine, loadErr := decision.NewEngine(tmpDir)
+		expect loadErr == nil
+
+		when "listing policies" {
+			policies, err := engine.ListPolicies()
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "returns the loaded domain" {
+				expect len(policies) == 1
+			}
+			then "contains the cache domain" {
+				expect policies[0] == "cache"
+			}
+		}
+
+		when "reading an existing policy" {
+			source, err := engine.ReadPolicy("cache")
+
+			then "succeeds without error" {
+				expect err == nil
+			}
+			then "returns non-empty source" {
+				expect len(source) > 0
+			}
+			then "source contains expected content" {
+				expect strings.Contains(source, "KeepByDefault")
+			}
+		}
+
+		when "reading a nonexistent policy" {
+			_, err := engine.ReadPolicy("nonexistent")
+
+			then "returns an error" {
+				expect err != nil
+			}
+		}
+
+		when "writing a valid updated policy" {
+			updatedSource := `feature cache from "cache-state" {
+    volume_usage_pct: number
+    served_within_7d: bool
+}
+
+rule EvictWhenFull priority 0 {
+    when {
+        cache.volume_usage_pct > 90
+    }
+    then EvictCacheEntry {
+        reason: "above threshold",
+    }
+}
+`
+			err := engine.WritePolicy("cache", updatedSource)
+
+			then "succeeds" {
+				expect err == nil
+			}
+		}
+
+		when "reading back a written policy" {
+			updatedSource := `feature cache from "cache-state" {
+    volume_usage_pct: number
+    served_within_7d: bool
+}
+
+rule UpdatedRule priority 0 {
+    when {
+        cache.volume_usage_pct > 95
+    }
+    then EvictCacheEntry {
+        reason: "critically full",
+    }
+}
+`
+			writeErr := engine.WritePolicy("cache", updatedSource)
+			expect writeErr == nil
+			source, readErr := engine.ReadPolicy("cache")
+
+			then "read succeeds" {
+				expect readErr == nil
+			}
+			then "source reflects the written content" {
+				expect strings.Contains(source, "UpdatedRule")
+			}
+		}
+
+		when "writing with empty source" {
+			err := engine.WritePolicy("cache", "")
+
+			then "returns an error for empty source" {
+				expect err != nil
+			}
+		}
+
+		when "writing a policy with invalid domain characters" {
+			err := engine.WritePolicy("../../etc/passwd", "some content")
+
+			then "returns an error" {
+				expect err != nil
+			}
+		}
+	}
+}
+
+unit "Engine ListPolicies with empty dir" {
+	given "an empty policy directory" {
+		tmpDir, err := os.MkdirTemp("", "engine-empty-*")
+		expect err == nil
+		defer os.RemoveAll(tmpDir)
+
+		engine, loadErr := decision.NewEngine(tmpDir)
+		expect loadErr == nil
+
+		when "listing policies" {
+			policies, err := engine.ListPolicies()
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "returns empty slice" {
+				expect len(policies) == 0
+			}
+		}
+	}
+}
+
+unit "Engine skips test arb files" {
+	given "a directory with both runtime and test arb files" {
+		tmpDir, err := os.MkdirTemp("", "engine-testfiles-*")
+		expect err == nil
+		defer os.RemoveAll(tmpDir)
+
+		policySource := `feature cache from "cache-state" {
+    volume_usage_pct: number
+    served_within_7d: bool
+}
+
+rule DefaultKeep priority 0 {
+    when {
+        cache.volume_usage_pct <= 100
+    }
+    then KeepCacheEntry {
+        reason: "default",
+    }
+}
+`
+		os.WriteFile(filepath.Join(tmpDir, "cache.arb"), []byte(policySource), 0o644)
+		os.WriteFile(filepath.Join(tmpDir, "cache.test.arb"), []byte(policySource), 0o644)
+
+		engine, loadErr := decision.NewEngine(tmpDir)
+		expect loadErr == nil
+
+		when "listing policies" {
+			policies, listErr := engine.ListPolicies()
+
+			then "succeeds" {
+				expect listErr == nil
+			}
+			then "only returns the runtime policy" {
+				expect len(policies) == 1
+				expect policies[0] == "cache"
+			}
+		}
+	}
+}

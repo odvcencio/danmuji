@@ -1,0 +1,256 @@
+package maintenance_test
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/odvcencio/goetrope/pkg/library"
+	"github.com/odvcencio/goetrope/pkg/maintenance"
+)
+
+unit "VolumeStats UsagePct edge cases" {
+	then "rounds to nearest integer at 50.5 percent" {
+		vs := maintenance.VolumeStats{TotalBytes: 200, UsedBytes: 101}
+		expect vs.UsagePct() == 51
+	}
+	then "rounds down at 49.5 percent" {
+		vs := maintenance.VolumeStats{TotalBytes: 200, UsedBytes: 99}
+		expect vs.UsagePct() == 50
+	}
+	then "returns 100 when used equals total" {
+		vs := maintenance.VolumeStats{TotalBytes: 512, UsedBytes: 512}
+		expect vs.UsagePct() == 100
+	}
+	then "returns 0 when used is 0" {
+		vs := maintenance.VolumeStats{TotalBytes: 1000000, UsedBytes: 0}
+		expect vs.UsagePct() == 0
+	}
+	then "returns 0 when total is 0" {
+		vs := maintenance.VolumeStats{TotalBytes: 0, UsedBytes: 500}
+		expect vs.UsagePct() == 0
+	}
+	then "returns 75 at three quarters usage" {
+		vs := maintenance.VolumeStats{TotalBytes: 1000, UsedBytes: 750}
+		expect vs.UsagePct() == 75
+	}
+	then "returns 90 at 90 percent" {
+		vs := maintenance.VolumeStats{TotalBytes: 1000, UsedBytes: 900}
+		expect vs.UsagePct() == 90
+	}
+	then "returns 91 at 91 percent" {
+		vs := maintenance.VolumeStats{TotalBytes: 1000, UsedBytes: 910}
+		expect vs.UsagePct() == 91
+	}
+}
+
+unit "NewCacheCleaner" {
+	then "returns a non-nil cleaner" {
+		cleaner := maintenance.NewCacheCleaner(nil, nil)
+		expect cleaner != nil
+	}
+
+	given "a cleaner with nil store" {
+		cleaner := maintenance.NewCacheCleaner(nil, nil)
+
+		when "calling MaxVolumeUsage" {
+			usage, err := cleaner.MaxVolumeUsage(context.Background())
+
+			then "returns zero without error" {
+				expect err == nil
+				expect usage == 0
+			}
+		}
+
+		when "calling Cleanup" {
+			report, err := cleaner.Cleanup(context.Background())
+
+			then "returns empty report without error" {
+				expect err == nil
+				expect report.ScannedEntries == 0
+				expect report.RemovedEntries == 0
+				expect report.FreedBytes == int64(0)
+			}
+		}
+	}
+}
+
+unit "CacheCleanupReport zero value" {
+	then "RanByPolicy defaults to false" {
+		var report maintenance.CacheCleanupReport
+		reject report.RanByPolicy
+	}
+	then "Errors defaults to nil" {
+		var report maintenance.CacheCleanupReport
+		expect report.Errors == nil
+	}
+	then "VolumeUsagePct defaults to 0" {
+		var report maintenance.CacheCleanupReport
+		expect report.VolumeUsagePct == 0
+	}
+}
+
+unit "CacheCleaner RunScheduled skips when usage is low" {
+	given "a cleaner with a mock store returning no entries" {
+		store := &mockCacheStore{entries: nil}
+		cleaner := maintenance.NewCacheCleaner(store, nil)
+
+		when "running scheduled with low volume usage" {
+			report, err := cleaner.RunScheduled(context.Background())
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "did not run by policy" {
+				reject report.RanByPolicy
+			}
+		}
+	}
+}
+
+unit "CacheCleaner Cleanup with no entries" {
+	given "a cleaner with empty cache entries" {
+		store := &mockCacheStore{entries: []library.CacheEntry{}}
+		cleaner := maintenance.NewCacheCleaner(store, nil)
+
+		when "cleaning up" {
+			report, err := cleaner.Cleanup(context.Background())
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "scanned zero entries" {
+				expect report.ScannedEntries == 0
+			}
+			then "removed zero entries" {
+				expect report.RemovedEntries == 0
+			}
+		}
+	}
+}
+
+unit "CacheCleaner shouldEvictEntry without engine" {
+	given "a cleaner with no policy engine" {
+		store := &mockCacheStore{}
+		cleaner := maintenance.NewCacheCleaner(store, nil)
+
+		when "volume is below threshold with old entry" {
+			report, _ := cleaner.Cleanup(context.Background())
+
+			then "scan completes without error" {
+				expect report.Errors == nil
+			}
+		}
+	}
+}
+
+unit "Maintenance Scheduler startup delay" {
+	given "a scheduler with an immediately eligible metadata refresh policy" {
+		policyDir := t.TempDir()
+		err := os.WriteFile(filepath.Join(policyDir, "maintenance.arb"), []byte(`
+feature maintenance from "maintenance-state" {
+    cache_volume_usage_pct: number
+    metadata_missing_artwork: bool
+    metadata_age_days: number
+    local_hour: number
+}
+
+outcome MaintenanceAction {
+    task: string
+    reason: string
+    urgency: string
+}
+
+outcome MaintenanceRuntimeResult {
+    action: string
+    status: string
+    detail: string
+}
+
+expert rule ImmediateMetadataRefresh {
+    when {
+        maintenance.metadata_missing_artwork == true
+    }
+    then emit MaintenanceAction {
+        task: "refresh_metadata",
+        reason: "test refresh",
+        urgency: "high",
+    }
+}
+
+worker execute_maintenance {
+    input MaintenanceAction
+    output MaintenanceRuntimeResult
+    exec "goetrope-maintenance"
+}
+
+arbiter maintenance_scheduler {
+    poll 1h
+    on MaintenanceAction worker execute_maintenance
+}
+`), 0o644)
+		expect err == nil
+		store := &schedulerMetadataStore{}
+		pipeline := &schedulerPipeline{}
+		scheduler := maintenance.NewScheduler(policyDir, nil, store, pipeline, maintenance.NewCacheCleaner(nil, nil))
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			scheduler.Run(ctx)
+			close(done)
+		}()
+
+		when "running briefly after startup" {
+			time.Sleep(200 * time.Millisecond)
+			cancel()
+			<-done
+
+			then "does not execute metadata refresh immediately" {
+				expect pipeline.calls.Load() == int32(0)
+			}
+		}
+	}
+}
+
+// mockCacheStore implements the cacheStore interface for testing.
+type mockCacheStore struct {
+	entries []library.CacheEntry
+}
+
+func (m *mockCacheStore) ListCacheEntries(ctx context.Context) ([]library.CacheEntry, error) {
+	return m.entries, nil
+}
+
+func (m *mockCacheStore) DeleteCacheEntry(ctx context.Context, mediaItemID int64, quality string) error {
+	return nil
+}
+
+// ensure mockCacheStore is used
+var _ = time.Now
+
+type schedulerMetadataStore struct{}
+
+func (s *schedulerMetadataStore) MetadataRefreshState(ctx context.Context) (library.MetadataRefreshSnapshot, error) {
+	return library.MetadataRefreshSnapshot{
+		MissingArtwork: true,
+		MaxAgeDays:     31,
+	}, nil
+}
+
+func (s *schedulerMetadataStore) ListMetadataRefreshCandidates(ctx context.Context, minAgeDays, limit int) ([]library.MetadataRefreshCandidate, error) {
+	return []library.MetadataRefreshCandidate{
+		{MediaItemID: 1, Path: "/media/movie.mkv", AgeDays: 31},
+	}, nil
+}
+
+type schedulerPipeline struct {
+	calls atomic.Int32
+}
+
+func (p *schedulerPipeline) IngestPath(ctx context.Context, path string) (*library.MediaItem, error) {
+	p.calls.Add(1)
+	return &library.MediaItem{ID: 1, Path: path}, nil
+}

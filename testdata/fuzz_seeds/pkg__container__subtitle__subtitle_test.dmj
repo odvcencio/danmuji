@@ -1,0 +1,202 @@
+package subtitle_test
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/container/mp4"
+	"github.com/odvcencio/goetrope/pkg/container/subtitle"
+)
+
+unit "ConvertSRTToWebVTT" {
+	given "a standard SRT file" {
+		srt := []byte("1\r\n00:00:01,000 --> 00:00:04,000\r\nHello world\r\n\r\n2\r\n00:00:05,500 --> 00:00:08,200\r\nSecond line\r\n")
+
+		when "converting" {
+			vtt := string(subtitle.ConvertSRTToWebVTT(srt))
+
+			then "starts with WEBVTT header" {
+				expect strings.HasPrefix(vtt, "WEBVTT")
+			}
+			then "converts comma to period in timestamps" {
+				expect strings.Contains(vtt, "00:00:01.000")
+				expect strings.Contains(vtt, "00:00:04.000")
+			}
+			then "preserves subtitle text" {
+				expect strings.Contains(vtt, "Hello world")
+				expect strings.Contains(vtt, "Second line")
+			}
+		}
+	}
+
+	given "SRT with UTF-8 BOM" {
+		srt := append([]byte{0xEF, 0xBB, 0xBF}, []byte("1\r\n00:00:01,000 --> 00:00:02,000\r\nBOM test\r\n")...)
+
+		when "converting" {
+			vtt := string(subtitle.ConvertSRTToWebVTT(srt))
+
+			then "removes BOM" {
+				reject strings.Contains(vtt, "\xEF\xBB\xBF")
+			}
+			then "still valid WebVTT" {
+				expect strings.HasPrefix(vtt, "WEBVTT")
+			}
+		}
+	}
+
+	given "empty SRT" {
+		when "converting" {
+			vtt := string(subtitle.ConvertSRTToWebVTT(nil))
+
+			then "returns just the header" {
+				expect strings.HasPrefix(vtt, "WEBVTT")
+			}
+		}
+	}
+}
+
+unit "ConvertASSToWebVTT" {
+	given "an ASS subtitle with styled dialogue" {
+		ass := []byte("[Script Info]\r\nTitle: Test\r\nPlayResX: 1920\r\nPlayResY: 1080\r\n\r\n[V4+ Styles]\r\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\r\nStyle: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H7F000000,0,0,0,0,100,100,0,0,1,2,0,2,32,32,48,1\r\n\r\n[Events]\r\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\r\nDialogue: 0,0:00:01.00,0:00:04.00,Default,,0,0,0,,{\\an8}Hello {\\b1}world{\\b0}\\N{\\i1}Again{\\i0}\r\n")
+
+		when "converting" {
+			vtt := string(subtitle.ConvertASSToWebVTT(ass))
+
+			then "starts with WEBVTT header" {
+				expect strings.HasPrefix(vtt, "WEBVTT")
+			}
+			then "preserves supported ASS emphasis as VTT markup" {
+				expect strings.Contains(vtt, "Hello <b>world</b>")
+				expect strings.Contains(vtt, "<i>Again</i>")
+			}
+			then "maps top aligned dialogue into cue placement settings" {
+				expect strings.Contains(vtt, "position:50%")
+				expect strings.Contains(vtt, "line:8%")
+			}
+			then "preserves explicit line breaks" {
+				expect strings.Contains(vtt, "Hello <b>world</b>\n<i>Again</i>")
+			}
+		}
+	}
+
+	given "an ASS subtitle with explicit positioned text" {
+		ass := []byte("[Script Info]\r\nTitle: Test\r\nPlayResX: 1920\r\nPlayResY: 1080\r\n\r\n[Events]\r\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\r\nDialogue: 0,0:00:05.00,0:00:08.00,Default,,0,0,0,,{\\pos(960,180)}Sign text\r\n")
+
+		when "converting" {
+			vtt := string(subtitle.ConvertASSToWebVTT(ass))
+
+			then "projects explicit ASS coordinates into WebVTT percentages" {
+				expect strings.Contains(vtt, "position:50%")
+				expect strings.Contains(vtt, "line:16.67%")
+			}
+			then "preserves the sign text payload" {
+				expect strings.Contains(vtt, "Sign text")
+			}
+		}
+	}
+}
+
+unit "ShiftWebVTT" {
+	given "an absolute WebVTT track and a media clock offset" {
+		vtt := []byte("WEBVTT\n\nold\n00:00:02.000 --> 00:00:04.000\nalready gone\n\nstraddle\n00:00:04.500 --> 00:00:06.500\nstill visible\n\nfuture\n00:00:10.000 --> 00:00:12.000 position:50% line:90%\nfuture line\n")
+
+		when "shifting for the media element clock" {
+			shifted := string(subtitle.ShiftWebVTT(vtt, 5000))
+
+			then "drops cues that ended before the stream start" {
+				reject strings.Contains(shifted, "already gone")
+			}
+			then "clamps cues that overlap the stream start" {
+				expect strings.Contains(shifted, "00:00:00.000 --> 00:00:01.500")
+				expect strings.Contains(shifted, "still visible")
+			}
+			then "preserves cue settings on later cues" {
+				expect strings.Contains(shifted, "00:00:05.000 --> 00:00:07.000 position:50% line:90%")
+				expect strings.Contains(shifted, "future line")
+			}
+		}
+	}
+}
+
+unit "AppendSidecarStreams" {
+	given "a media file with common tagged sidecar subtitles" {
+		tmpDir, dirErr := os.MkdirTemp("", "sidecar-tags-*")
+		expect dirErr == nil
+		defer os.RemoveAll(tmpDir)
+
+		mediaPath := filepath.Join(tmpDir, "Kung Pow.mkv")
+		os.WriteFile(mediaPath, []byte("fake"), 0o644)
+		os.WriteFile(filepath.Join(tmpDir, "Kung Pow.English.srt"), []byte("english"), 0o644)
+		os.WriteFile(filepath.Join(tmpDir, "Kung Pow.SDH.srt"), []byte("sdh"), 0o644)
+		os.WriteFile(filepath.Join(tmpDir, "Kung Pow.en-US.vtt"), []byte("WEBVTT\n"), 0o644)
+		os.WriteFile(filepath.Join(tmpDir, "Kung Pow - forced.ass"), []byte("[Script Info]\n"), 0o644)
+		os.WriteFile(filepath.Join(tmpDir, "Kung Powed.en.srt"), []byte("wrong"), 0o644)
+		os.WriteFile(filepath.Join(tmpDir, "Kung Pow Legacy.en.srt"), []byte("wrong"), 0o644)
+
+		when "finding sidecars without opt-in environment" {
+			sidecars, err := subtitle.FindSidecars(mediaPath)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "finds common language and accessibility tag variants" {
+				expect len(sidecars) == 4
+			}
+			then "normalizes real languages and ignores descriptive tags" {
+				expect sidecars[0].Language == "und"
+				expect sidecars[1].Language == "en"
+				expect sidecars[2].Language == "und"
+				expect sidecars[3].Language == "en"
+			}
+			then "does not match unrelated near-prefix titles" {
+				for _, sidecar := range sidecars {
+					expect filepath.Base(sidecar.Path) != "Kung Powed.en.srt"
+					expect filepath.Base(sidecar.Path) != "Kung Pow Legacy.en.srt"
+				}
+			}
+		}
+	}
+
+	given "a media file with sidecar subtitles" {
+		tmpDir, dirErr := os.MkdirTemp("", "sidecar-test-*")
+		expect dirErr == nil
+		defer os.RemoveAll(tmpDir)
+
+		mediaPath := filepath.Join(tmpDir, "movie.mp4")
+		os.WriteFile(mediaPath, []byte("fake"), 0o644)
+		os.WriteFile(filepath.Join(tmpDir, "movie.en.srt"), []byte("1\n00:00:01,000 --> 00:00:02,000\nHi\n"), 0o644)
+
+		when "appending sidecar streams" {
+			info := &mp4.MediaInfo{}
+			err := subtitle.AppendSidecarStreams(mediaPath, info)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "finds sidecar files" {
+				expect len(info.Streams) >= 1
+			}
+		}
+	}
+
+	given "a media file with no sidecars" {
+		tmpDir, dirErr := os.MkdirTemp("", "no-sidecar-*")
+		expect dirErr == nil
+		defer os.RemoveAll(tmpDir)
+
+		mediaPath := filepath.Join(tmpDir, "movie.mp4")
+		os.WriteFile(mediaPath, []byte("fake"), 0o644)
+
+		when "appending sidecar streams" {
+			info := &mp4.MediaInfo{}
+			err := subtitle.AppendSidecarStreams(mediaPath, info)
+
+			then "succeeds with no streams added" {
+				expect err == nil
+				expect len(info.Streams) == 0
+			}
+		}
+	}
+}

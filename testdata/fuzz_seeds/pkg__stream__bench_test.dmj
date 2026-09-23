@@ -1,0 +1,169 @@
+package stream_test
+
+import (
+	"bytes"
+	"os"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/container/mp4"
+	"github.com/odvcencio/goetrope/pkg/stream"
+)
+
+benchmark "TSWriter.WritePAT" {
+	setup {
+		var buf bytes.Buffer
+	}
+	measure {
+		buf.Reset()
+		tw := stream.NewTSWriter(&buf)
+		_ = tw.WritePAT()
+	}
+	report_allocs
+}
+
+benchmark "TSWriter.WriteVideoPacket small" {
+	setup {
+		payload := make([]byte, 200)
+	}
+	measure {
+		var buf bytes.Buffer
+		tw := stream.NewTSWriter(&buf)
+		_ = tw.WriteVideoPacket(payload, 90000, true)
+	}
+	report_allocs
+}
+
+benchmark "TSWriter.WriteVideoPacket large" {
+	setup {
+		payload := make([]byte, 50000)
+	}
+	measure {
+		var buf bytes.Buffer
+		tw := stream.NewTSWriter(&buf)
+		_ = tw.WriteVideoPacket(payload, 90000, true)
+	}
+	report_allocs
+}
+
+benchmark "ConvertToAnnexB" {
+	setup {
+		data := make([]byte, 0, 10*(4+1000))
+		for i := 0; i < 10; i++ {
+			lenBuf := make([]byte, 4)
+			lenBuf[0] = 0
+			lenBuf[1] = 0
+			lenBuf[2] = 0x03
+			lenBuf[3] = 0xE8
+			data = append(data, lenBuf...)
+			data = append(data, make([]byte, 1000)...)
+		}
+	}
+	measure {
+		mp4.ConvertToAnnexB(data, 4)
+	}
+	report_allocs
+}
+
+benchmark "ADTSHeader" {
+	measure {
+		stream.ADTSHeader(1024, 1, 4, 2)
+	}
+	report_allocs
+}
+
+benchmark "ADTSHeaderInto zero alloc" {
+	setup {
+		buf := make([]byte, 7)
+	}
+	measure {
+		stream.ADTSHeaderInto(buf, 1024, 1, 4, 2)
+	}
+	report_allocs
+}
+
+benchmark "CalculateSegments" {
+	measure {
+		stream.CalculateSegments(7200000, 4.0)
+	}
+	report_allocs
+}
+
+benchmark "concurrent TSWriter" {
+	setup {
+		payload := make([]byte, 500)
+	}
+	parallel measure {
+		var buf bytes.Buffer
+		tw := stream.NewTSWriter(&buf)
+		_ = tw.WritePAT()
+		_ = tw.WritePMT("h264", true)
+		_ = tw.WriteVideoPacket(payload, 90000, true)
+		_ = tw.WriteAudioPacket(payload[:100], 90000)
+	}
+}
+
+benchmark "WriteSegment synthetic MP4" {
+	setup {
+		mp4Data := buildTestMP4(30, 200)
+		tmp, _ := os.CreateTemp("", "bench-seg-*.mp4")
+		tmp.Write(mp4Data)
+		tmpPath := tmp.Name()
+		tmp.Close()
+		stream.ResetMediaIndexCache()
+	}
+	measure {
+		var buf bytes.Buffer
+		stream.WriteSegment(&buf, tmpPath, 0, 4.0)
+	}
+	report_allocs
+}
+
+benchmark "WriteSegment cached hit" {
+	setup {
+		mp4Data := buildTestMP4(30, 200)
+		tmp, _ := os.CreateTemp("", "bench-cache-*.mp4")
+		tmp.Write(mp4Data)
+		tmpPath := tmp.Name()
+		tmp.Close()
+		stream.ResetMediaIndexCache()
+		var warmup bytes.Buffer
+		stream.WriteSegment(&warmup, tmpPath, 0, 4.0)
+	}
+	measure {
+		var buf bytes.Buffer
+		stream.WriteSegment(&buf, tmpPath, 0, 4.0)
+	}
+	report_allocs
+}
+
+benchmark "MediaIndex load cached" {
+	setup {
+		mp4Data := buildTestMP4(30, 200)
+		tmp, _ := os.CreateTemp("", "bench-idx-*.mp4")
+		tmp.Write(mp4Data)
+		tmpPath := tmp.Name()
+		tmp.Close()
+		stream.ResetMediaIndexCache()
+		stream.LoadMediaIndex(tmpPath, 4.0)
+	}
+	measure {
+		stream.LoadMediaIndex(tmpPath, 4.0)
+	}
+	report_allocs
+}
+
+benchmark "full segment pipeline 120 samples" {
+	setup {
+		mp4Data := buildTestMP4(120, 500)
+		tmp, _ := os.CreateTemp("", "bench-full-*.mp4")
+		tmp.Write(mp4Data)
+		tmpPath := tmp.Name()
+		tmp.Close()
+		stream.ResetMediaIndexCache()
+	}
+	measure {
+		var buf bytes.Buffer
+		stream.WriteSegment(&buf, tmpPath, 0, 4.0)
+	}
+	report_allocs
+}

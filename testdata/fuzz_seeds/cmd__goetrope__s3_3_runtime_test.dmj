@@ -1,0 +1,350 @@
+package main
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/odvcencio/goetrope/pkg/api"
+	"github.com/odvcencio/goetrope/pkg/randomchannel"
+	"github.com/odvcencio/goetrope/pkg/transcode"
+	"github.com/odvcencio/goetrope/pkg/worker"
+)
+
+type s3RuntimeSpecExecutor struct{}
+
+func (s3RuntimeSpecExecutor) Capabilities() transcode.Capabilities {
+	return transcode.Capabilities{HasFFmpeg: true, CPUAvailable: true, PreferredBackend: transcode.BackendCPU, VideoEncoders: []string{"libx264"}}
+}
+
+func (s3RuntimeSpecExecutor) Execute(context.Context, transcode.Job, worker.ProgressSink) (transcode.Completion, error) {
+	return transcode.Completion{Success: true}, nil
+}
+
+@serial
+unit "runtime recovery lifecycle" {
+	then "recovery runs after worker registration and before periodic loops" {
+		coord := transcode.NewCoordinator()
+		sequence := []string{}
+		loopStarted := make(chan struct{})
+		var starts atomic.Int64
+		components := serveRuntimeComponents{
+			startWorker: func(_ context.Context, runtimeCtx context.Context) (*worker.EmbeddedRunner, error) {
+				sequence = append(sequence, "worker")
+				starts.Add(1)
+				return worker.StartEmbedded(runtimeCtx, coord, worker.EmbeddedConfig{Label: "embedded", MediaRoots: []string{"/tmp"}, Executor: s3RuntimeSpecExecutor{}})
+			},
+			recoverRuntime: func(context.Context) (runtimeRecoveryReport, error) {
+				sequence = append(sequence, "recovery")
+				expect len(coord.ListWorkers()) == 1
+				return runtimeRecoveryReport{State: "complete", Planned: 1}, nil
+			},
+			startTrustedWorkerGRPC: func(context.Context) (*trustedWorkerGRPCRuntime, error) {
+				sequence = append(sequence, "trusted")
+				return nil, nil
+			},
+			runDelivery: func(ctx context.Context) {
+				sequence = append(sequence, "delivery")
+				close(loopStarted)
+				<-ctx.Done()
+			},
+		}
+		controller, err := newApplicationRuntimeController(context.Background(), components.start)
+		expect err == nil
+		expect controller.EnsureStarted(context.Background()) == nil
+		<-loopStarted
+		expect starts.Load() == 1
+		expect sequence[0] == "worker"
+		expect sequence[1] == "recovery"
+		expect sequence[2] == "trusted"
+		expect sequence[3] == "delivery"
+		expect controller.Readiness().Ready
+		lifecycle := controller.Lifecycle()
+		expect lifecycle.RecoveryState == "complete"
+		expect !lifecycle.ReadyAt.IsZero()
+		expect !lifecycle.RecoveryCompletedAt.IsZero()
+		expect lifecycle.FirstProgressAt.IsZero()
+		controller.Close()
+	}
+
+	then "a bounded stop callback cannot hold shutdown forever" {
+		instance := &applicationRuntimeInstance{lifecycle: runtimeLifecycleState{Phase: runtimePhaseReady}}
+		entered := make(chan struct{})
+		instance.AddStop(func() {
+			close(entered)
+			select {}
+		})
+		started := time.Now()
+		instance.closeWithTimeout(25 * time.Millisecond)
+		expect time.Since(started) < time.Second
+		<-entered
+		expect instance.lifecycleSnapshot().ShutdownTimedOut
+	}
+
+	then "a hostile start callback is fenced by the shared shutdown budget" {
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		var captured *applicationRuntimeInstance
+		controller, err := newApplicationRuntimeController(context.Background(), func(_ context.Context, _ context.Context, instance *applicationRuntimeInstance) error {
+			captured = instance
+			close(entered)
+			<-release
+			return nil
+		})
+		expect err == nil
+		result := make(chan error, 1)
+		go func() { result <- controller.EnsureStarted(context.Background()) }()
+		<-entered
+		started := time.Now()
+		controller.closeWithTimeout(25 * time.Millisecond)
+		expect time.Since(started) < time.Second
+		expect captured.lifecycleSnapshot().ShutdownTimedOut
+		close(release)
+		select {
+		case err := <-result:
+			expect err != nil
+		case <-time.After(time.Second):
+			t.Fatal("hostile start did not finish after release")
+		}
+	}
+
+	then "a blocked shutdown gate rejects every late registration" {
+		instance := &applicationRuntimeInstance{lifecycle: runtimeLifecycleState{Phase: runtimePhaseReady}}
+		stopEntered := make(chan struct{})
+		releaseStop := make(chan struct{})
+		instance.AddStop(func() {
+			close(stopEntered)
+			<-releaseStop
+		})
+		closeDone := make(chan struct{})
+		go func() {
+			instance.closeWithTimeout(time.Second)
+			close(closeDone)
+		}()
+		<-stopEntered
+		var lateLoops atomic.Int64
+		var lateStops atomic.Int64
+		var lateProcesses atomic.Int64
+		instance.Go(func() { lateLoops.Add(1) })
+		instance.AddStop(func() { lateStops.Add(1) })
+		instance.AddProcessSupervisor(func(context.Context) error {
+			lateProcesses.Add(1)
+			return nil
+		})
+		close(releaseStop)
+		<-closeDone
+		expect lateLoops.Load() == 0
+		expect lateStops.Load() == 0
+		expect lateProcesses.Load() == 0
+	}
+
+	then "failed activations use retryable process stop and final close uses final fence" {
+		var attempts atomic.Int64
+		var retryStops atomic.Int64
+		var finalStops atomic.Int64
+		sequence := []string{}
+		controller, err := newApplicationRuntimeController(context.Background(), func(_ context.Context, _ context.Context, instance *applicationRuntimeInstance) error {
+			attempt := attempts.Add(1)
+			instance.AddProcessSupervisor(func(context.Context) error {
+				retryStops.Add(1)
+				sequence = append(sequence, "retry")
+				return nil
+			})
+			if attempt == 1 {
+				return context.Canceled
+			}
+			return nil
+		})
+		expect err == nil
+		registered := controller.AddFinalProcessSupervisor(func(context.Context) error {
+			finalStops.Add(1)
+			sequence = append(sequence, "final")
+			return nil
+		})
+		expect registered
+		expect controller.EnsureStarted(context.Background()) != nil
+		expect attempts.Load() == 1
+		expect retryStops.Load() == 1
+		expect finalStops.Load() == 0
+		expect controller.EnsureStarted(context.Background()) == nil
+		controller.Close()
+		expect attempts.Load() == 2
+		expect retryStops.Load() == 2
+		expect finalStops.Load() == 1
+		expect sequence[0] == "retry"
+		expect sequence[1] == "final"
+		expect sequence[2] == "retry"
+	}
+
+	then "first accepted progress is observed before readiness evidence" {
+		coord := transcode.NewCoordinator()
+		record, inserted := coord.Enqueue(transcode.Job{ID: "progress-before-return", Type: transcode.JobTypeOnDemand, SourcePath: "/tmp/synthetic", Quality: "h264-720p"})
+		expect inserted
+		components := serveRuntimeComponents{
+			startWorkerWithProgress: func(_ context.Context, runtimeCtx context.Context, observer func()) (*worker.EmbeddedRunner, error) {
+				return worker.StartEmbeddedWithProgress(runtimeCtx, coord, worker.EmbeddedConfig{Label: "embedded", MediaRoots: []string{"/tmp"}, Executor: s3RuntimeSpecExecutor{}}, observer)
+			},
+			recoverRuntime: func(context.Context) (runtimeRecoveryReport, error) {
+				return runtimeRecoveryReport{State: "complete"}, nil
+			},
+		}
+		controller, err := newApplicationRuntimeController(context.Background(), components.start)
+		expect err == nil
+		expect controller.EnsureStarted(context.Background()) == nil
+		waitForRuntimeProgress(t, controller)
+		expect !controller.Lifecycle().FirstProgressAt.IsZero()
+		got, ok := coord.GetJob(record.Job.ID)
+		expect ok
+		expect got.Progress.SegmentsFinished == 0
+		controller.Close()
+	}
+
+	then "readiness resamples dependency loss and recovery on the monitor cadence" {
+		coord := transcode.NewCoordinator()
+		var cacheReady atomic.Bool
+		cacheReady.Store(true)
+		components := serveRuntimeComponents{
+			startWorker: func(_ context.Context, runtimeCtx context.Context) (*worker.EmbeddedRunner, error) {
+				return worker.StartEmbedded(runtimeCtx, coord, worker.EmbeddedConfig{Label: "embedded", Executor: s3RuntimeSpecExecutor{}})
+			},
+			recoverRuntime: func(context.Context) (runtimeRecoveryReport, error) {
+				return runtimeRecoveryReport{State: "complete"}, nil
+			},
+			requiredDependencies: func() runtimeDependencyState {
+				state := defaultRuntimeDependencyState()
+				state.Cache = cacheReady.Load()
+				return state
+			},
+			dependencyProbeCadence: 10 * time.Millisecond,
+		}
+		controller, err := newApplicationRuntimeController(context.Background(), components.start)
+		expect err == nil
+		expect controller.EnsureStarted(context.Background()) == nil
+		expect controller.Readiness().Ready
+		cacheReady.Store(false)
+		waitRuntimeReadiness(t, controller, func(state api.ReadinessState) bool {
+			return !state.Ready && len(state.Reasons) > 0 && state.Reasons[0] == runtimeReasonCacheUnavailable
+		})
+		cacheReady.Store(true)
+		waitRuntimeReadiness(t, controller, func(state api.ReadinessState) bool { return state.Ready })
+		controller.Close()
+	}
+
+	then "trusted worker listener starts only during owner activation" {
+		coord := transcode.NewCoordinator()
+		var trustedStarts atomic.Int64
+		var recoveryDone atomic.Bool
+		components := serveRuntimeComponents{
+			startWorker: func(_ context.Context, runtimeCtx context.Context) (*worker.EmbeddedRunner, error) {
+				return worker.StartEmbedded(runtimeCtx, coord, worker.EmbeddedConfig{Label: "embedded", Executor: s3RuntimeSpecExecutor{}})
+			},
+			startTrustedWorkerGRPC: func(context.Context) (*trustedWorkerGRPCRuntime, error) {
+				expect recoveryDone.Load()
+				trustedStarts.Add(1)
+				return nil, nil
+			},
+			recoverRuntime: func(context.Context) (runtimeRecoveryReport, error) {
+				recoveryDone.Store(true)
+				return runtimeRecoveryReport{State: "complete"}, nil
+			},
+		}
+		controller, err := newApplicationRuntimeController(context.Background(), components.start)
+		expect err == nil
+		expect trustedStarts.Load() == 0
+		expect controller.EnsureStarted(context.Background()) == nil
+		expect trustedStarts.Load() == 1
+		controller.Close()
+	}
+
+	then "cache readiness uses the worker cache probe" {
+		root := t.TempDir()
+		expect runtimeCacheRootReady(root)
+		fileRoot := filepath.Join(t.TempDir(), "cache-file")
+		expect os.WriteFile(fileRoot, []byte("not-a-directory"), 0o600) == nil
+		reject runtimeCacheRootReady(fileRoot)
+		link := filepath.Join(t.TempDir(), "cache-link")
+		if err := os.Symlink(root, link); err != nil {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		reject runtimeCacheRootReady(link)
+	}
+
+	then "random channel recovery aggregation preserves every channel signal" {
+		report := runtimeRecoveryReport{State: "complete"}
+		mergeRandomChannelRecovery(&report, "1", randomchannel.RuntimeRecoveryReport{
+			State:             randomchannel.RecoveryComplete,
+			Planned:           1,
+			Reused:            2,
+			Skipped:           3,
+			DesiredKeys:       []string{"CHAN01:10", "CHAN01:11"},
+			ReasonCodes:       []string{"movie_reason"},
+			CacheObservations: []string{"movie_cache"},
+		}, nil)
+		mergeRandomChannelRecovery(&report, "2", randomchannel.RuntimeRecoveryReport{
+			State:             randomchannel.RecoveryDegraded,
+			Planned:           4,
+			Reused:            5,
+			Skipped:           6,
+			DesiredKeys:       []string{"SHOW01:20"},
+			ReasonCodes:       []string{"show_reason"},
+			CacheObservations: []string{"show_cache"},
+		}, nil)
+		expect report.State == "degraded"
+		expect report.Planned == 5
+		expect report.Reused == 7
+		expect report.Skipped == 9
+		expect report.Desired == 3
+		expect report.ReasonCodes[0] == "movie_reason"
+		expect report.ReasonCodes[1] == "show_reason"
+		expect report.ReasonCodes[2] == "random_channel_2_recovery_degraded"
+		expect report.CacheObservations[0] == "movie_cache"
+		expect report.CacheObservations[1] == "show_cache"
+	}
+
+	then "intentional random channel live-cache suppression is not a startup degradation" {
+		report := runtimeRecoveryReport{State: "complete"}
+		mergeRandomChannelRecovery(&report, "2", randomchannel.RuntimeRecoveryReport{
+			State:       randomchannel.RecoveryComplete,
+			Skipped:     2,
+			DesiredKeys: []string{"SHOW01:20", "SHOW01:21"},
+			ReasonCodes: []string{"live_cache_suppressed"},
+		}, nil)
+
+		expect report.State == "complete"
+		expect report.Planned == 0
+		expect report.Skipped == 2
+		expect report.Desired == 2
+		expect report.ReasonCodes[0] == "live_cache_suppressed"
+	}
+
+	then "soft theatre recovery observations are not public runtime reasons" {
+		reasons := appendRuntimeDeliveryReasons([]string{"theatre_recovery_unavailable"}, []string{"cache_unavailable", "playlist_projected", "playlist_overflow", "invalid_room_snapshot"})
+
+		expect len(reasons) == 2
+		expect reasons[0] == "theatre_recovery_unavailable"
+		expect reasons[1] == "invalid_room_snapshot"
+	}
+
+	then "managed cache readiness remains a public runtime reason" {
+		reasons := appendRuntimeDeliveryReasons(nil, []string{runtimeReasonCacheUnavailable, "cache_unavailable", "worker_unavailable"})
+
+		expect len(reasons) == 2
+		expect reasons[0] == runtimeReasonCacheUnavailable
+		expect reasons[1] == "worker_unavailable"
+	}
+}
+
+func waitForRuntimeProgress(t *testing.T, controller *applicationRuntimeController) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !controller.Lifecycle().FirstProgressAt.IsZero() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for accepted progress")
+}

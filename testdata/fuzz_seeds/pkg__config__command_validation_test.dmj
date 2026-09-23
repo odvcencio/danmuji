@@ -1,0 +1,47 @@
+package config
+
+import (
+	"strings"
+	"testing"
+)
+
+@serial
+unit "command-level configuration validation" {
+	then "worker and ingest validate the shared fields without server-only activation requirements" {
+		worker := Defaults()
+		worker.Security.Runtime = RuntimeProduction
+		ingest := Defaults()
+		expect ValidateCommand(worker, CommandWorker) == nil
+		expect ValidateCommand(ingest, CommandIngest) == nil
+	}
+
+	then "worker reports invalid security fields before process activation" {
+		cfg := Defaults()
+		cfg.Security.Runtime = RuntimeMode("invalid-runtime")
+		err := ValidateCommand(cfg, CommandWorker)
+		expect err != nil
+		expect strings.Contains(err.Error(), "security.runtime")
+	}
+
+	then "ingest reports invalid DNS64 fields before database work" {
+		cfg := Defaults()
+		cfg.Netfetch.DNS64Mode = DNS64Declared
+		cfg.Netfetch.DNS64Prefixes = nil
+		err := ValidateCommand(cfg, CommandIngest)
+		expect err != nil
+		expect strings.Contains(err.Error(), "netfetch.dns64_prefixes")
+	}
+
+	then "the worker health default matches the advertised CLI default" {
+		expect Defaults().Worker.HealthListen == "127.0.0.1:9091"
+	}
+
+	then "command-specific fields remain a validated common superset" {
+		cfg := Defaults()
+		cfg.Worker.Server = "127.0.0.1:9090"
+		cfg.Worker.MediaRoot = "/media"
+		cfg.Ingest.Path = "/media/item.mkv"
+		expect ValidateCommand(cfg, CommandWorker) == nil
+		expect ValidateCommand(cfg, CommandIngest) == nil
+	}
+}

@@ -1,0 +1,124 @@
+package decision_test
+
+import (
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/decision"
+)
+
+unit "expandFlatKeys" {
+	given "flat keys with dots" {
+		when "expanding single level" {
+			engine, _ := decision.NewEngine("../../policies")
+			// Test via Evaluate which calls expandFlatKeys internally
+			results, err := engine.Evaluate("stream", map[string]any{
+				"media.codec":           "h264",
+				"media.bitrate":         5000000,
+				"media.direct_playable": true,
+			})
+
+			then "evaluates correctly with expanded keys" {
+				expect err == nil
+				expect len(results) > 0
+			}
+		}
+	}
+}
+
+unit "Engine loads all policy domains" {
+	given "the real policies directory" {
+		engine, err := decision.NewEngine("../../policies")
+
+		then "loads without error" {
+			expect err == nil
+		}
+
+		then "stream domain loaded" {
+			_, ok := engine.Compiled("stream")
+			expect ok
+		}
+		then "library domain loaded" {
+			_, ok := engine.Compiled("library")
+			expect ok
+		}
+		then "theatre domain loaded" {
+			_, ok := engine.Compiled("theatre")
+			expect ok
+		}
+		then "cache domain loaded" {
+			_, ok := engine.Compiled("cache")
+			expect ok
+		}
+		then "ingest domain loaded" {
+			_, ok := engine.Compiled("ingest")
+			expect ok
+		}
+		then "transcode domain loaded" {
+			_, ok := engine.Compiled("transcode")
+			expect ok
+		}
+		then "subtitle domain loaded" {
+			_, ok := engine.Compiled("subtitle")
+			expect ok
+		}
+		then "maintenance domain loaded" {
+			_, ok := engine.Compiled("maintenance")
+			expect ok
+		}
+		then "middleware domain loaded" {
+			_, ok := engine.Compiled("middleware")
+			expect ok
+		}
+		then "random channel domain loaded" {
+			_, ok := engine.Compiled("random_channel")
+			expect ok
+		}
+		then "random channel picker domain loaded" {
+			_, ok := engine.Compiled("random_channel_picker")
+			expect ok
+		}
+		then "future channel programming policy is not loaded as runtime policy" {
+			_, ok := engine.Compiled("channel_programming")
+			expect !ok
+		}
+	}
+}
+
+unit "Engine reload stress test" {
+	given "a temp policy directory" {
+		tmpDir, err := os.MkdirTemp("", "engine-stress-*")
+		expect err == nil
+		defer os.RemoveAll(tmpDir)
+
+		policy, err := os.ReadFile("../../policies/stream.arb")
+		expect err == nil
+		os.WriteFile(filepath.Join(tmpDir, "stream.arb"), policy, 0o644)
+		engine, _ := decision.NewEngine(tmpDir)
+
+		when "100 concurrent evaluations" {
+			var wg sync.WaitGroup
+			errors := make([]error, 100)
+			for i := 0; i < 100; i++ {
+				wg.Add(1)
+				go func(idx int) {
+					defer wg.Done()
+					_, errors[idx] = engine.Evaluate("stream", map[string]any{
+						"media.codec":           "h264",
+						"media.bitrate":         5000000,
+						"media.direct_playable": true,
+					})
+				}(i)
+			}
+			wg.Wait()
+
+			then "all succeed" {
+				for _, e := range errors {
+					expect e == nil
+				}
+			}
+		}
+	}
+}

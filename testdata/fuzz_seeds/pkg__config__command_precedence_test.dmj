@@ -1,0 +1,126 @@
+package config
+
+import (
+	"path/filepath"
+	"testing"
+)
+
+@serial
+unit "all command configuration uses one origin-aware loader" {
+	then "worker command fields preserve TOML environment and changed-flag precedence" {
+		dir := t.TempDir()
+		t.Chdir(dir)
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		writeFile(t, filepath.Join(dir, "goetrope.toml"), `
+[worker]
+server = "toml.example:9090"
+gpu_device = "toml-gpu"
+media_root = "/toml/media"
+media_canary = "toml/canary"
+push_segments = false
+
+[media]
+cache_root = "/toml/cache"
+`)
+		t.Setenv("GOETROPE_WORKER_SERVER", "env.example:9090")
+		t.Setenv("GOETROPE_WORKER_GPU_DEVICE", "env-gpu")
+		flagServer := "flag.example:9090"
+		flagPush := true
+		result, err := Load(LoadOptions{Command: CommandWorker, Flags: FlagOverrides{
+			WorkerServer:       &flagServer,
+			WorkerPushSegments: &flagPush,
+		}})
+		expect err == nil
+		expect result.Config.Worker.Server == "flag.example:9090"
+		expect result.Config.Worker.GPUDevice == "env-gpu"
+		expect result.Config.Worker.MediaRoot == "/toml/media"
+		expect result.Config.Worker.MediaCanary == "toml/canary"
+		expect *result.Config.Worker.PushSegments
+		expect result.Config.Media.CacheRoot == "/toml/cache"
+		expect result.Origins["worker.server"].Layer == "flag"
+		expect result.Origins["worker.gpu_device"].Layer == "environment"
+		expect result.Origins["worker.media_root"].Layer == "toml"
+		expect result.Origins["media.cache_root"].Layer == "toml"
+	}
+
+	then "worker media canary follows environment and changed-flag precedence as non-secret text" {
+		t.Chdir(t.TempDir())
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		t.Setenv("GOETROPE_WORKER_MEDIA_CANARY", "env/canary")
+		flagCanary := "flag/canary"
+		result, err := Load(LoadOptions{Command: CommandWorker, Flags: FlagOverrides{WorkerMediaCanary: &flagCanary}})
+		expect err == nil
+		expect result.Config.Worker.MediaCanary == "flag/canary"
+		expect result.Origins["worker.media_canary"].Layer == "flag"
+		field := result.Effective(CommandWorker).Fields["worker.media_canary"]
+		reject field.Secret
+		expect field.Value == "flag/canary"
+	}
+
+	then "ingest command inputs participate in the same precedence chain" {
+		t.Chdir(t.TempDir())
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		t.Setenv("GOETROPE_INGEST_PATH", "/env/item.mkv")
+		flagPath := "/flag/item.mkv"
+		result, err := Load(LoadOptions{Command: CommandIngest, Flags: FlagOverrides{IngestPath: &flagPath}})
+		expect err == nil
+		expect result.Config.Ingest.Path == "/flag/item.mkv"
+		expect result.Origins["ingest.path"].Layer == "flag"
+		expect result.Origins["ingest.path"].Source == "--path"
+	}
+
+	then "effective output redacts every credential source value" {
+		t.Chdir(t.TempDir())
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		dsnSource := "env:POSTGRES_SOURCE"
+		result, err := Load(LoadOptions{Command: CommandServe, Flags: FlagOverrides{
+			PostgresDSNSource: &dsnSource,
+		}})
+		expect err == nil
+		field := result.Effective(CommandServe).Fields["postgres.dsn_source"]
+		expect field.Secret
+		expect field.Value == "[redacted]"
+		reject field.Value == "POSTGRES_SOURCE"
+	}
+
+	then "worker credential source follows TOML environment and flag precedence and stays redacted" {
+		dir := t.TempDir()
+		t.Chdir(dir)
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		writeFile(t, filepath.Join(dir, "goetrope.toml"), `
+[worker]
+credential_source = "file:/toml/worker-credential"
+
+[worker.tls]
+ca_source = "file:/toml/worker-ca.pem"
+server_name = "toml.worker.example"
+`)
+		t.Setenv("GOETROPE_WORKER_CREDENTIAL_SOURCE", "env:WORKER_CREDENTIAL_ENV")
+		t.Setenv("GOETROPE_WORKER_TLS_CA_SOURCE", "env:WORKER_CA_ENV")
+		t.Setenv("GOETROPE_WORKER_TLS_SERVER_NAME", "env.worker.example")
+		envResult, err := Load(LoadOptions{Command: CommandWorker})
+		expect err == nil
+		expect envResult.Config.Worker.CredentialSource.String() == "env:WORKER_CREDENTIAL_ENV"
+		expect envResult.Config.Worker.TLS.CASource.String() == "env:WORKER_CA_ENV"
+		expect envResult.Config.Worker.TLS.ServerName == "env.worker.example"
+		expect envResult.Origins["worker.credential_source"].Layer == "environment"
+		flagCredential := "store:systemd/worker-credential"
+		flagCA := "store:systemd/worker-ca"
+		flagName := "flag.worker.example"
+		flagResult, err := Load(LoadOptions{Command: CommandWorker, Flags: FlagOverrides{WorkerCredentialSource: &flagCredential, WorkerTLSCASource: &flagCA, WorkerTLSServerName: &flagName}})
+		expect err == nil
+		expect flagResult.Config.Worker.CredentialSource.String() == flagCredential
+		expect flagResult.Config.Worker.TLS.CASource.String() == flagCA
+		expect flagResult.Config.Worker.TLS.ServerName == flagName
+		expect flagResult.Origins["worker.credential_source"].Layer == "flag"
+		field := flagResult.Effective(CommandWorker).Fields["worker.credential_source"]
+		expect field.Secret
+		expect field.Value == "[redacted]"
+		reject field.Value == flagCredential
+		reject field.Value == "worker-credential"
+		caField := flagResult.Effective(CommandWorker).Fields["worker.tls.ca_source"]
+		expect caField.Secret
+		expect caField.Value == "[redacted]"
+		reject caField.Value == flagCA
+	}
+}

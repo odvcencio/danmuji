@@ -1,0 +1,284 @@
+package ingest
+
+import (
+	"context"
+	"errors"
+	"io/fs"
+	"testing"
+	"time"
+
+	"github.com/odvcencio/arbiter/vm"
+	"github.com/odvcencio/goetrope/pkg/container/mp4"
+	"github.com/odvcencio/goetrope/pkg/library"
+	"github.com/odvcencio/goetrope/pkg/transcode"
+)
+
+unit "IngestPath uses cached library rows for unchanged files" {
+	given "a store that already contains the media item" {
+		store := &fakeStore{
+			item: &library.MediaItem{
+				ID:       42,
+				Path:     "/media/movies/Movie.mkv",
+				FileSize:  1234,
+				Title:    "Movie",
+				Container: "mkv",
+			},
+		}
+		p := NewPipeline(store, nil)
+		p.runAsync = func(fn func()) { fn() }
+		probeCalls := 0
+		p.probeFile = func(_ context.Context, path string) (*mp4.MediaInfo, error) {
+			probeCalls++
+			return nil, errors.New("probe should not run")
+		}
+		p.statFile = func(path string) (fs.FileInfo, error) {
+			return fakeFileInfo{size: 1234}, nil
+		}
+
+		when "ingesting the same path again" {
+			item, err := p.IngestPath(context.Background(), "/media/movies/Movie.mkv")
+
+			then "returns the cached item without probing" {
+				expect err == nil
+				expect item != nil
+				expect item.ID == 42
+				expect item.Path == "/media/movies/Movie.mkv"
+				expect probeCalls == 0
+			}
+		}
+	}
+
+	given "a file that changed size" {
+		store := &fakeStore{
+			item: &library.MediaItem{
+				ID:       42,
+				Path:     "/media/movies/Movie.mkv",
+				FileSize:  1234,
+				Title:    "Movie",
+				Container: "mkv",
+			},
+		}
+		p := NewPipeline(store, nil)
+		p.runAsync = func(func()) {}
+		probeCalls := 0
+		p.probeFile = func(_ context.Context, path string) (*mp4.MediaInfo, error) {
+			probeCalls++
+			return &mp4.MediaInfo{
+				Container:  "mkv",
+				DurationMs: 1000,
+				Streams: []mp4.StreamInfo{{Index: 0, Type: "video", Codec: "h264"}},
+			}, nil
+		}
+		p.statFile = func(path string) (fs.FileInfo, error) {
+			return fakeFileInfo{size: 4321, mod: time.Unix(1, 0)}, nil
+		}
+
+		when "ingesting after the file changes" {
+			item, err := p.IngestPath(context.Background(), "/media/movies/Movie.mkv")
+
+			then "re-probes the file" {
+				expect err == nil
+				expect item != nil
+				expect probeCalls == 1
+				expect item.FileSize == 4321
+			}
+		}
+	}
+
+	given "a cached item with filename metadata and async resolver enabled" {
+		store := &fakeStore{
+			item: &library.MediaItem{
+				ID:       42,
+				Path:     "/media/movies/Movie.mkv",
+				FileSize: 1234,
+				Title:    "Movie 1080p DTS",
+				Container: "mkv",
+				Metadata: &library.Metadata{
+					Source:        "filename",
+					ResolvedTitle: "Movie 1080p DTS",
+					Year:          1999,
+					Confidence:    0.96,
+				},
+			},
+		}
+		p := NewPipeline(store, nil)
+		p.resolveAsync = true
+		p.runAsync = func(fn func()) { fn() }
+		p.resolveMetadata = func(ctx context.Context, path string, seed *library.Metadata) *library.Metadata {
+			return &library.Metadata{
+				Source:        "jellyfin",
+				RawTitle:      seed.RawTitle,
+				ResolvedTitle: "Movie",
+				Year:          1999,
+				Confidence:    0.99,
+			}
+		}
+		p.probeFile = func(_ context.Context, path string) (*mp4.MediaInfo, error) {
+			return nil, errors.New("probe should not run")
+		}
+		p.statFile = func(path string) (fs.FileInfo, error) {
+			return fakeFileInfo{size: 1234}, nil
+		}
+
+		when "ingesting the cached path again" {
+			item, err := p.IngestPath(context.Background(), "/media/movies/Movie.mkv")
+
+			then "returns the cached item and refreshes metadata asynchronously" {
+				expect err == nil
+				expect item != nil
+				expect item.ID == 42
+				expect store.item != nil
+				expect store.item.Metadata != nil
+				expect store.item.Metadata.Source == "jellyfin"
+				expect store.item.Title == "Movie"
+			}
+		}
+	}
+
+	given "a cached item with remote metadata but stale promoted fields" {
+		store := &fakeStore{
+			item: &library.MediaItem{
+				ID:       77,
+				Path:     "/media/movies/Space.mkv",
+				FileSize: 1234,
+				Title:    "A Space Odyssey 1968",
+				Year:     2001,
+				Container: "mkv",
+				Metadata: &library.Metadata{
+					Source:        "jellyfin",
+					ResolvedTitle: "2001: A Space Odyssey",
+					Year:          1968,
+					Confidence:    0.99,
+				},
+			},
+		}
+		p := NewPipeline(store, nil)
+		p.resolveAsync = true
+		p.runAsync = func(fn func()) { fn() }
+		p.resolveMetadata = func(ctx context.Context, path string, seed *library.Metadata) *library.Metadata {
+			return cloneMetadata(seed)
+		}
+		p.probeFile = func(_ context.Context, path string) (*mp4.MediaInfo, error) {
+			return nil, errors.New("probe should not run")
+		}
+		p.statFile = func(path string) (fs.FileInfo, error) {
+			return fakeFileInfo{size: 1234}, nil
+		}
+
+		when "ingesting the cached path again" {
+			item, err := p.IngestPath(context.Background(), "/media/movies/Space.mkv")
+
+			then "repairs the promoted title and year even when metadata is unchanged" {
+				expect err == nil
+				expect item != nil
+				expect store.item != nil
+				expect store.item.Title == "2001: A Space Odyssey"
+				expect store.item.Year == 1968
+			}
+		}
+	}
+}
+
+unit "Ingest async admission" {
+	given "a pipeline with a two task async budget" {
+		store := &fakeStore{}
+		p := NewPipeline(store, nil)
+		p.SetAsyncConcurrency(2)
+		started := make(chan struct{}, 2)
+		release := make(chan struct{})
+
+		when "three enrichment jobs are requested" {
+			first := p.startAsync(func() {
+				started <- struct{}{}
+				<-release
+			})
+			second := p.startAsync(func() {
+				started <- struct{}{}
+				<-release
+			})
+			<-started
+			<-started
+			third := p.startAsync(func() {})
+			snapshot := p.Snapshot()
+			close(release)
+			p.Close()
+			afterClose := p.Snapshot()
+
+			then "runs only up to the configured budget" {
+				expect first
+				expect second
+				reject third
+				expect snapshot.ActiveAsync == 2
+				expect snapshot.AsyncCapacity == 2
+				expect snapshot.AsyncRejected == 1
+				expect afterClose.ActiveAsync == 0
+			}
+		}
+	}
+}
+
+unit "Post-ingest speculative work falls back safely" {
+	given "a warmup policy evaluation error" {
+		queue := &fakeTranscodeQueue{}
+		p := NewPipeline(&fakeStore{}, &fakePolicyEngine{
+			evaluate: func(domain string, facts map[string]any) ([]vm.MatchedRule, error) {
+				if domain == "warmup" {
+					return nil, errors.New("policy unavailable")
+				}
+				return nil, nil
+			},
+		})
+		p.SetTranscodeQueue(queue)
+		item := &library.MediaItem{
+			ID:   1,
+			Path: "/media/movie.mkv",
+			Streams: []library.Stream{{
+				StreamType: "video",
+				Codec:      "h264",
+				Height:     1080,
+			}},
+		}
+
+		when "post-ingest jobs are evaluated" {
+			p.enqueuePostIngestJobs(item)
+
+			then "does not amplify work with default warmups" {
+				expect len(queue.jobs) == 0
+			}
+		}
+	}
+
+	given "a subtitle policy evaluation error" {
+		queue := &fakeTranscodeQueue{}
+		p := NewPipeline(&fakeStore{}, &fakePolicyEngine{
+			evaluate: func(domain string, facts map[string]any) ([]vm.MatchedRule, error) {
+				if domain == "subtitle" {
+					return nil, errors.New("policy unavailable")
+				}
+				return nil, nil
+			},
+		})
+		p.SetTranscodeQueue(queue)
+		item := &library.MediaItem{
+			ID:   2,
+			Path: "/media/bitmap.mkv",
+			Streams: []library.Stream{{
+				StreamType: "subtitle",
+				Codec:      "dvd_subtitle",
+				CodecTag:   "dvdsub",
+			}},
+		}
+
+		when "post-ingest jobs are evaluated" {
+			p.enqueuePostIngestJobs(item)
+
+			then "does not queue proactive OCR" {
+				for _, job := range queue.jobs {
+					if job.Type == transcode.JobTypeSubtitleOCR {
+						t.Fatalf("unexpected OCR job: %#v", job)
+					}
+				}
+			}
+		}
+	}
+}

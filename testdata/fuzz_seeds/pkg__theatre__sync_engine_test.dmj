@@ -1,0 +1,107 @@
+package theatre_test
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/theatre"
+)
+
+unit "SyncEngine messages" {
+	given "a sync engine" {
+		playback := theatre.NewPlaybackStateManager()
+		rooms := theatre.NewRuntimeManager()
+		engine := theatre.NewSyncEngine(playback, rooms)
+
+		when "encoding a heartbeat" {
+			playback.Set("room-1", theatre.PlaybackState{Position: 5000.0, Playing: true})
+			rooms.AddClient("room-1", 1, theatre.NewWsClient("room-1", "v1", false))
+			hb := engine.EncodeHeartbeat("room-1")
+
+			then "produces 16 bytes" {
+				expect len(hb) == 16
+			}
+			then "first byte is heartbeat type" {
+				expect hb[0] == byte(0x01)
+			}
+		}
+
+		when "creating sync prepare message" {
+			msg := engine.SyncPrepareMessage(42000.0, 73)
+
+			then "returns non-empty JSON" {
+				expect len(msg) > 0
+			}
+			then "includes transcode progress" {
+				expect strings.Contains(string(msg), "\"transcode_progress\":73")
+			}
+			then "includes a three second countdown" {
+				expect strings.Contains(string(msg), "\"countdown_ms\":3000")
+			}
+		}
+
+		when "creating sync play message" {
+			msg := engine.SyncPlayMessage(42000.0)
+
+			then "returns non-empty JSON" {
+				expect len(msg) > 0
+			}
+		}
+
+		when "creating pause message" {
+			msg := engine.PauseMessage(12345.0)
+
+			then "returns non-empty JSON" {
+				expect len(msg) > 0
+			}
+		}
+
+		when "creating seek message" {
+			msg := engine.SeekMessage(60000.0, true)
+
+			then "returns non-empty JSON" {
+				expect len(msg) > 0
+			}
+		}
+	}
+}
+
+unit "ComputeSnapshot" {
+	given "a sync engine with active room" {
+		playback := theatre.NewPlaybackStateManager()
+		rooms := theatre.NewRuntimeManager()
+		engine := theatre.NewSyncEngine(playback, rooms)
+
+		playback.Set("snap-room", theatre.PlaybackState{Position: 10000.0, Playing: true})
+		rooms.AddClient("snap-room", 1, theatre.NewWsClient("snap-room", "v1", false))
+		rooms.AddClient("snap-room", 2, theatre.NewWsClient("snap-room", "v2", false))
+
+		when "computing snapshot" {
+			snap := engine.ComputeSnapshot("snap-room")
+
+			then "has 2 viewers" {
+				expect snap.ViewerCount == 2
+			}
+			then "is playing" {
+				expect snap.Playing
+			}
+			then "has positive position" {
+				expect snap.Position >= 0
+			}
+		}
+	}
+
+	given "a sync engine with empty room" {
+		playback := theatre.NewPlaybackStateManager()
+		rooms := theatre.NewRuntimeManager()
+		engine := theatre.NewSyncEngine(playback, rooms)
+
+		when "computing snapshot for nonexistent room" {
+			snap := engine.ComputeSnapshot("ghost-room")
+
+			then "has 0 viewers" {
+				expect snap.ViewerCount == 0
+			}
+		}
+	}
+}

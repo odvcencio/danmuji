@@ -1,0 +1,35 @@
+package theatre
+
+import (
+	"strings"
+	"testing"
+)
+
+unit "playlist websocket messages carry rich entries when available" {
+	room := &Room{
+		Playlist:         []int64{7, 9},
+		CurrentItemIndex: 0,
+	}
+	entries := []PlaylistEntryMessage{
+		{MediaItemID: 7, Title: "Seven.raw", DisplayTitle: "Seven", Year: 2007, DurationMS: 7000},
+		{MediaItemID: 9, Title: "Nine.raw", DisplayTitle: "Nine", Year: 2009, DurationMS: 9000},
+	}
+
+	update := string(PlaylistUpdateMessageWithEntries(room, entries))
+	change := string(PlaylistChangeMessageWithEntries(room, entries))
+
+	then "keeps the legacy playlist contract" {
+		expect strings.Contains(update, "\"type\":\"playlist_update\"")
+		expect strings.Contains(update, "\"playlist\":[7,9]")
+		expect strings.Contains(change, "\"type\":\"playlist_change\"")
+		expect strings.Contains(change, "\"itemId\":7")
+	}
+	then "adds current and next rich metadata" {
+		expect strings.Contains(update, "\"playlist_entries\"")
+		expect strings.Contains(update, "\"current_item\"")
+		expect strings.Contains(update, "\"next_item\"")
+		expect strings.Contains(update, "\"display_title\":\"Seven\"")
+		expect strings.Contains(update, "\"duration_ms\":9000")
+		expect strings.Contains(change, "\"display_title\":\"Nine\"")
+	}
+}

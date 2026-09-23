@@ -1,0 +1,182 @@
+package theatre_test
+
+import (
+	"context"
+	"fmt"
+	"testing"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
+
+	"github.com/odvcencio/goetrope/pkg/db"
+	"github.com/odvcencio/goetrope/pkg/theatre"
+)
+
+integration "Theatre room lifecycle" {
+	before all {
+		ctx := context.Background()
+		pgReq := testcontainers.ContainerRequest{
+			Image:        "postgres:15",
+			ExposedPorts: []string{"5432/tcp"},
+			Env: map[string]string{
+				"POSTGRES_USER":     "test",
+				"POSTGRES_PASSWORD": "test",
+				"POSTGRES_DB":       "goetrope_test",
+			},
+			WaitingFor: wait.ForLog("database system is ready to accept connections").WithOccurrence(2),
+		}
+		pgContainer, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+			ContainerRequest: pgReq,
+			Started:          true,
+		})
+		if err != nil {
+			t.Fatalf("start postgres: %v", err)
+		}
+		t.Cleanup(func() { _ = pgContainer.Terminate(ctx) })
+
+		pgHost, err := pgContainer.Host(ctx)
+		if err != nil {
+			t.Fatalf("get host: %v", err)
+		}
+		pgPort, err := pgContainer.MappedPort(ctx, "5432/tcp")
+		if err != nil {
+			t.Fatalf("get port: %v", err)
+		}
+		connStr := fmt.Sprintf("postgres://test:test@%s:%s/goetrope_test?sslmode=disable", pgHost, pgPort.Port())
+
+		pool, err := pgxpool.New(ctx, connStr)
+		if err != nil {
+			t.Fatalf("connect: %v", err)
+		}
+		t.Cleanup(func() { pool.Close() })
+
+		if migErr := db.Migrate(ctx, pool); migErr != nil {
+			t.Fatalf("migrate: %v", migErr)
+		}
+
+		mgr := theatre.NewManager(pool, nil)
+	}
+
+	given "no rooms exist" {
+		when "creating a public room" {
+			room, err := mgr.CreateRoom(ctx, theatre.CreateRoomInput{
+				AccessMode: theatre.AccessModePublic,
+			})
+
+			then "succeeds" {
+				expect err == nil
+				expect room not_nil
+			}
+			then "generates a room code" {
+				expect len(room.RoomCode) == 6
+			}
+			then "generates an admin token" {
+				expect room.AdminToken != ""
+			}
+			then "sets expiration" {
+				expect room.ExpiresAt.After(room.CreatedAt)
+			}
+		}
+
+		when "creating a password-protected room" {
+			room, err := mgr.CreateRoom(ctx, theatre.CreateRoomInput{
+				AccessMode: theatre.AccessModePassword,
+				Password:   "secret123",
+			})
+
+			then "succeeds" {
+				expect err == nil
+				expect room not_nil
+			}
+			then "stores a password hash" {
+				expect room.PasswordHash != ""
+				expect room.PasswordHash != "secret123"
+			}
+		}
+	}
+
+	given "a room exists" {
+		room, createErr := mgr.CreateRoom(ctx, theatre.CreateRoomInput{
+			AccessMode: theatre.AccessModePublic,
+		})
+		expect createErr == nil
+
+		when "retrieving by code" {
+			got, err := mgr.GetRoom(ctx, room.RoomCode)
+
+			then "succeeds" {
+				expect err == nil
+				expect got.RoomCode == room.RoomCode
+			}
+		}
+
+		when "retrieving as admin" {
+			got, err := mgr.GetControlRoom(ctx, room.RoomCode, room.AdminToken)
+
+			then "succeeds" {
+				expect err == nil
+				expect got.AdminToken == room.AdminToken
+			}
+		}
+
+		when "retrieving with wrong admin token" {
+			_, err := mgr.GetControlRoom(ctx, room.RoomCode, "wrong-token")
+
+			then "returns an error" {
+				expect err != nil
+			}
+		}
+
+		when "updating playback position" {
+			err := mgr.UpdatePlayback(ctx, room.RoomCode, 45000)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "persists the position" {
+				got, _ := mgr.GetRoom(ctx, room.RoomCode)
+				expect got.PlaybackPositionMs == int64(45000)
+			}
+		}
+	}
+
+	given "a room with playlist items" {
+		room, _ := mgr.CreateRoom(ctx, theatre.CreateRoomInput{
+			AccessMode: theatre.AccessModePublic,
+		})
+
+		when "appending items" {
+			_, err1 := mgr.AppendPlaylistItem(ctx, room.RoomCode, 100)
+			_, err2 := mgr.AppendPlaylistItem(ctx, room.RoomCode, 200)
+			_, err3 := mgr.AppendPlaylistItem(ctx, room.RoomCode, 300)
+
+			then "all succeed" {
+				expect err1 == nil
+				expect err2 == nil
+				expect err3 == nil
+			}
+			then "playlist has 3 items" {
+				got, _ := mgr.GetRoom(ctx, room.RoomCode)
+				expect len(got.Playlist) == 3
+			}
+		}
+
+		when "advancing the playlist" {
+			// Set up a room with items
+			r, _ := mgr.CreateRoom(ctx, theatre.CreateRoomInput{AccessMode: theatre.AccessModePublic})
+			mgr.AppendPlaylistItem(ctx, r.RoomCode, 10)
+			mgr.AppendPlaylistItem(ctx, r.RoomCode, 20)
+			mgr.AppendPlaylistItem(ctx, r.RoomCode, 30)
+
+			advanced, err := mgr.AdvancePlaylist(ctx, r.RoomCode, 1)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "moves to next item" {
+				expect advanced.CurrentItemIndex == 1
+			}
+		}
+	}
+}

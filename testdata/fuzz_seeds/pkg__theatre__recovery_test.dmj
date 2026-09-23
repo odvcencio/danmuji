@@ -1,0 +1,93 @@
+package theatre
+
+import (
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/library"
+	"github.com/odvcencio/goetrope/pkg/transcode"
+)
+
+unit "bounded theatre runtime rehydration" {
+	given "recoverable room snapshots in unstable input order" {
+		snapshots := []RecoverableRoom{
+			{ID: 3, RoomCode: "ZZ9999", Playlist: []int64{30}},
+			{ID: 2, RoomCode: "AA0002", Playlist: []int64{20, 21}},
+			{ID: 1, RoomCode: "AA0001", Playlist: []int64{10, 11}},
+		}
+
+		when "ordering with an explicit cap" {
+			ordered, overflow := orderRecoverableRooms(snapshots, 2)
+
+			then "it is stable and reports overflow" {
+				expect overflow
+				expect len(ordered) == 2
+				expect ordered[0].RoomCode == "AA0001"
+				expect ordered[1].RoomCode == "AA0002"
+			}
+		}
+	}
+
+	given "a recoverable room with a current cursor" {
+		snapshot := RecoverableRoom{RoomCode: "ROOM01", Playlist: []int64{10, 20, 30}, CurrentItemIndex: 1}
+		room := roomFromRecoverySnapshot(snapshot)
+
+		when "selecting the bounded delivery window" {
+			current, next := roomDeliveryItems(room)
+			item := &library.MediaItem{ID: current}
+			firstKey := deliveryDesiredKey(room, item, "current", transcode.JobTypeTheatre, "h264-720p", 0, 120)
+			secondKey := deliveryDesiredKey(room, item, "current", transcode.JobTypeTheatre, "h264-720p", 0, 120)
+
+			then "it selects current and immediate-next only" {
+				expect current == 20
+				expect next == 30
+				expect firstKey == secondKey
+				expect firstKey == "room=ROOM01|phase=current|item=20|type=theatre|quality=h264-720p|window=0:120"
+			}
+		}
+	}
+
+	given "an AV1 theatre delivery action requests a high transcode rung" {
+		item := &library.MediaItem{
+			ID: 935,
+			Streams: []library.Stream{
+				{StreamType: "video", Codec: "av1", Width: 1920, Height: 1080},
+			},
+		}
+
+		when "bounding cache work for active and next-room phases" {
+			current := boundedDeliveryQuality(item, "h264-720p", transcode.JobTypeTheatre)
+			next := boundedDeliveryQuality(item, "h264-720p", transcode.JobTypeLiveCache)
+			original := boundedDeliveryQuality(item, "original", transcode.JobTypeTheatre)
+
+			then "it keeps direct play but clamps transcode work to the base rung" {
+				expect current == "h264-480p"
+				expect next == "h264-480p"
+				expect original == "original"
+			}
+		}
+	}
+
+	given "soft theatre recovery observations" {
+		reasons := []string{"cache_unavailable", "playlist_projected", "playlist_overflow"}
+
+		when "classifying delivery recovery reasons" {
+			degraded := hasDeliveryDegradeReason(reasons)
+
+			then "direct-play cache preparation and bounded projection are not degrading by themselves" {
+				reject degraded
+			}
+		}
+	}
+
+	given "soft and hard theatre recovery observations together" {
+		reasons := []string{"cache_unavailable", "worker_unavailable"}
+
+		when "classifying delivery recovery reasons" {
+			degraded := hasDeliveryDegradeReason(reasons)
+
+			then "the hard reason keeps recovery degraded" {
+				expect degraded
+			}
+		}
+	}
+}

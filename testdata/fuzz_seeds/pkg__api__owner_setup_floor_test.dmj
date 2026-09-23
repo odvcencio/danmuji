@@ -1,0 +1,310 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/odvcencio/goetrope/pkg/auth"
+)
+
+type ownerSetupFloorSpecService struct {
+	state       auth.SetupState
+	stateErr    error
+	stateCalls  atomic.Int64
+	consumeErr  error
+	consumes    atomic.Int64
+	seenToken   []byte
+	seenUser    []byte
+	seenPass    []byte
+}
+
+type ownerSetupFloorRaceService struct {
+	winner atomic.Bool
+}
+
+func (s *ownerSetupFloorRaceService) SetupState(context.Context) (auth.SetupState, error) {
+	if s.winner.Load() {
+		return auth.SetupState{FeatureActive: true, ActiveOwnerID: 42}, nil
+	}
+	return auth.SetupState{FeatureActive: true, SetupRequired: true}, nil
+}
+
+func (s *ownerSetupFloorRaceService) ConsumeBootstrap(context.Context, []byte, []byte, []byte) (int64, error) {
+	if s.winner.CompareAndSwap(false, true) {
+		return 42, nil
+	}
+	return 0, auth.ErrOwnerExists
+}
+
+func (s *ownerSetupFloorSpecService) SetupState(context.Context) (auth.SetupState, error) {
+	s.stateCalls.Add(1)
+	return s.state, s.stateErr
+}
+
+func (s *ownerSetupFloorSpecService) ConsumeBootstrap(_ context.Context, token, password, username []byte) (int64, error) {
+	s.consumes.Add(1)
+	s.seenToken = token
+	s.seenPass = password
+	s.seenUser = username
+	if s.consumeErr != nil {
+		return 0, s.consumeErr
+	}
+	return 42, nil
+}
+
+type ownerSetupBlockingService struct {
+	state      auth.SetupState
+	stateErr   error
+	started    chan struct{}
+	release    chan struct{}
+	done       chan struct{}
+	startOnce  sync.Once
+	doneOnce   sync.Once
+	stateCalls atomic.Int64
+}
+
+func (s *ownerSetupBlockingService) SetupState(ctx context.Context) (auth.SetupState, error) {
+	s.stateCalls.Add(1)
+	s.startOnce.Do(func() { close(s.started) })
+	defer s.doneOnce.Do(func() { close(s.done) })
+	select {
+	case <-s.release:
+		return s.state, s.stateErr
+	case <-ctx.Done():
+		return auth.SetupState{}, ctx.Err()
+	}
+}
+
+func (s *ownerSetupBlockingService) ConsumeBootstrap(context.Context, []byte, []byte, []byte) (int64, error) {
+	return 0, errors.New("not used")
+}
+
+func ownerSetupFloorSpecRequest(handler http.Handler, method, target, remote string, body []byte) *httptest.ResponseRecorder {
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(method, target, bytes.NewReader(body))
+	request.RemoteAddr = remote
+	if body != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	handler.ServeHTTP(recorder, request)
+	return recorder
+}
+
+func ownerSetupAllZero(value []byte) bool {
+	for _, item := range value {
+		if item != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func ownerSetupMust(t *testing.T, condition bool) {
+	t.Helper()
+	if !condition {
+		t.Fatal("owner setup specification condition failed")
+	}
+}
+
+unit "canonical pre-owner HTTP floor" {
+	then "literal route exceptions" {
+		service := &ownerSetupFloorSpecService{state: auth.SetupState{FeatureActive: true, SetupRequired: true}}
+		nextCalls := atomic.Int64{}
+		next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			nextCalls.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		})
+		floor, err := newOwnerSetupFloor(context.Background(), next, service, service.state)
+		if err != nil { t.Fatal(err) }
+		floor.now = func() time.Time { return time.Unix(100, 0) }
+		floor.checkedAt = time.Unix(100, 0)
+
+		for _, method := range []string{http.MethodGet, http.MethodHead} {
+			live := ownerSetupFloorSpecRequest(floor, method, "/live", "203.0.113.5:4000", nil)
+			if live.Code != http.StatusOK { t.Fatalf("live status = %d", live.Code) }
+		}
+		for _, method := range []string{http.MethodGet, http.MethodPost} {
+			setupResponse := ownerSetupFloorSpecRequest(floor, method, "/setup", "127.0.0.1:4000", []byte(`{"token":"bad","username":"owner","password":"bad"}`))
+			if method == http.MethodGet {
+				ownerSetupMust(t, setupResponse.Code == http.StatusOK)
+			} else {
+				ownerSetupMust(t, setupResponse.Code == http.StatusUnauthorized)
+			}
+		}
+
+		type hostileCase struct {
+			method string
+			target string
+			mutate func(*http.Request)
+		}
+		cases := []hostileCase{
+			{http.MethodGet, "/%6cive", nil}, {http.MethodGet, "/%73etup", nil},
+			{http.MethodGet, "/setup/", nil}, {http.MethodGet, "//setup", nil},
+			{http.MethodGet, "/./setup", nil}, {http.MethodGet, "/x/../setup", nil},
+			{http.MethodGet, "/setup%2f", nil}, {http.MethodGet, "/setup%2e", nil},
+			{http.MethodGet, "/setup;", nil}, {http.MethodGet, "/setup%5c", nil},
+			{http.MethodGet, "/setup?x=1", nil}, {http.MethodGet, "/live?x=1", nil},
+			{http.MethodOptions, "/setup", nil}, {http.MethodHead, "/setup", nil},
+			{http.MethodPost, "/live", nil},
+			{http.MethodGet, "/setup", func(r *http.Request) { r.URL.Fragment = "x" }},
+			{http.MethodGet, "/setup", func(r *http.Request) { r.URL.ForceQuery = true }},
+			{http.MethodGet, "/setup", func(r *http.Request) { r.URL.RawPath = "/%73etup" }},
+			{http.MethodGet, "/setup", func(r *http.Request) { r.Header.Set("Connection", "upgrade"); r.Header.Set("Upgrade", "websocket") }},
+		}
+		for _, test := range cases {
+			req := httptest.NewRequest(test.method, test.target, nil)
+			req.RemoteAddr = "127.0.0.1:4000"
+			if test.mutate != nil {
+				test.mutate(req)
+			}
+			recorder := httptest.NewRecorder()
+			floor.ServeHTTP(recorder, req)
+			ownerSetupMust(t, recorder.Code == http.StatusServiceUnavailable)
+			ownerSetupMust(t, recorder.Body.String() == "{\"code\":\"setup_required\"}\n")
+		}
+		ownerSetupMust(t, nextCalls.Load() == int64(0))
+	}
+
+	then "uniform safe response" {
+		service := &ownerSetupFloorSpecService{state: auth.SetupState{FeatureActive: true, SetupRequired: true}}
+		floor, err := newOwnerSetupFloor(context.Background(), http.NotFoundHandler(), service, service.state)
+		if err != nil { t.Fatal(err) }
+		for _, target := range []string{
+			"/api/auth/discord/login", "/api/auth/discord/callback?code=marker", "/api/discord/interactions",
+			"/api/library", "/stream/1/master.m3u8", "/api/theatre/room/ws", string([]byte{'/', 'r', 'e', 'a', 'd', 'y'}), "/health/details",
+			"/static/app.js", "/", "/unknown/route",
+		} {
+			recorder := ownerSetupFloorSpecRequest(floor, http.MethodGet, target, "127.0.0.1:4000", nil)
+			ownerSetupMust(t, recorder.Code == http.StatusServiceUnavailable)
+			ownerSetupMust(t, recorder.Header().Get("Content-Type") == "application/json")
+			ownerSetupMust(t, recorder.Header().Get("Cache-Control") == "no-store")
+			ownerSetupMust(t, recorder.Body.String() == "{\"code\":\"setup_required\"}\n")
+			ownerSetupMust(t, !strings.Contains(recorder.Body.String(), "marker"))
+		}
+	}
+
+	then "loopback setup transition" {
+		service := &ownerSetupFloorSpecService{state: auth.SetupState{FeatureActive: true, SetupRequired: true}}
+		nextCalls := atomic.Int64{}
+		next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			nextCalls.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		})
+		floor, err := newOwnerSetupFloor(context.Background(), next, service, service.state)
+		if err != nil {
+			t.Fatal(err)
+		}
+		remote := ownerSetupFloorSpecRequest(floor, http.MethodGet, "/setup", "203.0.113.5:4000", nil)
+		ownerSetupMust(t, remote.Code == http.StatusForbidden)
+		body := []byte(`{"token":"KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio","username":"owner","password":"Correct Horse Battery 7"}`)
+		created := ownerSetupFloorSpecRequest(floor, http.MethodPost, "/setup", "127.0.0.1:4000", body)
+		ownerSetupMust(t, created.Code == http.StatusCreated)
+		normal := ownerSetupFloorSpecRequest(floor, http.MethodGet, "/api/library", "127.0.0.1:4000", nil)
+		ownerSetupMust(t, normal.Code == http.StatusNoContent)
+		ownerSetupMust(t, nextCalls.Load() == int64(1))
+		setupAgain := ownerSetupFloorSpecRequest(floor, http.MethodGet, "/setup", "127.0.0.1:4000", nil)
+		ownerSetupMust(t, setupAgain.Code == http.StatusNotFound)
+	}
+
+	then "single setup winner" {
+		service := &ownerSetupFloorRaceService{}
+		floor, err := newOwnerSetupFloor(context.Background(), http.NotFoundHandler(), service, auth.SetupState{FeatureActive: true, SetupRequired: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := []byte(`{"token":"KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio","username":"owner","password":"Correct Horse Battery 7"}`)
+		start := make(chan struct{})
+		codes := make(chan int, 2)
+		var wg sync.WaitGroup
+		for index := 0; index < 2; index++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				codes <- ownerSetupFloorSpecRequest(floor, http.MethodPost, "/setup", "127.0.0.1:4000", body).Code
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(codes)
+		created := 0
+		closedLoser := 0
+		for code := range codes {
+			if code == http.StatusCreated {
+				created++
+			} else if code == http.StatusConflict || code == http.StatusNotFound {
+				closedLoser++
+			}
+		}
+		ownerSetupMust(t, created == 1)
+		ownerSetupMust(t, closedLoser == 1)
+	}
+}
+
+unit "wiped exact setup document" {
+	then "wiped decoded JSON fields" {
+		for _, consumeErr := range []error{nil, auth.ErrOwnerCredentialInvalid, errors.New("database marker")} {
+			service := &ownerSetupFloorSpecService{state: auth.SetupState{FeatureActive: true, SetupRequired: true}, consumeErr: consumeErr}
+			floor, err := newOwnerSetupFloor(context.Background(), http.NotFoundHandler(), service, service.state)
+			if err != nil { t.Fatal(err) }
+			raw := []byte(`{"token":"\u0052EREREREREREREREREREREREREREREREREREREREREQ","username":"ow\u006eer","password":"Correct\u0020Horse\u0020Battery\u00207"}`)
+			recorder := httptest.NewRecorder()
+			floor.consumeSetupOwned(recorder, context.Background(), raw)
+			if consumeErr == nil {
+				ownerSetupMust(t, recorder.Code == http.StatusCreated)
+			} else if errors.Is(consumeErr, auth.ErrOwnerCredentialInvalid) {
+				ownerSetupMust(t, recorder.Code == http.StatusUnauthorized)
+			} else {
+				ownerSetupMust(t, recorder.Code == http.StatusServiceUnavailable)
+			}
+			ownerSetupMust(t, ownerSetupAllZero(raw))
+			ownerSetupMust(t, ownerSetupAllZero(service.seenToken))
+			ownerSetupMust(t, ownerSetupAllZero(service.seenPass))
+			ownerSetupMust(t, ownerSetupAllZero(service.seenUser))
+		}
+	}
+
+	then "invalid document rejection and erasure" {
+		invalid := [][]byte{
+			[]byte(`{"token":"x","token":"y","username":"owner","password":"Correct Horse Battery 7"}`),
+			[]byte(`{"token":"x","username":"owner","password":"Correct Horse Battery 7","extra":"x"}`),
+			[]byte(`{"username":"owner","password":"Correct Horse Battery 7"}`),
+			[]byte(`{"token":"x","username":"owner","password":"Correct Horse Battery 7"} {}`),
+			[]byte(`{"token":7,"username":"owner","password":"Correct Horse Battery 7"}`),
+			[]byte(`{"token":"x","username":null,"password":"Correct Horse Battery 7"}`),
+		}
+		for _, raw := range invalid {
+			service := &ownerSetupFloorSpecService{state: auth.SetupState{FeatureActive: true, SetupRequired: true}}
+			floor, err := newOwnerSetupFloor(context.Background(), http.NotFoundHandler(), service, service.state)
+			if err != nil { t.Fatal(err) }
+			recorder := httptest.NewRecorder()
+			floor.consumeSetupOwned(recorder, context.Background(), raw)
+			ownerSetupMust(t, recorder.Code == http.StatusBadRequest)
+			ownerSetupMust(t, ownerSetupAllZero(raw))
+			ownerSetupMust(t, service.consumes.Load() == int64(0))
+		}
+	}
+
+	then "bounded request rejection" {
+		service := &ownerSetupFloorSpecService{state: auth.SetupState{FeatureActive: true, SetupRequired: true}}
+		floor, err := newOwnerSetupFloor(context.Background(), http.NotFoundHandler(), service, service.state)
+		if err != nil { t.Fatal(err) }
+		wrong := httptest.NewRequest(http.MethodPost, "/setup", strings.NewReader(`{}`))
+		wrong.RemoteAddr = "127.0.0.1:4000"
+		wrong.Header.Set("Content-Type", "text/plain")
+		wrongRecorder := httptest.NewRecorder()
+		floor.ServeHTTP(wrongRecorder, wrong)
+		ownerSetupMust(t, wrongRecorder.Code == http.StatusUnsupportedMediaType)
+		oversized := ownerSetupFloorSpecRequest(floor, http.MethodPost, "/setup", "127.0.0.1:4000", bytes.Repeat([]byte{'a'}, ownerSetupBodyLimit+1))
+		ownerSetupMust(t, oversized.Code == http.StatusRequestEntityTooLarge)
+		ownerSetupMust(t, service.consumes.Load() == int64(0))
+	}
+}

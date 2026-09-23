@@ -1,0 +1,275 @@
+package config
+
+import (
+	"strings"
+	"testing"
+)
+
+func securitySpecProduction() Config {
+	cfg := Defaults()
+	cfg.Security.MasterKeySource = "env:GOETROPE_TEST_MASTER_KEYS"
+	return Normalize(cfg)
+}
+
+unit "security mode defaults" {
+	then "defaults are private production embedded with loopback listeners" {
+		cfg := Normalize(Defaults())
+		expect cfg.Security.Runtime == RuntimeProduction
+		expect cfg.Security.Exposure == ExposurePrivate
+		expect cfg.Worker.Mode == WorkerEmbedded
+		expect cfg.Worker.RemoteMinReady != nil
+		expect *cfg.Worker.RemoteMinReady == 0
+		expect cfg.Server.Listen == "127.0.0.1:3000"
+		expect cfg.Server.GRPCListen == "127.0.0.1:9090"
+	}
+
+	then "remote and both receive different omitted readiness defaults" {
+		remote := Defaults()
+		remote.Worker.Mode = WorkerRemote
+		remote = Normalize(remote)
+		expect *remote.Worker.RemoteMinReady == 1
+
+		both := Defaults()
+		both.Worker.Mode = WorkerBoth
+		both = Normalize(both)
+		expect *both.Worker.RemoteMinReady == 0
+	}
+}
+
+unit "development truth table" {
+	given "a private embedded loopback configuration" {
+		cfg := Defaults()
+		cfg.Security.Runtime = RuntimeDevelopment
+		cfg = Normalize(cfg)
+
+		then "ephemeral development is valid" {
+			expect Validate(cfg) == nil
+		}
+	}
+
+	then "hybrid development is rejected with a field diagnostic" {
+		cfg := Defaults()
+		cfg.Security.Runtime = RuntimeDevelopment
+		cfg.Security.Exposure = ExposureHybrid
+		cfg = Normalize(cfg)
+		err := Validate(cfg)
+		expect err != nil
+		expect strings.Contains(err.Error(), "security.exposure")
+	}
+
+	then "remote development is rejected" {
+		cfg := Defaults()
+		cfg.Security.Runtime = RuntimeDevelopment
+		cfg.Worker.Mode = WorkerRemote
+		cfg = Normalize(cfg)
+		err := Validate(cfg)
+		expect err != nil
+		expect strings.Contains(err.Error(), "worker.mode")
+	}
+
+	then "wildcard empty and hostname listeners are not loopback" {
+		for _, listener := range []string{":3000", "0.0.0.0:3000", "[::]:3000", "localhost:3000", "127.0.0.1:not-a-port", "127.0.0.1:0"} {
+			cfg := Defaults()
+			cfg.Security.Runtime = RuntimeDevelopment
+			cfg.Server.Listen = listener
+			cfg = Normalize(cfg)
+			err := Validate(cfg)
+			expect err != nil
+			expect strings.Contains(err.Error(), "server.listen")
+		}
+	}
+}
+
+unit "production and hybrid truth table" {
+	then "production requires an explicit master key source" {
+		cfg := Normalize(Defaults())
+		err := Validate(cfg)
+		expect err != nil
+		expect strings.Contains(err.Error(), "security.master_key_source")
+	}
+
+	then "environment injection is an explicit production source" {
+		cfg := securitySpecProduction()
+		expect Validate(cfg) == nil
+	}
+
+	then "hybrid requires HTTPS base and trusted proxy CIDRs" {
+		cfg := securitySpecProduction()
+		cfg.Security.Exposure = ExposureHybrid
+		err := Validate(cfg)
+		expect err != nil
+		expect strings.Contains(err.Error(), "server.external_base_url")
+		expect strings.Contains(err.Error(), "security.trusted_proxy_cidrs")
+	}
+
+	then "hybrid accepts an HTTPS origin and explicit CIDR and activates" {
+		cfg := securitySpecProduction()
+		cfg.Security.Exposure = ExposureHybrid
+		cfg.Server.ExternalBaseURL = "https://watch.example.test"
+		cfg.Security.TrustedProxyCIDRs = []string{"10.42.0.0/16"}
+		expect Validate(cfg) == nil
+		expect ValidateActivation(cfg) == nil
+	}
+
+	then "hybrid cannot explicitly disable secure cookies" {
+		insecure := false
+		cfg := securitySpecProduction()
+		cfg.Security.Exposure = ExposureHybrid
+		cfg.Server.ExternalBaseURL = "https://watch.example.test"
+		cfg.Security.TrustedProxyCIDRs = []string{"10.42.0.0/16"}
+		cfg.Auth.CookieSecure = &insecure
+		err := Validate(cfg)
+		expect err != nil
+		expect strings.Contains(err.Error(), "auth.cookie_secure")
+	}
+
+	then "non-loopback private HTTP requires a named protected edge" {
+		cfg := securitySpecProduction()
+		cfg.Server.Listen = "192.0.2.10:3000"
+		err := Validate(cfg)
+		expect err != nil
+		expect strings.Contains(err.Error(), "security.private_edge")
+		cfg.Security.PrivateEdge = PrivateEdgeSecureOverlay
+		expect Validate(cfg) == nil
+	}
+
+	then "non-loopback private HTTP activation requires an HTTPS external base URL" {
+		cfg := securitySpecProduction()
+		cfg.Server.Listen = "192.0.2.10:3000"
+		cfg.Security.PrivateEdge = PrivateEdgeTLSProxy
+		expect Validate(cfg) == nil
+		activationErr := ValidateActivation(cfg)
+		expect activationErr != nil
+		expect strings.Contains(activationErr.Error(), "server.external_base_url")
+		cfg.Server.ExternalBaseURL = "https://watch.example.test"
+		expect ValidateActivation(cfg) == nil
+	}
+
+	then "a protected edge still requires an explicit listener IP" {
+		cfg := securitySpecProduction()
+		cfg.Server.Listen = ":3000"
+		cfg.Security.PrivateEdge = PrivateEdgeTLSProxy
+		err := Validate(cfg)
+		expect err != nil
+		expect strings.Contains(err.Error(), "server.listen")
+	}
+}
+
+unit "HTTP activation fence" {
+	then "loopback private embedded activation remains available" {
+		cfg := securitySpecProduction()
+		expect ValidateActivation(cfg) == nil
+	}
+
+	then "hybrid and non-loopback listeners activate with the S2.4 envelope configured" {
+		hybrid := securitySpecProduction()
+		hybrid.Security.Exposure = ExposureHybrid
+		hybrid.Server.ExternalBaseURL = "https://watch.example.test"
+		hybrid.Security.TrustedProxyCIDRs = []string{"10.42.0.0/16"}
+		expect Validate(hybrid) == nil
+		expect ValidateActivation(hybrid) == nil
+
+		nonLoopback := securitySpecProduction()
+		nonLoopback.Server.Listen = "192.0.2.10:3000"
+		nonLoopback.Security.PrivateEdge = PrivateEdgeTLSProxy
+		nonLoopback.Server.ExternalBaseURL = "https://watch.example.test"
+		expect Validate(nonLoopback) == nil
+		expect ValidateActivation(nonLoopback) == nil
+	}
+
+	then "a non-loopback listener without an HTTPS external base URL fails closed" {
+		nonLoopback := securitySpecProduction()
+		nonLoopback.Server.Listen = "192.0.2.10:3000"
+		nonLoopback.Security.PrivateEdge = PrivateEdgeTLSProxy
+		expect Validate(nonLoopback) == nil
+		err := ValidateActivation(nonLoopback)
+		expect err != nil
+		expect strings.Contains(err.Error(), "server.external_base_url")
+	}
+}
+
+unit "worker activation fence" {
+	then "remote readiness validates but activation fails closed until v2" {
+		cfg := securitySpecProduction()
+		cfg.Worker.Mode = WorkerRemote
+		cfg.Worker.RemoteMinReady = nil
+		cfg.Worker.CredentialSource = "file:/run/secrets/worker-credential"
+		cfg.Worker.TLS.CASource = "file:/run/secrets/worker-ca.pem"
+		cfg.Worker.TLS.ServerName = "worker.example.test"
+		cfg = Normalize(cfg)
+		expect Validate(cfg) == nil
+		err := ValidateActivation(cfg)
+		expect err != nil
+		expect strings.Contains(err.Error(), "worker.mode")
+		expect strings.Contains(err.Error(), "S2.8")
+	}
+
+	then "remote explicit zero fails the readiness minimum" {
+		zero := 0
+		cfg := securitySpecProduction()
+		cfg.Worker.Mode = WorkerRemote
+		cfg.Worker.RemoteMinReady = &zero
+		cfg.Worker.CredentialSource = "file:/run/secrets/worker-credential"
+		cfg.Worker.TLS.CASource = "file:/run/secrets/worker-ca.pem"
+		cfg.Worker.TLS.ServerName = "worker.example.test"
+		err := Validate(cfg)
+		expect err != nil
+		expect strings.Contains(err.Error(), "worker.remote_min_ready")
+	}
+
+	then "an external remote listener requires server TLS references" {
+		cfg := securitySpecProduction()
+		cfg.Worker.Mode = WorkerRemote
+		cfg.Worker.RemoteMinReady = nil
+		cfg.Worker.CredentialSource = "file:/run/secrets/worker-credential"
+		cfg.Worker.TLS.CASource = "file:/run/secrets/worker-ca.pem"
+		cfg.Worker.TLS.ServerName = "worker.example.test"
+		cfg.Server.GRPCListen = "0.0.0.0:9090"
+		cfg = Normalize(cfg)
+		err := Validate(cfg)
+		expect err != nil
+		expect strings.Contains(err.Error(), "worker.tls.cert_source")
+		expect strings.Contains(err.Error(), "worker.tls.key_source")
+	}
+
+	then "remote and both reject missing scoped worker credentials" {
+		for _, mode := range []WorkerMode{WorkerRemote, WorkerBoth} {
+			cfg := securitySpecProduction()
+			cfg.Worker.Mode = mode
+			cfg = Normalize(cfg)
+			err := Validate(cfg)
+			expect err != nil
+			expect strings.Contains(err.Error(), "worker.credential_source")
+		}
+	}
+
+	then "remote and both reject missing CA source or server name" {
+		for _, mode := range []WorkerMode{WorkerRemote, WorkerBoth} {
+			cfg := securitySpecProduction()
+			cfg.Worker.Mode = mode
+			cfg.Worker.CredentialSource = "file:/run/secrets/worker-credential"
+			cfg = Normalize(cfg)
+			err := Validate(cfg)
+			expect err != nil
+			expect strings.Contains(err.Error(), "worker.tls.ca_source")
+			expect strings.Contains(err.Error(), "worker.tls.server_name")
+		}
+	}
+
+	then "both requires server TLS sources even on its loopback listener" {
+		cfg := securitySpecProduction()
+		cfg.Worker.Mode = WorkerBoth
+		cfg.Worker.CredentialSource = "file:/run/secrets/worker-credential"
+		cfg.Worker.TLS.CASource = "file:/run/secrets/worker-ca.pem"
+		cfg.Worker.TLS.ServerName = "worker.example.test"
+		cfg = Normalize(cfg)
+		err := Validate(cfg)
+		expect err != nil
+		expect strings.Contains(err.Error(), "worker.tls.cert_source")
+		expect strings.Contains(err.Error(), "worker.tls.key_source")
+		cfg.Worker.TLS.CertSource = "file:/run/secrets/worker-server.crt"
+		cfg.Worker.TLS.KeySource = "file:/run/secrets/worker-server.key"
+		expect Validate(cfg) == nil
+		expect ValidateActivation(cfg) == nil
+	}
+}

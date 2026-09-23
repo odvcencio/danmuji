@@ -1,0 +1,314 @@
+package stream_test
+
+import (
+	"bytes"
+	"encoding/binary"
+	"os"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/container/mp4"
+	"github.com/odvcencio/goetrope/pkg/stream"
+)
+
+// buildTestMP4 creates a minimal valid MP4 file in memory with:
+// - ftyp box
+// - moov box containing one video trak with stbl (stsz, stco, stsc, stts, stss, stsd/avcC)
+// - mdat box with fake length-prefixed NAL units
+// Returns the raw bytes and the number of samples.
+func buildTestMP4(numSamples int, sampleSize int) []byte {
+	var buf bytes.Buffer
+
+	// --- ftyp ---
+	ftyp := buildBox("ftyp", []byte("isom\x00\x00\x00\x00isom"))
+
+	// --- mdat ---
+	// Each sample: 4-byte length prefix + (sampleSize-4) bytes of NAL data
+	mdatBody := make([]byte, numSamples*sampleSize)
+	for i := 0; i < numSamples; i++ {
+		off := i * sampleSize
+		naluLen := sampleSize - 4
+		binary.BigEndian.PutUint32(mdatBody[off:off+4], uint32(naluLen))
+		// First byte of NAL: 0x65 = IDR slice (keyframe indicator for H.264)
+		if naluLen > 0 {
+			mdatBody[off+4] = 0x65
+		}
+		for j := 5; j < off+sampleSize && j < len(mdatBody); j++ {
+			mdatBody[j] = byte(j & 0xFF)
+		}
+	}
+	mdat := buildBox("mdat", mdatBody)
+
+	// mdat starts after ftyp + moov. We compute moov size after building it,
+	// so we need the ftyp size first.
+	ftypSize := len(ftyp)
+
+	// --- stsd with avcC ---
+	avcC := buildAvcCBox()
+	// avc1 sample entry: 78 byte base + avcC box
+	avc1Body := make([]byte, 78)
+	copy(avc1Body[4:8], []byte("avc1"))  // actually this is the format tag
+	avc1Body[24] = 0x00                   // data_ref_index
+	avc1Body[25] = 0x01
+	binary.BigEndian.PutUint16(avc1Body[32:34], 1920) // width
+	binary.BigEndian.PutUint16(avc1Body[34:36], 1080) // height
+	// Build avc1 as raw box: size(4) + "avc1"(4) + 70-byte base + avcC
+	var avc1Buf bytes.Buffer
+	avc1Base := make([]byte, 70)
+	binary.BigEndian.PutUint16(avc1Base[24:26], 1920)
+	binary.BigEndian.PutUint16(avc1Base[26:28], 1080)
+	avc1Buf.Write(avc1Base)
+	avc1Buf.Write(avcC)
+	avc1Box := buildBox("avc1", avc1Buf.Bytes())
+
+	stsdBody := make([]byte, 8) // version(4) + entry_count(4)
+	binary.BigEndian.PutUint32(stsdBody[4:8], 1)
+	stsdBody = append(stsdBody, avc1Box...)
+	stsd := buildBox("stsd", stsdBody)
+
+	// --- stsz (sample sizes) ---
+	stszBody := make([]byte, 12+numSamples*4)
+	// version+flags = 0
+	binary.BigEndian.PutUint32(stszBody[4:8], 0)              // sample_size = 0 (variable)
+	binary.BigEndian.PutUint32(stszBody[8:12], uint32(numSamples))
+	for i := 0; i < numSamples; i++ {
+		binary.BigEndian.PutUint32(stszBody[12+i*4:16+i*4], uint32(sampleSize))
+	}
+	stsz := buildBox("stsz", stszBody)
+
+	// --- stco (chunk offsets) - all samples in one chunk ---
+	stcoBody := make([]byte, 8)
+	binary.BigEndian.PutUint32(stcoBody[4:8], 1) // 1 chunk
+	// Chunk offset = ftypSize + moovSize + 8 (mdat header). We patch this after computing moov.
+	stcoOffset := make([]byte, 4) // placeholder
+	stcoBody = append(stcoBody, stcoOffset...)
+	stco := buildBox("stco", stcoBody)
+
+	// --- stsc (sample-to-chunk) ---
+	stscBody := make([]byte, 8+12)
+	binary.BigEndian.PutUint32(stscBody[4:8], 1)                    // 1 entry
+	binary.BigEndian.PutUint32(stscBody[8:12], 1)                   // first_chunk
+	binary.BigEndian.PutUint32(stscBody[12:16], uint32(numSamples)) // samples_per_chunk
+	binary.BigEndian.PutUint32(stscBody[16:20], 1)                  // sample_description_index
+	stsc := buildBox("stsc", stscBody)
+
+	// --- stts (time-to-sample) ---
+	sttsBody := make([]byte, 8+8)
+	binary.BigEndian.PutUint32(sttsBody[4:8], 1)                    // 1 entry
+	binary.BigEndian.PutUint32(sttsBody[8:12], uint32(numSamples))  // count
+	binary.BigEndian.PutUint32(sttsBody[12:16], 3000)               // delta (90000/30fps = 3000)
+	stts := buildBox("stts", sttsBody)
+
+	// --- stss (sync samples) - first sample is keyframe ---
+	stssBody := make([]byte, 8+4)
+	binary.BigEndian.PutUint32(stssBody[4:8], 1) // 1 sync sample
+	binary.BigEndian.PutUint32(stssBody[8:12], 1) // sample 1 (1-based)
+	stss := buildBox("stss", stssBody)
+
+	// --- stbl ---
+	var stblBody bytes.Buffer
+	stblBody.Write(stsd)
+	stblBody.Write(stsz)
+	stblBody.Write(stco)
+	stblBody.Write(stsc)
+	stblBody.Write(stts)
+	stblBody.Write(stss)
+	stbl := buildContainerBox("stbl", stblBody.Bytes())
+
+	// --- mdhd (timescale=90000) ---
+	mdhdBody := make([]byte, 24)
+	// version 0: creation_time(4), modification_time(4), timescale(4), duration(4)
+	binary.BigEndian.PutUint32(mdhdBody[12:16], 90000) // timescale
+	binary.BigEndian.PutUint32(mdhdBody[16:20], uint32(numSamples)*3000) // duration
+	mdhd := buildBox("mdhd", mdhdBody)
+
+	// --- hdlr (handler = vide) ---
+	hdlrBody := make([]byte, 24)
+	copy(hdlrBody[8:12], "vide")
+	hdlr := buildBox("hdlr", hdlrBody)
+
+	// --- minf > stbl ---
+	minf := buildContainerBox("minf", stbl)
+
+	// --- mdia = mdhd + hdlr + minf ---
+	var mdiaBody bytes.Buffer
+	mdiaBody.Write(mdhd)
+	mdiaBody.Write(hdlr)
+	mdiaBody.Write(minf)
+	mdia := buildContainerBox("mdia", mdiaBody.Bytes())
+
+	// --- trak ---
+	trak := buildContainerBox("trak", mdia)
+
+	// --- moov ---
+	moov := buildContainerBox("moov", trak)
+
+	// Now we know moov size. Patch stco offset.
+	mdatOffset := ftypSize + len(moov) + 8 // +8 for mdat box header
+	// Find stco in moov and patch the chunk offset
+	// stco body has: version(4) + flags + count(4) + offset(4)
+	// The offset is at the last 4 bytes of the stco body
+	patchStcoInMoov(moov, uint32(mdatOffset))
+
+	buf.Write(ftyp)
+	buf.Write(moov)
+	buf.Write(mdat)
+	return buf.Bytes()
+}
+
+func buildBox(boxType string, data []byte) []byte {
+	size := 8 + len(data)
+	hdr := make([]byte, 8)
+	binary.BigEndian.PutUint32(hdr[0:4], uint32(size))
+	copy(hdr[4:8], boxType)
+	return append(hdr, data...)
+}
+
+func buildContainerBox(boxType string, children []byte) []byte {
+	return buildBox(boxType, children)
+}
+
+func buildAvcCBox() []byte {
+	// Minimal avcC: version(1) + profile/compat/level(3) + lengthSizeMinusOne(1)
+	// + numSPS(1) + sps_len(2) + sps_data(4) + numPPS(1) + pps_len(2) + pps_data(2)
+	body := []byte{
+		0x01,             // version
+		0x64, 0x00, 0x1F, // profile, compat, level
+		0xFF,             // 0xFC | 3 -> lengthSize=4
+		0xE1,             // 0xE0 | 1 -> numSPS=1
+		0x00, 0x04,       // sps length = 4
+		0x67, 0x64, 0x00, 0x1F, // SPS data
+		0x01,             // numPPS=1
+		0x00, 0x02,       // pps length = 2
+		0x68, 0xCE,       // PPS data
+	}
+	return buildBox("avcC", body)
+}
+
+func patchStcoInMoov(moov []byte, mdatOffset uint32) {
+	// Walk the moov bytes to find stco and patch the chunk offset.
+	// stco has type "stco" at bytes [4:8] of its box header.
+	for i := 0; i < len(moov)-12; i++ {
+		if string(moov[i+4:i+8]) == "stco" {
+			// stco body starts at i+8
+			// version+flags(4) + count(4) + offset(4)
+			offsetPos := i + 8 + 8 // skip version+flags+count
+			binary.BigEndian.PutUint32(moov[offsetPos:offsetPos+4], mdatOffset)
+			return
+		}
+	}
+}
+
+unit "WriteSegment end to end with synthetic MP4" {
+	given "a minimal MP4 file with 10 video samples" {
+		mp4Data := buildTestMP4(10, 100)
+
+		tmp, err := os.CreateTemp("", "test-*.mp4")
+		expect err == nil
+		_, err = tmp.Write(mp4Data)
+		expect err == nil
+		tmpPath := tmp.Name()
+		tmp.Close()
+		defer os.Remove(tmpPath)
+
+		when "writing segment 0" {
+			var buf bytes.Buffer
+			err := stream.WriteSegment(&buf, tmpPath, 0, 4.0)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "produces non-empty TS output" {
+				expect buf.Len() > 0
+			}
+			then "output is 188-byte aligned" {
+				expect buf.Len() % 188 == 0
+			}
+			then "first byte is TS sync byte" {
+				expect buf.Bytes()[0] == byte(0x47)
+			}
+			then "all packets have sync byte" {
+				data := buf.Bytes()
+				for i := 0; i < len(data); i += 188 {
+					expect data[i] == byte(0x47)
+				}
+			}
+		}
+	}
+
+	given "a MP4 with enough samples for multiple segments" {
+		mp4Data := buildTestMP4(300, 50)
+
+		tmp, err := os.CreateTemp("", "multi-seg-*.mp4")
+		expect err == nil
+		_, err = tmp.Write(mp4Data)
+		expect err == nil
+		tmpPath := tmp.Name()
+		tmp.Close()
+		defer os.Remove(tmpPath)
+
+		when "calculating segments from file" {
+			segCount, err := stream.CalculateSegmentsFromFile(tmpPath, 4.0)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "returns at least 1 segment" {
+				expect segCount >= 1
+			}
+		}
+	}
+
+	given "a MP4 file" {
+		mp4Data := buildTestMP4(10, 100)
+
+		tmp, err := os.CreateTemp("", "oob-*.mp4")
+		expect err == nil
+		_, err = tmp.Write(mp4Data)
+		expect err == nil
+		tmpPath := tmp.Name()
+		tmp.Close()
+		defer os.Remove(tmpPath)
+
+		when "requesting an out-of-bounds segment" {
+			var buf bytes.Buffer
+			err := stream.WriteSegment(&buf, tmpPath, 9999, 4.0)
+
+			then "returns an error" {
+				expect err != nil
+			}
+		}
+	}
+}
+
+unit "Probe synthetic MP4" {
+	given "a valid synthetic MP4" {
+		mp4Data := buildTestMP4(30, 80)
+		reader := bytes.NewReader(mp4Data)
+
+		when "probing" {
+			info, err := mp4.Probe(reader)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "detects container as mp4" {
+				expect info.Container == "mp4"
+			}
+			then "finds a video stream" {
+				foundVideo := false
+				for _, s := range info.Streams {
+					if s.Type == "video" {
+						foundVideo = true
+					}
+				}
+				expect foundVideo
+			}
+			then "duration is non-negative" {
+				// Our minimal synthetic MP4 may not have mvhd, so duration
+				// could be 0. The important thing is probe doesn't error.
+				expect info.DurationMs >= 0
+			}
+		}
+	}
+}
+

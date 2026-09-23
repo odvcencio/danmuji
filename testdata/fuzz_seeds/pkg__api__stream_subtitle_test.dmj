@@ -1,0 +1,170 @@
+package api
+
+import (
+	"context"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/cachepath"
+	"github.com/odvcencio/goetrope/pkg/container/subtitle"
+	"github.com/odvcencio/goetrope/pkg/library"
+	"github.com/odvcencio/goetrope/pkg/stream"
+	"github.com/odvcencio/goetrope/pkg/transcode"
+)
+
+unit "Bitmap subtitle WebVTT selection" {
+	given "worker OCR text and legacy local OCR text both exist" {
+		mediaPath := filepath.Join(t.TempDir(), "movie.mkv")
+		err := os.WriteFile(mediaPath, []byte("media"), 0o644)
+		expect err == nil
+		_, err = subtitle.StoreBitmapTextTracks(mediaPath, 0, []subtitle.TextCue{
+			{StartMS: 0, EndMS: 1200, Text: "worker text"},
+		})
+		expect err == nil
+		legacyDir, err := cachepath.DirForSharedMedia(mediaPath, "sub-00", "subtitles")
+		expect err == nil
+		err = os.MkdirAll(legacyDir, 0o755)
+		expect err == nil
+		err = os.WriteFile(filepath.Join(legacyDir, "ocr.vtt"), []byte("WEBVTT\n\n00:00:00.000 --> 00:00:01.200\nlegacy placeholder\n\n"), 0o644)
+		expect err == nil
+		item := &library.MediaItem{
+			ID:   91,
+			Path: mediaPath,
+			Streams: []library.Stream{
+				{StreamType: "subtitle", StreamIndex: 2, Codec: "pgs", CodecTag: "pgs"},
+			},
+		}
+		h := &streamHandler{transcode: transcode.NewCoordinator()}
+
+		when "loading bitmap WebVTT" {
+			body, pending, loadErr := h.bitmapSubtitleWebVTT(context.Background(), item, item.Streams[0], 0, 2)
+
+			then "serves the worker text cache first" {
+				expect loadErr == nil
+				reject pending
+				expect strings.Contains(string(body), "worker text")
+				reject strings.Contains(string(body), "legacy placeholder")
+				expect len(h.transcode.ListJobs()) == 0
+			}
+		}
+	}
+
+	given "only legacy local OCR exists with a coordinator configured" {
+		mediaPath := filepath.Join(t.TempDir(), "movie.mkv")
+		err := os.WriteFile(mediaPath, []byte("media"), 0o644)
+		expect err == nil
+		legacyDir, err := cachepath.DirForSharedMedia(mediaPath, "sub-00", "subtitles")
+		expect err == nil
+		err = os.MkdirAll(legacyDir, 0o755)
+		expect err == nil
+		err = os.WriteFile(filepath.Join(legacyDir, "ocr.vtt"), []byte("WEBVTT\n\n00:00:00.000 --> 00:00:01.200\nlegacy placeholder\n\n"), 0o644)
+		expect err == nil
+		item := &library.MediaItem{
+			ID:   92,
+			Path: mediaPath,
+			Streams: []library.Stream{
+				{StreamType: "subtitle", StreamIndex: 2, Codec: "pgs", CodecTag: "pgs"},
+			},
+		}
+		h := &streamHandler{transcode: transcode.NewCoordinator()}
+
+		when "loading bitmap WebVTT" {
+			body, pending, loadErr := h.bitmapSubtitleWebVTT(context.Background(), item, item.Streams[0], 0, 2)
+			jobs := h.transcode.ListJobs()
+
+			then "queues system worker OCR instead of serving stale local text" {
+				expect loadErr == nil
+				expect pending
+				expect len(body) == 0
+				expect len(jobs) == 1
+				expect jobs[0].Job.Type == transcode.JobTypeSubtitleOCR
+			}
+		}
+	}
+}
+
+unit "HLS master subtitle modes" {
+	given "a bitmap subtitle track and external subtitle mode" {
+		item := &library.MediaItem{
+			ID: 99,
+			Streams: []library.Stream{
+				{StreamType: "subtitle", StreamIndex: 2, Codec: "pgs", CodecTag: "pgs", Language: "eng", IsDefault: true},
+			},
+		}
+
+		when "rendering the master playlist for GoSX" {
+			playlist := masterPlaylistForItem(99, item, []stream.Variant{{
+				Bandwidth:  2_000_000,
+				Resolution: "1920x1080",
+				URI:        "/stream/99/h264-720p/playlist.m3u8",
+			}}, false)
+
+			then "omits HLS subtitle media renditions" {
+				reject strings.Contains(playlist, "#EXT-X-MEDIA:TYPE=SUBTITLES")
+				reject strings.Contains(playlist, `SUBTITLES="subs"`)
+				reject strings.Contains(playlist, `/stream/99/subtitles/2.vtt`)
+			}
+		}
+	}
+}
+
+unit "Subtitle response cache headers" {
+	given "a token-free, immutable subtitle body (embedded/sidecar text VTT or cached ASS)" {
+		rec := httptest.NewRecorder()
+		body := []byte("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhi\n")
+
+		when "writing the subtitle response as cacheable" {
+			writeSubtitleResponse(rec, body, "text/vtt; charset=utf-8", true)
+
+			then "sets a private, browser-cacheable Cache-Control header" {
+				expect rec.Header().Get("Cache-Control") == "private, max-age=86400"
+				expect rec.Body.String() == string(body)
+			}
+		}
+	}
+
+	given "a token-bearing or OCR-mutable subtitle body (bitmap image VTT or OCR-aware text VTT)" {
+		rec := httptest.NewRecorder()
+		body := []byte("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhi\n")
+
+		when "writing the subtitle response as not cacheable" {
+			writeSubtitleResponse(rec, body, "text/vtt; charset=utf-8", false)
+
+			then "keeps the response uncacheable" {
+				expect rec.Header().Get("Cache-Control") == "no-store"
+				expect rec.Body.String() == string(body)
+			}
+		}
+	}
+
+	given "a protected bitmap cue image response" {
+		when "selecting its cache profile" {
+			header := bitmapCueImageCacheControl()
+
+			then "allows browser reuse without shared public caching" {
+				expect header == "private, max-age=86400"
+				reject strings.Contains(header, "public")
+			}
+		}
+	}
+}
+
+unit "Subtitle offset query parsing" {
+	given "a GoSX external subtitle request with an offset" {
+		req := httptest.NewRequest("GET", "/stream/99/subtitles/2.vtt?offset=1257.7", nil)
+
+		then "converts seconds into milliseconds" {
+			expect subtitleOffsetMillis(req) == 1257700
+		}
+	}
+	given "a compatibility subtitle request with a position" {
+		req := httptest.NewRequest("GET", "/stream/99/subtitles/2.vtt?position=4.25", nil)
+
+		then "accepts position as an offset alias" {
+			expect subtitleOffsetMillis(req) == 4250
+		}
+	}
+}

@@ -1,0 +1,131 @@
+package api
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/library"
+	"github.com/odvcencio/goetrope/pkg/stream"
+	"github.com/odvcencio/goetrope/pkg/transcode"
+)
+
+unit "stream direct play eligibility" {
+	given "an mkv item with h264 video and aac audio" {
+		item := &library.MediaItem{
+			Container: "mkv",
+			Streams: []library.Stream{
+				{StreamType: "video", Codec: "h264", Width: 1920, Height: 1080},
+				{StreamType: "audio", Codec: "aac", CodecTag: "mp4a", Channels: 2},
+			},
+		}
+
+		then "can direct play" {
+			expect canDirectPlayItem(item, false)
+		}
+	}
+
+	given "a webm-style item with vp9 and opus" {
+		item := &library.MediaItem{
+			Container: "webm",
+			Streams: []library.Stream{
+				{StreamType: "video", Codec: "vp9", Width: 1920, Height: 1080},
+				{StreamType: "audio", Codec: "opus", CodecTag: "opus", Channels: 2},
+			},
+		}
+		handler := &streamHandler{}
+
+		then "cannot direct play" {
+			reject canDirectPlayItem(item, false)
+		}
+
+		when "deciding the stream action" {
+			action := handler.decideStreamAction(item, false, 0)
+
+			then "chooses transcode" {
+				expect action == "Transcode"
+			}
+		}
+	}
+}
+
+unit "AV1 software transcode bounding" {
+	given "an AV1 item that requires H264 normalization" {
+		item := &library.MediaItem{
+			ID:         42,
+			Path:       "/media/show-av1.mkv",
+			DurationMs: 600000,
+			Streams: []library.Stream{
+				{StreamType: "video", Codec: "av1", Width: 1920, Height: 1080, Bitrate: 2500000},
+				{StreamType: "audio", Codec: "aac", CodecTag: "mp4a", Channels: 2},
+			},
+		}
+
+		when "negotiating an on-demand H264 transcode" {
+			coord := transcode.NewCoordinator()
+			handler := &streamHandler{transcode: coord}
+			result := handler.negotiateOnDemandTranscode(context.Background(), item.ID, item, streamNegotiateRequest{}, streamDecision{
+				Action:      "Transcode",
+				TargetCodec: transcode.CodecH264,
+				Reason:      "source requires normalization",
+			}, stream.DefaultSegmentDuration, transcode.JobTypeOnDemand)
+			record, ok := coord.GetJob(result.Response.JobID)
+
+			then "returns the bounded 480p playlist URL" {
+				expect strings.Contains(result.Response.MasterPlaylistURL, "/stream/42/h264-480p/playlist.m3u8")
+				reject strings.Contains(result.Response.MasterPlaylistURL, "h264-720p")
+			}
+			then "queues the bounded quality instead of the requested high rung" {
+				expect ok
+				expect record.Job.Quality == "h264-480p"
+			}
+		}
+
+		when "negotiating a supports_av1 on-demand transcode" {
+			coord := transcode.NewCoordinator()
+			handler := &streamHandler{transcode: coord}
+			supportsAV1 := true
+			result := handler.negotiateOnDemandTranscode(context.Background(), item.ID, item, streamNegotiateRequest{SupportsAV1: &supportsAV1}, streamDecision{
+				Action:      "Transcode",
+				TargetCodec: transcode.CodecAV1,
+				Reason:      "source requires normalization and client supports AV1",
+			}, stream.DefaultSegmentDuration, transcode.JobTypeOnDemand)
+			record, ok := coord.GetJob(result.Response.JobID)
+
+			then "returns the bounded AV1 base-rung playlist URL" {
+				expect strings.Contains(result.Response.MasterPlaylistURL, "/stream/42/av1-480p/playlist.m3u8")
+				reject strings.Contains(result.Response.MasterPlaylistURL, "av1-1080p")
+			}
+			then "queues AV1 at 480p instead of a high software rung" {
+				expect ok
+				expect record.Job.Quality == "av1-480p"
+			}
+		}
+
+		when "collapsing a direct AV1 quality request" {
+			quality := boundedTranscodeQualityForRequest(item, "av1-1080p", transcode.JobTypeOnDemand)
+
+			then "keeps the requested codec but uses the base rung" {
+				expect quality == "av1-480p"
+			}
+		}
+
+		when "collapsing theatre ladder qualities" {
+			qualities := boundedTranscodeQualitiesForRequest(item, []string{"h264-480p", "h264-720p", "h264-1080p"}, transcode.JobTypeTheatre)
+
+			then "advertises only one base H264 rung" {
+				expect len(qualities) == 1
+				expect qualities[0] == "h264-480p"
+			}
+		}
+
+		when "collapsing theatre AV1 ladder qualities for an AV1-capable client" {
+			qualities := boundedTranscodeQualitiesForRequest(item, []string{"av1-480p", "av1-720p", "av1-1080p"}, transcode.JobTypeTheatre)
+
+			then "advertises only one base AV1 rung" {
+				expect len(qualities) == 1
+				expect qualities[0] == "av1-480p"
+			}
+		}
+	}
+}

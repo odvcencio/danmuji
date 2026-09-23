@@ -1,0 +1,340 @@
+package theatre_test
+
+import (
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/theatre"
+	"golang.org/x/crypto/bcrypt"
+)
+
+unit "NormalizeCreateRoomInput" {
+	given "a public room" {
+		input := theatre.CreateRoomInput{
+			AccessMode: theatre.AccessModePublic,
+		}
+
+		when "normalizing" {
+			result, err := theatre.NormalizeCreateRoomInput(input)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "keeps public mode" {
+				expect result.AccessMode == theatre.AccessModePublic
+			}
+		}
+	}
+
+	given "a password room with password" {
+		input := theatre.CreateRoomInput{
+			AccessMode: theatre.AccessModePassword,
+			Password:   "secret",
+		}
+
+		when "normalizing" {
+			result, err := theatre.NormalizeCreateRoomInput(input)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "keeps password mode" {
+				expect result.AccessMode == theatre.AccessModePassword
+			}
+		}
+	}
+
+	given "a password room without password" {
+		input := theatre.CreateRoomInput{
+			AccessMode: theatre.AccessModePassword,
+			Password:   "",
+		}
+
+		when "normalizing" {
+			_, err := theatre.NormalizeCreateRoomInput(input)
+
+			then "returns error" {
+				expect err != nil
+			}
+		}
+	}
+
+	given "a discord role room without roles" {
+		input := theatre.CreateRoomInput{
+			AccessMode:     theatre.AccessModeDiscordRole,
+			DiscordGuildID: "123456789",
+			DiscordRoleIDs: nil,
+		}
+
+		when "normalizing" {
+			_, err := theatre.NormalizeCreateRoomInput(input)
+
+			then "returns error" {
+				expect err != nil
+			}
+		}
+	}
+
+	given "a discord role room with duplicate unordered roles" {
+		input := theatre.CreateRoomInput{
+			AccessMode:     theatre.AccessModeDiscordRole,
+			DiscordGuildID: " 123456789 ",
+			DiscordRoleIDs: []string{"42", "7", "42"},
+		}
+
+		when "normalizing" {
+			result, err := theatre.NormalizeCreateRoomInput(input)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "trims the guild id" {
+				expect result.DiscordGuildID == "123456789"
+			}
+			then "dedupes and sorts role ids" {
+				expect len(result.DiscordRoleIDs) == 2
+				expect result.DiscordRoleIDs[0] == "42"
+				expect result.DiscordRoleIDs[1] == "7"
+			}
+		}
+	}
+
+	given "a discord role room with an empty role id" {
+		input := theatre.CreateRoomInput{
+			AccessMode:     theatre.AccessModeDiscordRole,
+			DiscordGuildID: "123456789",
+			DiscordRoleIDs: []string{"42", " "},
+		}
+
+		when "normalizing" {
+			_, err := theatre.NormalizeCreateRoomInput(input)
+
+			then "returns error" {
+				expect err != nil
+			}
+		}
+	}
+
+	given "a discord role room with a nonnumeric role id" {
+		input := theatre.CreateRoomInput{
+			AccessMode:     theatre.AccessModeDiscordRole,
+			DiscordGuildID: "123456789",
+			DiscordRoleIDs: []string{"42", "role-a"},
+		}
+
+		when "normalizing" {
+			_, err := theatre.NormalizeCreateRoomInput(input)
+
+			then "returns error" {
+				expect err != nil
+			}
+		}
+	}
+
+	given "a discord role room with a zero role id" {
+		input := theatre.CreateRoomInput{
+			AccessMode:     theatre.AccessModeDiscordRole,
+			DiscordGuildID: "123456789",
+			DiscordRoleIDs: []string{"42", "0"},
+		}
+
+		when "normalizing" {
+			_, err := theatre.NormalizeCreateRoomInput(input)
+
+			then "returns error" {
+				expect err != nil
+			}
+		}
+	}
+
+	given "a discord role room with a leading-zero role id" {
+		input := theatre.CreateRoomInput{
+			AccessMode:     theatre.AccessModeDiscordRole,
+			DiscordGuildID: "123456789",
+			DiscordRoleIDs: []string{"42", "007"},
+		}
+
+		when "normalizing" {
+			_, err := theatre.NormalizeCreateRoomInput(input)
+
+			then "returns error" {
+				expect err != nil
+			}
+		}
+	}
+
+	given "a discord role room with an overflowing role id" {
+		input := theatre.CreateRoomInput{
+			AccessMode:     theatre.AccessModeDiscordRole,
+			DiscordGuildID: "123456789",
+			DiscordRoleIDs: []string{"42", "18446744073709551616"},
+		}
+
+		when "normalizing" {
+			_, err := theatre.NormalizeCreateRoomInput(input)
+
+			then "returns error" {
+				expect err != nil
+			}
+		}
+	}
+
+	given "a discord role room with too many raw role ids" {
+		roleIDs := make([]string, theatre.MaxRoomRoleIDs+1)
+		for i := range roleIDs {
+			roleIDs[i] = "42"
+		}
+		input := theatre.CreateRoomInput{
+			AccessMode:     theatre.AccessModeDiscordRole,
+			DiscordGuildID: "123456789",
+			DiscordRoleIDs: roleIDs,
+		}
+
+		when "normalizing" {
+			_, err := theatre.NormalizeCreateRoomInput(input)
+
+			then "returns error before dedupe" {
+				expect err != nil
+			}
+		}
+	}
+
+	given "a discord role room with a malformed guild id" {
+		input := theatre.CreateRoomInput{
+			AccessMode:     theatre.AccessModeDiscordRole,
+			DiscordGuildID: "guild-123",
+			DiscordRoleIDs: []string{"42"},
+		}
+
+		when "normalizing" {
+			_, err := theatre.NormalizeCreateRoomInput(input)
+
+			then "returns error" {
+				expect err != nil
+			}
+		}
+	}
+
+	given "a discord role room with a zero guild id" {
+		input := theatre.CreateRoomInput{
+			AccessMode:     theatre.AccessModeDiscordRole,
+			DiscordGuildID: "0",
+			DiscordRoleIDs: []string{"42"},
+		}
+
+		when "normalizing" {
+			_, err := theatre.NormalizeCreateRoomInput(input)
+
+			then "returns error" {
+				expect err != nil
+			}
+		}
+	}
+
+	given "a discord role room with a leading-zero guild id" {
+		input := theatre.CreateRoomInput{
+			AccessMode:     theatre.AccessModeDiscordRole,
+			DiscordGuildID: "0123456789",
+			DiscordRoleIDs: []string{"42"},
+		}
+
+		when "normalizing" {
+			_, err := theatre.NormalizeCreateRoomInput(input)
+
+			then "returns error" {
+				expect err != nil
+			}
+		}
+	}
+
+	given "a discord role room with an overflowing guild id" {
+		input := theatre.CreateRoomInput{
+			AccessMode:     theatre.AccessModeDiscordRole,
+			DiscordGuildID: "18446744073709551616",
+			DiscordRoleIDs: []string{"42"},
+		}
+
+		when "normalizing" {
+			_, err := theatre.NormalizeCreateRoomInput(input)
+
+			then "returns error" {
+				expect err != nil
+			}
+		}
+	}
+
+	given "a discord member room without guild" {
+		input := theatre.CreateRoomInput{
+			AccessMode:     theatre.AccessModeDiscordMember,
+			DiscordGuildID: "",
+		}
+
+		when "normalizing" {
+			_, err := theatre.NormalizeCreateRoomInput(input)
+
+			then "returns error" {
+				expect err != nil
+			}
+		}
+	}
+
+	given "a discord member room with a malformed guild id" {
+		input := theatre.CreateRoomInput{
+			AccessMode:     theatre.AccessModeDiscordMember,
+			DiscordGuildID: "guild-123",
+		}
+
+		when "normalizing" {
+			_, err := theatre.NormalizeCreateRoomInput(input)
+
+			then "returns error" {
+				expect err != nil
+			}
+		}
+	}
+}
+
+unit "AccessMode predicates" {
+	then "password requires password" {
+		expect theatre.AccessModePassword.RequiresPassword()
+		reject theatre.AccessModePublic.RequiresPassword()
+	}
+	then "discord modes require discord" {
+		expect theatre.AccessModeDiscordMember.RequiresDiscord()
+		expect theatre.AccessModeDiscordRole.RequiresDiscord()
+		reject theatre.AccessModePublic.RequiresDiscord()
+		reject theatre.AccessModePassword.RequiresDiscord()
+	}
+	then "discord role requires roles" {
+		expect theatre.AccessModeDiscordRole.RequiresRoles()
+		reject theatre.AccessModeDiscordMember.RequiresRoles()
+	}
+}
+
+unit "VerifyPassword" {
+	given "empty password and empty hash" {
+		then "both empty matches" {
+			expect theatre.VerifyPassword("", "")
+		}
+	}
+
+	given "a non-empty password" {
+		then "wrong password rejects" {
+			reject theatre.VerifyPassword("wrong", "0000000000000000000000000000000000000000000000000000000000000000")
+		}
+	}
+
+	given "a bcrypt password hash" {
+		hashBytes, err := bcrypt.GenerateFromPassword([]byte("secret"), bcrypt.DefaultCost)
+		if err != nil {
+			t.Fatalf("bcrypt hash: %v", err)
+		}
+		hash := string(hashBytes)
+
+		then "matching password succeeds" {
+			expect theatre.VerifyPassword("secret", hash)
+		}
+		then "wrong password rejects" {
+			reject theatre.VerifyPassword("wrong", hash)
+		}
+	}
+}

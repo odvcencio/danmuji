@@ -1,0 +1,141 @@
+package theatre_test
+
+import (
+	"encoding/binary"
+	"math"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/theatre"
+)
+
+unit "ParseTheatreWebSocketPath" {
+	given "a viewer path" {
+		code, ok := theatre.ParseTheatreWebSocketPath("/api/theatre/ABC123/ws")
+		then "parses" {
+			expect ok
+			expect code == "ABC123"
+		}
+	}
+	given "a non-ws path" {
+		_, ok := theatre.ParseTheatreWebSocketPath("/api/theatre/ABC123")
+		then "rejects" {
+			reject ok
+		}
+	}
+	given "empty path" {
+		_, ok := theatre.ParseTheatreWebSocketPath("")
+		then "rejects" {
+			reject ok
+		}
+	}
+}
+
+unit "DriftReport encoding" {
+	given "a drift value" {
+		encoded := theatre.EncodeDriftReport(makeDriftReport(0.05))
+
+		then "produces 5 bytes" {
+			expect len(encoded) == 5
+		}
+		then "first byte is drift type" {
+			expect encoded[0] == byte(0x03)
+		}
+		then "round trips" {
+			msg, ok := theatre.DecodeMessage(encoded[:])
+			expect ok
+			expect msg.DriftReport not_nil
+			diff := math.Abs(float64(msg.DriftReport.Drift - 0.05))
+			expect diff < 0.001
+		}
+	}
+}
+
+unit "BufferUpdate decoding" {
+	given "a valid buffer update" {
+		data := make([]byte, 14)
+		data[0] = 0x02
+		binary.BigEndian.PutUint32(data[1:5], math.Float32bits(10.0))
+		binary.BigEndian.PutUint32(data[5:9], math.Float32bits(15.0))
+		binary.BigEndian.PutUint32(data[9:13], math.Float32bits(5000.0))
+		data[13] = 2
+
+		when "decoding" {
+			msg, ok := theatre.DecodeMessage(data)
+
+			then "succeeds with rising trend" {
+				expect ok
+				expect msg.BufferUpdate not_nil
+				expect msg.BufferUpdate.Trend == theatre.BufferTrendRising
+			}
+		}
+	}
+
+	given "truncated buffer update" {
+		data := []byte{0x02, 0x00, 0x00}
+		msg, ok := theatre.DecodeMessage(data)
+		then "rejects" {
+			reject ok
+			expect msg == nil
+		}
+	}
+}
+
+unit "All message types accept correct length" {
+	given "heartbeat" {
+		data := make([]byte, 16)
+		data[0] = 0x01
+		_, ok := theatre.DecodeMessage(data)
+		then "accepts" { expect ok }
+	}
+	given "buffer" {
+		data := make([]byte, 14)
+		data[0] = 0x02
+		_, ok := theatre.DecodeMessage(data)
+		then "accepts" { expect ok }
+	}
+	given "drift" {
+		data := make([]byte, 5)
+		data[0] = 0x03
+		_, ok := theatre.DecodeMessage(data)
+		then "accepts" { expect ok }
+	}
+	given "pong" {
+		data := make([]byte, 9)
+		data[0] = 0x04
+		_, ok := theatre.DecodeMessage(data)
+		then "accepts" { expect ok }
+	}
+	given "ping" {
+		data := make([]byte, 9)
+		data[0] = 0x05
+		_, ok := theatre.DecodeMessage(data)
+		then "accepts" { expect ok }
+	}
+}
+
+unit "All message types reject truncated" {
+	given "truncated heartbeat" {
+		data := make([]byte, 15)
+		data[0] = 0x01
+		_, ok := theatre.DecodeMessage(data)
+		then "rejects" { reject ok }
+	}
+	given "truncated buffer" {
+		data := make([]byte, 13)
+		data[0] = 0x02
+		_, ok := theatre.DecodeMessage(data)
+		then "rejects" { reject ok }
+	}
+	given "truncated drift" {
+		data := make([]byte, 4)
+		data[0] = 0x03
+		_, ok := theatre.DecodeMessage(data)
+		then "rejects" { reject ok }
+	}
+	given "truncated pong" {
+		data := make([]byte, 8)
+		data[0] = 0x04
+		_, ok := theatre.DecodeMessage(data)
+		then "rejects" { reject ok }
+	}
+}

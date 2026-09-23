@@ -1,0 +1,14 @@
+package mkv_test
+
+import (
+	"bytes"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/container/mkv"
+)
+
+fuzz "MKV Probe does not panic on arbitrary input" with (data []byte) {
+	reader := bytes.NewReader(data)
+	mkv.Probe(reader)
+	expect true
+}

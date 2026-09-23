@@ -1,0 +1,112 @@
+package worker
+
+import (
+	"context"
+	"net"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/odvcencio/goetrope/pkg/transcode"
+	transcodev1 "github.com/odvcencio/goetrope/proto/transcodev1"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/status"
+)
+
+func workerTrustedServerFence(fence transcode.AttemptFence) *transcodev1.AttemptFence {
+	return &transcodev1.AttemptFence{
+		BootEpoch:            fence.BootEpoch,
+		WorkerSessionId:      fence.WorkerSessionID,
+		JobId:                fence.JobID,
+		AttemptId:            fence.AttemptID,
+		AttemptEpoch:         fence.AttemptEpoch,
+		LeaseId:              fence.LeaseID,
+		CredentialGeneration: fence.CredentialGeneration,
+		OutputId:             fence.OutputID,
+	}
+}
+
+@serial
+unit "trusted worker gRPC server" {
+	then "requires credential and protocol admission inputs" {
+		certificate, _ := testWorkerCertificate(t)
+		cfg := TrustedWorkerGRPCServerConfig{
+			Transport: TrustedTransportConfig{Certificate: certificate},
+		}
+		server, err := NewTrustedWorkerGRPCServer(cfg)
+		expect err != nil
+		expect server is_nil
+		expect status.Code(err) == codes.Unknown
+
+		cfg.Transport.Credential = []byte(testWorkerCredential)
+		server, err = NewTrustedWorkerGRPCServer(cfg)
+		expect err != nil
+		expect server is_nil
+		expect strings.Contains(err.Error(), "protocol major")
+	}
+
+	then "serves the real transcode service through TLS and admission metadata" {
+		certificate, roots := testWorkerCertificate(t)
+		protocol := CurrentWorkerProtocol()
+		credential := []byte(testWorkerCredential)
+		serverConfig := TrustedTransportConfig{Certificate: certificate, Credential: credential, Protocol: protocol, RequireCanaryPassed: true, RequireCachePushReady: true}
+		coord := transcode.NewCoordinator()
+		server, err := NewTrustedWorkerGRPCServer(TrustedWorkerGRPCServerConfig{
+			Transport:   serverConfig,
+			Coordinator: coord,
+			CacheRoot:   t.TempDir(),
+		})
+		require.NoError(t, err)
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		go func() { _ = server.Serve(listener) }()
+		t.Cleanup(func() {
+			server.Stop()
+			_ = listener.Close()
+		})
+
+		clientTLS, err := NewClientTLS(TrustedTransportConfig{RootCAs: roots, ServerName: "worker.test"})
+		require.NoError(t, err)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		conn, err := grpc.DialContext(ctx, listener.Addr().String(), grpc.WithTransportCredentials(credentials.NewTLS(clientTLS)), grpc.WithBlock())
+		require.NoError(t, err)
+		defer conn.Close()
+		client := transcodev1.NewTranscodeServiceClient(conn)
+		rpcCtx := WithTrustedMetadata(ctx, credential, protocol, true, true)
+		registered, err := client.Register(rpcCtx, &transcodev1.WorkerInfo{Label: "trusted-loopback", MediaRoot: "/media", GpuDevice: "0"})
+		require.NoError(t, err)
+		expect registered.GetWorkerId() != ""
+		expect registered.GetWorkerSessionId() != ""
+		expect registered.GetCredentialGeneration() != 0
+
+		heartbeat, err := client.Heartbeat(rpcCtx, &transcodev1.HeartbeatRequest{WorkerId: registered.GetWorkerId()})
+		require.NoError(t, err)
+		expect heartbeat.GetOk()
+
+		jobs, err := client.PullJob(rpcCtx, &transcodev1.PullJobRequest{WorkerId: registered.GetWorkerId()})
+		require.NoError(t, err)
+		record, inserted := coord.Enqueue(transcode.Job{Type: transcode.JobTypeOnDemand, MediaItemID: 42, SourcePath: "/media/movie.mkv", Quality: "h264-720p"})
+		expect inserted
+		job, err := jobs.Recv()
+		require.NoError(t, err)
+		expect job.GetJobId() == record.Job.ID
+		authoritative, found := coord.GetJob(record.Job.ID)
+		expect found
+		expect authoritative.Fence.Valid()
+		fence := workerTrustedServerFence(authoritative.Fence)
+		fencedHeartbeat, err := client.Heartbeat(rpcCtx, &transcodev1.HeartbeatRequest{Fence: fence})
+		require.NoError(t, err)
+		expect fencedHeartbeat.GetOk()
+		renewed, err := client.RenewLease(rpcCtx, &transcodev1.LeaseRenewalRequest{Fence: fence})
+		require.NoError(t, err)
+		expect renewed.GetOk()
+
+		badCtx := WithTrustedMetadata(ctx, []byte("wrong-worker-credential"), protocol, true, true)
+		_, err = client.Register(badCtx, &transcodev1.WorkerInfo{Label: "rejected"})
+		expect status.Code(err) == codes.Unauthenticated
+	}
+}

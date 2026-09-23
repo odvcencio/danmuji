@@ -1,0 +1,115 @@
+package theatre
+
+import "testing"
+
+unit "Discord control policy normalization" {
+	given "duplicate unordered role controls" {
+		roles := []DiscordRoleControl{
+			{RoleID: "22", Queue: true},
+			{RoleID: " 11 ", Playback: true},
+			{RoleID: "22", Playback: true},
+		}
+
+		when "normalizing" {
+			policy, err := normalizeDiscordControlPolicy(42, " 123456789 ", roles)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "trims the guild id" {
+				expect policy.GuildID == "123456789"
+			}
+			then "dedupes and combines controls in sorted role order" {
+				expect len(policy.Roles) == 2
+				expect policy.Roles[0].RoleID == "11"
+				reject policy.Roles[0].Queue
+				expect policy.Roles[0].Playback
+				expect policy.Roles[1].RoleID == "22"
+				expect policy.Roles[1].Queue
+				expect policy.Roles[1].Playback
+			}
+		}
+	}
+
+	given "an empty role list" {
+		when "normalizing" {
+			policy, err := normalizeDiscordControlPolicy(42, "123456789", nil)
+
+			then "succeeds without granting any controls" {
+				expect err == nil
+				expect len(policy.Roles) == 0
+			}
+		}
+	}
+
+	given "a role without controls" {
+		when "normalizing" {
+			_, err := normalizeDiscordControlPolicy(42, "123456789", []DiscordRoleControl{
+				{RoleID: "11"},
+			})
+
+			then "returns error" {
+				expect err != nil
+			}
+		}
+	}
+
+	given "an overlong guild id" {
+		when "normalizing" {
+			_, err := normalizeDiscordControlPolicy(42, "123456789012345678901", nil)
+
+			then "returns error" {
+				expect err != nil
+			}
+		}
+	}
+
+	given "a zero guild id" {
+		when "normalizing" {
+			_, err := normalizeDiscordControlPolicy(42, "0", nil)
+
+			then "returns error" {
+				expect err != nil
+			}
+		}
+	}
+
+	given "a leading-zero guild id" {
+		when "normalizing" {
+			_, err := normalizeDiscordControlPolicy(42, "0123", nil)
+
+			then "returns error" {
+				expect err != nil
+			}
+		}
+	}
+
+	given "a snowflake greater than uint64" {
+		when "normalizing" {
+			_, err := normalizeDiscordControlPolicy(42, "18446744073709551616", nil)
+
+			then "returns error" {
+				expect err != nil
+			}
+		}
+	}
+
+	given "too many raw roles" {
+		roles := make([]DiscordRoleControl, MaxRoomRoleIDs+1)
+		for i := range roles {
+			roles[i] = DiscordRoleControl{
+				RoleID:   "1000",
+				Queue:    true,
+				Playback: false,
+			}
+		}
+
+		when "normalizing" {
+			_, err := normalizeDiscordControlPolicy(42, "123456789", roles)
+
+			then "returns error" {
+				expect err != nil
+			}
+		}
+	}
+}

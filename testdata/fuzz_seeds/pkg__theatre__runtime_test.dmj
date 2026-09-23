@@ -1,0 +1,148 @@
+package theatre_test
+
+import (
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/odvcencio/goetrope/pkg/theatre"
+)
+
+unit "RateLimiter" {
+	given "a limiter allowing 5 messages per 100ms" {
+		limiter := theatre.NewRateLimiter(5, 100*time.Millisecond)
+
+		when "sending exactly 5 messages" {
+			results := make([]bool, 5)
+			for i := 0; i < 5; i++ {
+				results[i] = limiter.Check()
+			}
+
+			then "all 5 are allowed" {
+				for i, ok := range results {
+					_ = i
+					expect ok
+				}
+			}
+		}
+
+		when "sending a 6th message" {
+			for i := 0; i < 5; i++ {
+				limiter.Check()
+			}
+			ok := limiter.Check()
+
+			then "is rejected" {
+				reject ok
+			}
+		}
+	}
+
+	given "a limiter that resets after its window" {
+		limiter := theatre.NewRateLimiter(2, 50*time.Millisecond)
+
+		when "exhausting the limit then waiting" {
+			limiter.Check()
+			limiter.Check()
+			blocked := limiter.Check()
+			time.Sleep(60 * time.Millisecond)
+			afterReset := limiter.Check()
+
+			then "blocks before reset" {
+				reject blocked
+			}
+			then "allows after window expires" {
+				expect afterReset
+			}
+		}
+	}
+}
+
+unit "RateLimiter concurrent safety" {
+	// BUG CHECK: RateLimiter.Check() mutates count and windowStart without
+	// a mutex. Under concurrent access from multiple WebSocket goroutines,
+	// the count can be corrupted — allowing more messages than the limit,
+	// or panicking on concurrent map/struct writes.
+	//
+	// This test fires 100 goroutines at a limiter with max=10 and checks
+	// that no more than max messages are accepted.
+
+	given "a limiter with max 10 per second" {
+		limiter := theatre.NewRateLimiter(10, time.Second)
+
+		when "100 goroutines race to Check()" {
+			var allowed atomic.Int64
+			var wg sync.WaitGroup
+			for i := 0; i < 100; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					if limiter.Check() {
+						allowed.Add(1)
+					}
+				}()
+			}
+			wg.Wait()
+
+			then "at most 10 messages are allowed" {
+				// With the race condition, this may allow more than 10.
+				// A correct implementation would guarantee <= 10.
+				expect allowed.Load() <= 10
+			}
+		}
+	}
+
+	given "a limiter embedded in WsClient used concurrently" {
+		client := theatre.NewWsClient("room1", "visitor1", false)
+
+		when "50 goroutines call Check on the same client" {
+			var allowed atomic.Int64
+			var wg sync.WaitGroup
+			for i := 0; i < 50; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					if client.RateLimiter.Check() {
+						allowed.Add(1)
+					}
+				}()
+			}
+			wg.Wait()
+
+			then "respects the 30/second limit" {
+				expect allowed.Load() <= 30
+			}
+		}
+	}
+}
+
+@serial
+unit "RuntimeManager viewer lifecycle" {
+	no_leaks
+
+	given "a runtime manager" {
+		mgr := theatre.NewRuntimeManager()
+
+		when "adding and removing clients" {
+			mgr.AddClient("room-a", 1, theatre.NewWsClient("room-a", "v1", false))
+			mgr.AddClient("room-a", 2, theatre.NewWsClient("room-a", "v2", false))
+
+			then "viewer count is 2" {
+				expect mgr.ViewerCount("room-a") == 2
+			}
+
+			mgr.RemoveClient("room-a", 1)
+
+			then "viewer count drops to 1" {
+				expect mgr.ViewerCount("room-a") == 1
+			}
+
+			mgr.RemoveClient("room-a", 2)
+
+			then "room is empty" {
+				expect mgr.ViewerCount("room-a") == 0
+			}
+		}
+	}
+}

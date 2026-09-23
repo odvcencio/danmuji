@@ -1,0 +1,89 @@
+package theatre_test
+
+import (
+	"testing"
+	"time"
+
+	"github.com/odvcencio/goetrope/pkg/theatre"
+)
+
+type fakeFollowDelayProvider struct {
+	delays map[string]float64
+}
+
+func (f *fakeFollowDelayProvider) FollowDelaySeconds(sessionID string) (float64, bool) {
+	delay, ok := f.delays[sessionID]
+	return delay, ok
+}
+
+unit "SyncEngine follow delay" {
+	given "a playing room with a delay provider" {
+		playback := theatre.NewPlaybackStateManager()
+		rooms := theatre.NewRuntimeManager()
+		engine := theatre.NewSyncEngine(playback, rooms)
+		engine.SetFollowDelayProvider(&fakeFollowDelayProvider{delays: map[string]float64{
+			"room-1": 8,
+		}})
+		playback.Set("room-1", theatre.PlaybackState{
+			Position:  50,
+			Playing:   true,
+			Timestamp: time.Now().UnixMilli(),
+		})
+
+		when "computing a snapshot" {
+			snap := engine.ComputeSnapshot("room-1")
+
+			then "targets a delayed playhead" {
+				expect snap.Position >= 42
+				expect snap.Position < 43
+			}
+
+			then "preserves the playing state" {
+				expect snap.Playing
+			}
+		}
+	}
+
+	given "a paused room with a delay provider" {
+		playback := theatre.NewPlaybackStateManager()
+		rooms := theatre.NewRuntimeManager()
+		engine := theatre.NewSyncEngine(playback, rooms)
+		engine.SetFollowDelayProvider(&fakeFollowDelayProvider{delays: map[string]float64{
+			"room-1": 8,
+		}})
+		playback.Set("room-1", theatre.PlaybackState{
+			Position: 50,
+			Playing:  false,
+		})
+
+		when "computing a snapshot" {
+			snap := engine.ComputeSnapshot("room-1")
+
+			then "leaves the paused playhead unchanged" {
+				expect snap.Position == 50
+			}
+		}
+	}
+
+	given "a playing room before the delay cushion has elapsed" {
+		playback := theatre.NewPlaybackStateManager()
+		rooms := theatre.NewRuntimeManager()
+		engine := theatre.NewSyncEngine(playback, rooms)
+		engine.SetFollowDelayProvider(&fakeFollowDelayProvider{delays: map[string]float64{
+			"room-1": 8,
+		}})
+		playback.Set("room-1", theatre.PlaybackState{
+			Position:  3,
+			Playing:   true,
+			Timestamp: time.Now().UnixMilli(),
+		})
+
+		when "computing a snapshot" {
+			snap := engine.ComputeSnapshot("room-1")
+
+			then "floors the delayed playhead at zero" {
+				expect snap.Position == 0
+			}
+		}
+	}
+}

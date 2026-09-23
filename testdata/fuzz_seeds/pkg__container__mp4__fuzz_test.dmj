@@ -1,0 +1,81 @@
+package mp4_test
+
+import (
+	"bytes"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/container/mp4"
+)
+
+fuzz "ReadBoxes does not panic on arbitrary input" with (data []byte) {
+	reader := bytes.NewReader(data)
+	mp4.ReadBoxes(reader, int64(len(data)))
+	expect true
+}
+
+fuzz "Probe does not panic on arbitrary input" with (data []byte) {
+	reader := bytes.NewReader(data)
+	mp4.Probe(reader)
+	expect true
+}
+
+fuzz "ConvertToAnnexB does not panic" with (data []byte, lengthSize byte) {
+	ls := int(lengthSize%4) + 1
+	mp4.ConvertToAnnexB(data, ls)
+	expect true
+}
+
+fuzz "ParseAvcC does not panic" with (data []byte) {
+	mp4.ParseAvcC(data)
+	expect true
+}
+
+fuzz "ParseHvcC does not panic" with (data []byte) {
+	mp4.ParseHvcC(data)
+	expect true
+}
+
+fuzz "parseStsz round trip" with (data []byte) {
+	// Feed arbitrary data into sample table parsing via a synthetic trak
+	if len(data) < 12 {
+		return
+	}
+	// Build minimal stbl > stsz box
+	stszBox := buildFuzzBox("stsz", data)
+	stblBox := buildFuzzContainerBox("stbl", stszBox)
+	minfBox := buildFuzzContainerBox("minf", stblBox)
+	mdhdData := make([]byte, 24)
+	mdhdData[12] = 0x00
+	mdhdData[13] = 0x01
+	mdhdData[14] = 0x5F
+	mdhdData[15] = 0x90 // timescale = 90000
+	mdhdBox := buildFuzzBox("mdhd", mdhdData)
+	mdiaBox := buildFuzzContainerBox("mdia", append(mdhdBox, minfBox...))
+	trakBox := buildFuzzContainerBox("trak", mdiaBox)
+
+	reader := bytes.NewReader(trakBox)
+	boxes, err := mp4.ReadBoxes(reader, int64(len(trakBox)))
+	if err != nil || len(boxes) == 0 {
+		return
+	}
+	st := mp4.ParseSampleTable(boxes[0])
+	if st != nil && len(st.Sizes) > 0 {
+		mp4.BuildSampleIndex(st)
+	}
+	expect true
+}
+
+func buildFuzzBox(boxType string, data []byte) []byte {
+	size := 8 + len(data)
+	hdr := make([]byte, 8)
+	hdr[0] = byte(size >> 24)
+	hdr[1] = byte(size >> 16)
+	hdr[2] = byte(size >> 8)
+	hdr[3] = byte(size)
+	copy(hdr[4:8], boxType)
+	return append(hdr, data...)
+}
+
+func buildFuzzContainerBox(boxType string, children []byte) []byte {
+	return buildFuzzBox(boxType, children)
+}

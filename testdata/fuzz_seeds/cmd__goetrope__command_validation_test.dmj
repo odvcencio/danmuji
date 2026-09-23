@@ -1,0 +1,103 @@
+package main
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/ingest"
+	"github.com/spf13/cobra"
+)
+
+func newWorkerValidationSpecCommand() *cobra.Command {
+	cmd := &cobra.Command{}
+	cmd.Flags().String("config", "", "")
+	cmd.Flags().String("server", "", "")
+	cmd.Flags().String("gpu-device", "0", "")
+	cmd.Flags().String("media-root", "", "")
+	cmd.Flags().String("cache-root", "", "")
+	cmd.Flags().Bool("push-segments", true, "")
+	cmd.Flags().String("label", "", "")
+	cmd.Flags().String("health-listen", "127.0.0.1:9091", "")
+	cmd.Flags().String("policies", "./policies", "")
+	return cmd
+}
+
+func newIngestValidationSpecCommand() *cobra.Command {
+	cmd := &cobra.Command{}
+	cmd.Flags().String("config", "", "")
+	cmd.Flags().String("postgres-dsn-source", "", "")
+	cmd.Flags().String("path", "", "")
+	cmd.Flags().String("url", "", "")
+	cmd.Flags().String("policies", "./policies", "")
+	return cmd
+}
+
+@serial
+unit "command configuration validation fences" {
+	then "worker rejects invalid shared configuration before executor activation" {
+		cmd := newWorkerValidationSpecCommand()
+		err := cmd.Flags().Set("server", "127.0.0.1:9090")
+		expect err == nil
+		err = cmd.Flags().Set("media-root", t.TempDir())
+		expect err == nil
+		t.Setenv("GOETROPE_SECURITY_RUNTIME", "invalid-runtime")
+		runErr := runWorker(cmd, nil)
+		expect runErr != nil
+		expect strings.Contains(runErr.Error(), "security.runtime")
+	}
+
+	then "ingest rejects invalid shared configuration before database work" {
+		cmd := newIngestValidationSpecCommand()
+		err := cmd.Flags().Set("path", "/media/item.mkv")
+		expect err == nil
+		t.Setenv("GOETROPE_SECURITY_RUNTIME", "invalid-runtime")
+		runErr := runIngest(cmd, nil)
+		expect runErr != nil
+		expect strings.Contains(runErr.Error(), "security.runtime")
+	}
+
+	then "a configured URL remains fenced before validation and credentials" {
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "goetrope.toml")
+		err := os.WriteFile(configPath, []byte("[ingest]\nurl = \"https://example.invalid/movie\"\n[security]\nruntime = \"invalid-runtime\"\n"), 0o600)
+		expect err == nil
+		cmd := newIngestValidationSpecCommand()
+		err = cmd.Flags().Set("config", configPath)
+		expect err == nil
+		runErr := runIngest(cmd, nil)
+		expect errors.Is(runErr, ingest.ErrURLIngestUnavailable)
+		expect runErr.Error() == "feature_unavailable"
+	}
+
+	then "a TOML URL wins over a path conflict and malformed selector" {
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "goetrope.toml")
+		err := os.WriteFile(configPath, []byte("[ingest]\nurl = \"https://example.invalid/toml\"\npath = \"/media/item.mkv\"\n"), 0o600)
+		expect err == nil
+		cmd := newIngestValidationSpecCommand()
+		err = cmd.Flags().Set("config", configPath)
+		expect err == nil
+		err = cmd.Flags().Set("postgres-dsn-source", "not-a-source-selector")
+		expect err == nil
+		runErr := runIngest(cmd, nil)
+		expect errors.Is(runErr, ingest.ErrURLIngestUnavailable)
+		expect runErr.Error() == "feature_unavailable"
+	}
+
+	then "an environment URL wins over a path conflict and malformed selector" {
+		t.Setenv("GOETROPE_INGEST_URL", "https://example.invalid/environment")
+		t.Setenv("GOETROPE_INGEST_PATH", "/media/item.mkv")
+		t.Setenv("GOETROPE_POSTGRES_DSN_SOURCE", "not-a-source-selector")
+		cmd := newIngestValidationSpecCommand()
+		runErr := runIngest(cmd, nil)
+		expect errors.Is(runErr, ingest.ErrURLIngestUnavailable)
+		expect runErr.Error() == "feature_unavailable"
+	}
+
+	then "worker help and the typed loader advertise the same health default" {
+		expect strings.Contains(workerCmd.UsageString(), "127.0.0.1:9091")
+	}
+}

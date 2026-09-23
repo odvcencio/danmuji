@@ -1,0 +1,307 @@
+package api
+
+import (
+"context"
+"fmt"
+"os"
+"path/filepath"
+"testing"
+"github.com/odvcencio/goetrope/pkg/library"
+"github.com/odvcencio/goetrope/pkg/randomchannel"
+"github.com/odvcencio/goetrope/pkg/stream"
+"github.com/odvcencio/goetrope/pkg/transcode"
+)
+
+type stubStreamChannelRegistry struct {
+summaries []*randomchannel.Summary
+}
+
+func (s stubStreamChannelRegistry) Summaries(context.Context) ([]*randomchannel.Summary, error) {
+	return s.summaries, nil
+}
+
+func (s stubStreamChannelRegistry) Summary(_ context.Context, alias string) (*randomchannel.Summary, bool, error) {
+	for _, summary := range s.summaries {
+		if summary != nil && summary.Alias == alias {
+			return summary, true, nil
+		}
+	}
+	return nil, false, nil
+}
+
+type recordingStreamChannelAdmin struct {
+summary *randomchannel.Summary
+groups []string
+}
+
+func (s *recordingStreamChannelAdmin) Summary(context.Context) (*randomchannel.Summary, error) {
+	return s.summary, nil
+}
+
+func (s *recordingStreamChannelAdmin) AdvanceNext(context.Context) error {
+	return nil
+}
+
+func (s *recordingStreamChannelAdmin) ForceReroll(context.Context) error {
+	return nil
+}
+
+func (s *recordingStreamChannelAdmin) SetActiveTranscodeGroup(groupID string) {
+	s.groups = append(s.groups, groupID)
+}
+
+unit "Theatre low-latency transcode readiness" {
+	given "only the current segment exists" {
+		tmp, err := os.CreateTemp("", "goetrope-theatre-current-only-*.mkv")
+		expect err == nil
+		tmpPath := tmp.Name()
+		tmp.Close()
+		defer os.Remove(tmpPath)
+		dir, err := stream.TranscodeCacheDir(tmpPath, "h264", stream.LowLatencySegmentDuration)
+		expect err == nil
+		err = os.MkdirAll(dir, 0o755)
+		expect err == nil
+		err = os.WriteFile(filepath.Join(dir, "seg00100.ts"), []byte("not-real-ts"), 0o644)
+		expect err == nil
+		item := &library.MediaItem{Path: tmpPath, DurationMs: 600_000}
+		then "theatre does not advertise the variant yet" {
+			reject transcodeVariantAvailableForPosition(item, "h264", stream.LowLatencySegmentDuration, 100)
+		}
+	}
+	given "the current segment and preroll are cached" {
+		tmp, err := os.CreateTemp("", "goetrope-theatre-preroll-*.mkv")
+		expect err == nil
+		tmpPath := tmp.Name()
+		tmp.Close()
+		defer os.Remove(tmpPath)
+		dir, err := stream.TranscodeCacheDir(tmpPath, "h264", stream.LowLatencySegmentDuration)
+		expect err == nil
+		err = os.MkdirAll(dir, 0o755)
+		expect err == nil
+		for idx := 100; idx <= 105; idx++ {
+			err = os.WriteFile(filepath.Join(dir, fmt.Sprintf("seg%05d.ts", idx)), []byte("not-real-ts"), 0o644)
+			expect err == nil
+		}
+		item := &library.MediaItem{Path: tmpPath, DurationMs: 600_000}
+		then "theatre advertises the variant" {
+			expect transcodeVariantAvailableForPosition(item, "h264", stream.LowLatencySegmentDuration, 100)
+		}
+	}
+	given "the current position is near the content tail" {
+		tmp, err := os.CreateTemp("", "goetrope-theatre-tail-*.mkv")
+		expect err == nil
+		tmpPath := tmp.Name()
+		tmp.Close()
+		defer os.Remove(tmpPath)
+		dir, err := stream.TranscodeCacheDir(tmpPath, "h264", stream.LowLatencySegmentDuration)
+		expect err == nil
+		err = os.MkdirAll(dir, 0o755)
+		expect err == nil
+		for idx := 100; idx <= 102; idx++ {
+			err = os.WriteFile(filepath.Join(dir, fmt.Sprintf("seg%05d.ts", idx)), []byte("not-real-ts"), 0o644)
+			expect err == nil
+		}
+		item := &library.MediaItem{Path: tmpPath, DurationMs: 103_000}
+		then "theatre accepts the truncated tail range" {
+			expect transcodeVariantAvailableForPosition(item, "h264", stream.LowLatencySegmentDuration, 100)
+		}
+	}
+}
+
+unit "Theatre live channel stream position" {
+	given "the current channel item has a viewer delay" {
+		h := &streamHandler{
+		channelAdmin: stubStreamChannelAdmin{
+		summary: &randomchannel.Summary{
+		CurrentItemIndex: 0,
+		CurrentPosition: 3580.25,
+		Playing: true,
+		ViewerDelay: 8,
+		Playlist: []randomchannel.PlaylistEntry{
+		{MediaItemID: 866},
+		},
+		},
+		},
+		}
+		item := &library.MediaItem{ID: 866, DurationMs: 5_979_115}
+		when "inferring the playlist position" {
+			position := h.inferTheatrePosition(context.Background(), 866, item, 3544.435)
+			then "uses the moving viewer-delayed channel clock" {
+				expect position == 3572.25
+			}
+		}
+	}
+	given "the current channel item is paused" {
+		h := &streamHandler{
+		channelAdmin: stubStreamChannelAdmin{
+		summary: &randomchannel.Summary{
+		CurrentItemIndex: 0,
+		CurrentPosition: 3580.25,
+		Playing: false,
+		ViewerDelay: 8,
+		Playlist: []randomchannel.PlaylistEntry{
+		{MediaItemID: 866},
+		},
+		},
+		},
+		}
+		item := &library.MediaItem{ID: 866, DurationMs: 5_979_115}
+		when "inferring the playlist position" {
+			position := h.inferTheatrePosition(context.Background(), 866, item, 3544.435)
+			then "uses the canonical paused channel clock" {
+				expect position == 3580.25
+			}
+		}
+	}
+	given "a show item is current in the registry and movies are also configured" {
+		h := &streamHandler{
+		channelRegistry: stubStreamChannelRegistry{
+		summaries: []*randomchannel.Summary{
+		{
+		Alias: "1",
+		Name: "Random Movies",
+		CurrentItemIndex: 0,
+		CurrentPosition: 11,
+		Playing: true,
+		Playlist: []randomchannel.PlaylistEntry{
+		{MediaItemID: 101},
+		},
+		},
+		{
+		Alias: "2",
+		Name: "Random Shows",
+		CurrentItemIndex: 0,
+		CurrentPosition: 1800,
+		Playing: true,
+		ViewerDelay: 12,
+		Playlist: []randomchannel.PlaylistEntry{
+		{MediaItemID: 202},
+		},
+		},
+		},
+		},
+		}
+		item := &library.MediaItem{ID: 202, DurationMs: 2_700_000}
+		when "inferring the playlist position" {
+			position := h.inferTheatrePosition(context.Background(), 202, item, 100)
+			then "uses the show channel clock" {
+				expect position == 1788.0
+			}
+		}
+		when "selecting cache headers for the show segment" {
+			header := h.segmentCacheControl(context.Background(), 202, true)
+			then "allows edge reuse for the currently playing show item" {
+				expect header == "public, max-age=120"
+			}
+		}
+	}
+	given "a theatre warmup belongs to the show channel while the legacy admin is movies" {
+		tmp, err := os.CreateTemp("", "goetrope-show-warmup-*.mkv")
+		expect err == nil
+		tmpPath := tmp.Name()
+		tmp.Close()
+		defer os.Remove(tmpPath)
+		movieAdmin := &recordingStreamChannelAdmin{
+		summary: &randomchannel.Summary{
+		Alias: "1",
+		Name: "Random Movies",
+		CurrentItemIndex: 0,
+		Playing: true,
+		Playlist: []randomchannel.PlaylistEntry{
+		{MediaItemID: 101},
+		},
+		},
+		}
+		h := &streamHandler{
+		transcode: transcode.NewCoordinator(),
+		channelAdmin: movieAdmin,
+		channelRegistry: stubStreamChannelRegistry{
+		summaries: []*randomchannel.Summary{
+		movieAdmin.summary,
+		{
+		Alias: "2",
+		Name: "Random Shows",
+		CurrentItemIndex: 0,
+		Playing: true,
+		Playlist: []randomchannel.PlaylistEntry{
+		{MediaItemID: 202},
+		},
+		},
+		},
+		},
+		}
+		item := &library.MediaItem{
+		ID: 202,
+		Path: tmpPath,
+		DurationMs: 2_700_000,
+		Streams: []library.Stream{
+		{StreamType: "video", Codec: "vp9", Width: 1280, Height: 720},
+		},
+		}
+		when "negotiating a theatre transcode" {
+			result := h.negotiateTheatreTranscode(
+			context.Background(),
+			202,
+			item,
+			streamNegotiateRequest{Source: "theatre", MaxBitrate: 2_000_000, Position: 64},
+			streamDecision{Action: "Transcode", TargetCodec: transcode.CodecH264},
+			stream.LowLatencySegmentDuration,
+			0,
+			)
+			then "does not assign the show group to the movie admin state" {
+				reject result.Response.Available
+				expect result.Response.GroupID != ""
+				expect len(movieAdmin.groups) == 0
+			}
+		}
+	}
+	given "an AV1 next item is prewarmed for theatre playback" {
+		tmp, err := os.CreateTemp("", "goetrope-av1-prewarm-*.mkv")
+		expect err == nil
+		tmpPath := tmp.Name()
+		tmp.Close()
+		defer os.Remove(tmpPath)
+		coord := transcode.NewCoordinator()
+		h := &streamHandler{transcode: coord}
+		item := &library.MediaItem{
+		ID: 303,
+		Path: tmpPath,
+		DurationMs: 600_000,
+		Streams: []library.Stream{
+		{StreamType: "video", Codec: "av1", Width: 1920, Height: 1080},
+		},
+		}
+		when "prewarming the transcode ladder" {
+			h.prewarmTheatreTranscode(item)
+			jobs := coord.ListJobs()
+			then "queues only the bounded live-cache base rung" {
+				expect len(jobs) > 0
+				for _, job := range jobs {
+					expect job.Job.Type == transcode.JobTypeLiveCache
+					expect job.Job.Quality == "h264-480p"
+				}
+			}
+		}
+	}
+	given "an AV1-capable theatre request targets AV1 for an AV1 source" {
+		supportsAV1 := true
+		item := &library.MediaItem{
+		ID: 404,
+		Path: "/media/av1-theatre.mkv",
+		DurationMs: 600_000,
+		Streams: []library.Stream{
+		{StreamType: "video", Codec: "av1", Width: 1920, Height: 1080},
+		},
+		}
+		when "selecting theatre effective qualities" {
+			qualities := theatreEffectiveQualities(item, streamNegotiateRequest{Source: "theatre", SupportsAV1: &supportsAV1}, streamDecision{
+			Action: "Transcode",
+			TargetCodec: transcode.CodecAV1,
+			}, 0)
+			then "collapses the AV1 ladder to the bounded base rung" {
+				expect len(qualities) == 1
+				expect qualities[0] == "av1-480p"
+			}
+		}
+	}
+}

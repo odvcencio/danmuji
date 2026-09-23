@@ -1,0 +1,24 @@
+package stream_test
+
+import (
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/stream"
+)
+
+unit "content segment tail helpers" {
+	given "a zero duration" {
+		then "does not infer a content tail" {
+			expect stream.ContentSegmentCountForDuration(0, 1.0) == 0
+			expect stream.LastContentSegmentIndexForDuration(0, 1.0) == -1
+		}
+	}
+
+	given "a one-second segment duration" {
+		then "reports the last real segment rather than the playlist sentinel" {
+			expect stream.ContentSegmentCountForDuration(3569966, 1.0) == 3570
+			expect stream.LastContentSegmentIndexForDuration(3569966, 1.0) == 3569
+			expect stream.MaxSegmentIndexForDuration(3569966, 1.0) == 3571
+		}
+	}
+}

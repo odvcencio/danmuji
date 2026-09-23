@@ -1,0 +1,60 @@
+package api
+
+import (
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/library"
+	"github.com/odvcencio/goetrope/pkg/theatre"
+)
+
+unit "theatre room responses carry reactive playlist metadata" {
+	room := &theatre.Room{
+		RoomCode:           "ROOM01",
+		Playlist:           []int64{7, 9},
+		CurrentItemIndex:   1,
+		PlaybackPositionMs: 15000,
+		AdminToken:         "secret",
+	}
+	entries := []theatrePlaylistEntryResponse{
+		{MediaItemID: 7, Title: "Seven", DisplayTitle: "Seven", Year: 2007, DurationMS: 7000},
+		{MediaItemID: 9, Title: "Nine", DisplayTitle: "Nine", Year: 2009, DurationMS: 9000},
+	}
+	resp := theatreRoomResponseFromRoom(room, true)
+	enrichTheatreRoomResponse(&resp, entries)
+
+	then "keeps the legacy id playlist" {
+		expect len(resp.Playlist) == 2
+		expect resp.Playlist[0] == int64(7)
+		expect resp.Playlist[1] == int64(9)
+	}
+	then "adds rich entries for reactive clients" {
+		expect len(resp.PlaylistEntries) == 2
+		expect resp.PlaylistEntries[1].DisplayTitle == "Nine"
+		expect resp.CurrentItem != nil
+		expect resp.CurrentItem.MediaItemID == int64(9)
+		expect resp.NextItem == nil
+	}
+	then "preserves control metadata" {
+		expect resp.AdminToken == "secret"
+		expect resp.WebSocketPath == "/api/theatre/ROOM01/ws"
+	}
+}
+
+unit "theatre playlist entries prefer library display titles" {
+	item := &library.MediaItem{
+		ID:         42,
+		Path:       "/media/Mulholland.Drive.2001.2160p.REMUX.mkv",
+		Title:      "Mulholland.Drive.2001.2160p.REMUX",
+		Year:       2001,
+		DurationMs: 8838000,
+	}
+	entry := theatrePlaylistEntryFromItem(42, item)
+
+	then "returns display metadata useful to the page runtime" {
+		expect entry.MediaItemID == int64(42)
+		expect entry.Title == "Mulholland.Drive.2001.2160p.REMUX"
+		expect entry.DisplayTitle == "Mulholland Drive"
+		expect entry.Year == 2001
+		expect entry.DurationMS == int64(8838000)
+	}
+}

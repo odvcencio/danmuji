@@ -1,0 +1,112 @@
+package library
+
+import (
+	"context"
+	"io"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/odvcencio/goetrope/pkg/container/mp4"
+)
+
+unit "ProbeFile caches repeated MKV probes" {
+	given "an unchanged MKV file" {
+		oldMKVProbe := mkvProbe
+		oldFFProbe := ffprobeMediaInfo
+		defer func() {
+			mkvProbe = oldMKVProbe
+			ffprobeMediaInfo = oldFFProbe
+			probeCache = newProbeCache()
+		}()
+
+		probeCalls := 0
+		mkvProbe = func(_ io.ReadSeeker) (*mp4.MediaInfo, error) {
+			probeCalls++
+			return &mp4.MediaInfo{
+				Container: "mkv",
+				Streams: []mp4.StreamInfo{{
+					Index: 0,
+					Type:  "video",
+					Codec: "h264",
+				}},
+			}, nil
+		}
+		ffprobeMediaInfo = func(_ context.Context, path string) (*mp4.MediaInfo, error) {
+			return nil, os.ErrNotExist
+		}
+		probeCache = newProbeCache()
+
+		tmpDir, dirErr := os.MkdirTemp("", "probe-cache-*")
+		expect dirErr == nil
+		defer os.RemoveAll(tmpDir)
+
+		path := filepath.Join(tmpDir, "movie.mkv")
+		expect os.WriteFile(path, []byte("mkv"), 0o644) == nil
+
+		when "probing the file twice" {
+			first, firstErr := ProbeFile(path)
+			second, secondErr := ProbeFile(path)
+
+			then "only probes once and reuses the cache" {
+				expect firstErr == nil
+				expect secondErr == nil
+				expect probeCalls == 1
+				expect first != nil
+				expect second != nil
+				expect first.Container == "mkv"
+				expect second.Container == "mkv"
+				expect len(second.Streams) == 1
+			}
+		}
+	}
+}
+
+@serial
+unit "ProbeFile cache evicts least recently used entries at its cap" {
+	oldMKVProbe := mkvProbe
+	oldFFProbe := ffprobeMediaInfo
+	oldCache := probeCache
+	defer func() {
+		mkvProbe = oldMKVProbe
+		ffprobeMediaInfo = oldFFProbe
+		probeCache = oldCache
+	}()
+
+	probeCalls := 0
+	mkvProbe = func(_ io.ReadSeeker) (*mp4.MediaInfo, error) {
+		probeCalls++
+		return &mp4.MediaInfo{Container: "mkv"}, nil
+	}
+	ffprobeMediaInfo = func(_ context.Context, path string) (*mp4.MediaInfo, error) {
+		return nil, os.ErrNotExist
+	}
+	probeCache = newBoundedTTLCache[probeCacheKey, *mp4.MediaInfo](1, time.Hour, time.Now)
+
+	tmpDir, dirErr := os.MkdirTemp("", "probe-cache-cap-*")
+	expect dirErr == nil
+	defer os.RemoveAll(tmpDir)
+	firstPath := filepath.Join(tmpDir, "first.mkv")
+	secondPath := filepath.Join(tmpDir, "second.mkv")
+	expect os.WriteFile(firstPath, []byte("first"), 0o644) == nil
+	expect os.WriteFile(secondPath, []byte("second"), 0o644) == nil
+
+	when "probing two files through a one-entry cache" {
+		_, firstErr := ProbeFile(firstPath)
+		_, secondErr := ProbeFile(secondPath)
+		_, repeatedErr := ProbeFile(firstPath)
+		stats := ProbeCacheStats()
+
+		then "all probes succeed" {
+			expect firstErr == nil
+			expect secondErr == nil
+			expect repeatedErr == nil
+		}
+		then "the first file is re-probed after eviction" {
+			expect probeCalls == 3
+			expect stats.Entries == 1
+			expect stats.MaxEntries == 1
+		}
+	}
+}
