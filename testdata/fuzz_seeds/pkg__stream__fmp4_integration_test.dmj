@@ -1,0 +1,66 @@
+package stream_test
+
+import (
+	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/stream"
+)
+
+integration "EnsureCachedFMP4Variant VOD" {
+	given "a synthetic MP4 source" {
+		ffmpegPath, lookErr := exec.LookPath("ffmpeg")
+		if lookErr != nil {
+			t.Skip("ffmpeg not installed")
+		}
+
+		tmpDir, mkdirErr := os.MkdirTemp("", "fmp4-cache-*")
+		expect mkdirErr == nil
+		defer os.RemoveAll(tmpDir)
+
+		sourcePath := filepath.Join(tmpDir, "clip.mp4")
+		cmd := exec.Command(
+			ffmpegPath,
+			"-y",
+			"-v", "error",
+			"-f", "lavfi",
+			"-i", "testsrc=size=640x360:rate=24",
+			"-f", "lavfi",
+			"-i", "sine=frequency=1000:sample_rate=48000",
+			"-t", "2",
+			"-c:v", "libx264",
+			"-pix_fmt", "yuv420p",
+			"-c:a", "aac",
+			sourcePath,
+		)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("ffmpeg synthetic source: %v\n%s", err, output)
+		}
+
+		when "caching the original VOD variant" {
+			playlistPath, err := stream.EnsureCachedFMP4Variant(context.Background(), sourcePath, "original", stream.DefaultSegmentDuration, false)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "writes the playlist" {
+				expect playlistPath != ""
+				_, statErr := os.Stat(playlistPath)
+				expect statErr == nil
+			}
+			then "writes the init segment" {
+				initPath := filepath.Join(filepath.Dir(playlistPath), "init.mp4")
+				_, statErr := os.Stat(initPath)
+				expect statErr == nil
+			}
+			then "writes at least one media fragment" {
+				fragments, globErr := filepath.Glob(filepath.Join(filepath.Dir(playlistPath), "*.m4s"))
+				expect globErr == nil
+				expect len(fragments) >= 1
+			}
+		}
+	}
+}

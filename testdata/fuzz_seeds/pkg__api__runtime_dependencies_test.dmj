@@ -1,0 +1,48 @@
+package api
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+unit "explicit API admin credential" {
+	given "a caller-owned admin key" {
+		marker := "API_ADMIN_MARKER_8f1f"
+		caller := []byte(marker)
+		verifier := NewAdminVerifier(caller)
+		for i := range caller {
+			caller[i] = 0
+		}
+
+		then "the verifier owns an independent redacted copy" {
+			expect verifier.Verify(marker)
+			reject strings.Contains(fmt.Sprintf("%+v", verifier), marker)
+		}
+
+		when "the verifier is closed" {
+			verifier.Close()
+
+			then "the credential no longer verifies" {
+				reject verifier.Verify(marker)
+			}
+		}
+	}
+}
+
+@serial
+unit "ambient admin environment has no authority" {
+	then "an un-injected legacy key cannot authorize a remote admin request" {
+		t.Setenv("GOETROPE_ADMIN_KEY", "AMBIENT_ADMIN_MARKER")
+		router := NewUnsafeRouterWithoutStreamAuth(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+		req := httptest.NewRequest(http.MethodGet, "/health/details", nil)
+		req.RemoteAddr = "203.0.113.9:5555"
+		req.Header.Set("X-Goetrope-Admin-Key", "AMBIENT_ADMIN_MARKER")
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, req)
+
+		expect recorder.Code == http.StatusForbidden
+	}
+}

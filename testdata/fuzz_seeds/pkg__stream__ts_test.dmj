@@ -1,0 +1,229 @@
+package stream_test
+
+import (
+	"bytes"
+	"encoding/binary"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/stream"
+)
+
+unit "TSWriter packet format" {
+	given "any PES write" {
+		var buf bytes.Buffer
+		tw := stream.NewTSWriter(&buf)
+
+		when "writing PAT" {
+			err := tw.WritePAT()
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "produces exactly 188 bytes" {
+				expect buf.Len() == 188
+			}
+			then "starts with sync byte 0x47" {
+				expect buf.Bytes()[0] == byte(0x47)
+			}
+		}
+	}
+
+	given "PAT plus PMT plus video packet" {
+		var buf bytes.Buffer
+		tw := stream.NewTSWriter(&buf)
+		_ = tw.WritePAT()
+		_ = tw.WritePMT("h264", true)
+
+		when "writing a video PES" {
+			payload := make([]byte, 200)
+			for i := range payload {
+				payload[i] = byte(i & 0xFF)
+			}
+			err := tw.WriteVideoPacket(payload, 90000, true)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "total output is a multiple of 188 bytes" {
+				expect buf.Len() % 188 == 0
+			}
+			then "every packet starts with sync byte" {
+				data := buf.Bytes()
+				for i := 0; i < len(data); i += 188 {
+					expect data[i] == byte(0x47)
+				}
+			}
+		}
+	}
+}
+
+unit "TSWriter adaptation field stuffing" {
+	each "payload size" {
+		defaults { size: 10 }
+		{ name: "tiny payload",      size: 1 }
+		{ name: "small payload",     size: 10 }
+		{ name: "medium payload",    size: 100 }
+		{ name: "almost full",       size: 183 }
+		{ name: "exactly one short", size: 182 }
+		{ name: "half",              size: 92 }
+	} do {
+		given "a payload of this size" {
+			sz := scenario.size.(int)
+			var buf bytes.Buffer
+			tw := stream.NewTSWriter(&buf)
+			payload := make([]byte, sz)
+			for i := range payload {
+				payload[i] = byte(0xAA)
+			}
+			err := tw.WriteAudioPacket(payload, 0)
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "output is a multiple of 188" {
+				expect buf.Len() % 188 == 0
+			}
+			then "every packet starts with sync byte" {
+				data := buf.Bytes()
+				for i := 0; i < len(data); i += 188 {
+					expect data[i] == byte(0x47)
+				}
+			}
+			then "output contains the payload bytes" {
+				// The payload may span multiple TS packets due to PES header
+				// overhead, so check the full output stream for the 0xAA pattern
+				// rather than checking a single packet.
+				data := buf.Bytes()
+				aaCount := 0
+				for _, b := range data {
+					if b == byte(0xAA) {
+						aaCount++
+					}
+				}
+				// All sz payload bytes must appear somewhere in the output
+				expect aaCount >= sz
+			}
+		}
+	}
+}
+
+unit "PES header PTS encoding" {
+	given "a known PTS value of 90000" {
+		var buf bytes.Buffer
+		tw := stream.NewTSWriter(&buf)
+		payload := make([]byte, 100)
+		_ = tw.WriteAudioPacket(payload, 90000)
+
+		then "PTS encodes correctly in PES header" {
+			data := buf.Bytes()
+			pesStart := -1
+			for i := 4; i < 188-3; i++ {
+				if data[i] == 0x00 && data[i+1] == 0x00 && data[i+2] == 0x01 {
+					pesStart = i
+					break
+				}
+			}
+			expect pesStart >= 0
+
+			ptsOff := pesStart + 9
+			b0 := data[ptsOff]
+			b1 := data[ptsOff+1]
+			b2 := data[ptsOff+2]
+			b3 := data[ptsOff+3]
+			b4 := data[ptsOff+4]
+
+			decoded := int64((int64(b0>>1) & 0x07) << 30)
+			decoded |= int64(b1) << 22
+			decoded |= int64(b2>>1) << 15
+			decoded |= int64(b3) << 7
+			decoded |= int64(b4 >> 1)
+
+			expect decoded == int64(90000)
+		}
+	}
+
+	given "max 33-bit PTS" {
+		var buf bytes.Buffer
+		tw := stream.NewTSWriter(&buf)
+		maxPTS := int64(0x1FFFFFFFF)
+		payload := make([]byte, 100)
+		_ = tw.WriteAudioPacket(payload, maxPTS)
+
+		then "PTS encodes without overflow" {
+			data := buf.Bytes()
+			pesStart := -1
+			for i := 4; i < 188-3; i++ {
+				if data[i] == 0x00 && data[i+1] == 0x00 && data[i+2] == 0x01 {
+					pesStart = i
+					break
+				}
+			}
+			expect pesStart >= 0
+
+			ptsOff := pesStart + 9
+			b0 := data[ptsOff]
+			b1 := data[ptsOff+1]
+			b2 := data[ptsOff+2]
+			b3 := data[ptsOff+3]
+			b4 := data[ptsOff+4]
+
+			decoded := int64((int64(b0>>1) & 0x07) << 30)
+			decoded |= int64(b1) << 22
+			decoded |= int64(b2>>1) << 15
+			decoded |= int64(b3) << 7
+			decoded |= int64(b4 >> 1)
+
+			expect decoded == maxPTS
+		}
+	}
+}
+
+unit "PES audio packet length" {
+	given "a known size audio payload" {
+		var buf bytes.Buffer
+		tw := stream.NewTSWriter(&buf)
+		payload := make([]byte, 100)
+		_ = tw.WriteAudioPacket(payload, 90000)
+
+		then "PES packet length field is correct" {
+			data := buf.Bytes()
+			pesStart := -1
+			for i := 4; i < 188-6; i++ {
+				if data[i] == 0x00 && data[i+1] == 0x00 && data[i+2] == 0x01 {
+					pesStart = i
+					break
+				}
+			}
+			expect pesStart >= 0
+
+			pesLen := int(binary.BigEndian.Uint16(data[pesStart+4 : pesStart+6]))
+
+			// Correct: 8 (optional header) + 100 (payload) = 108
+			// Bug would produce: 111 (with spurious +3)
+			expect pesLen == 108
+		}
+	}
+}
+
+unit "TSWriter continuity counter" {
+	given "multiple packets on the same PID" {
+		var buf bytes.Buffer
+		tw := stream.NewTSWriter(&buf)
+
+		when "writing three PATs" {
+			_ = tw.WritePAT()
+			_ = tw.WritePAT()
+			_ = tw.WritePAT()
+
+			then "continuity counters increment" {
+				data := buf.Bytes()
+				cc0 := data[3] & 0x0F
+				cc1 := data[188+3] & 0x0F
+				cc2 := data[376+3] & 0x0F
+				expect cc0 == byte(0)
+				expect cc1 == byte(1)
+				expect cc2 == byte(2)
+			}
+		}
+	}
+}

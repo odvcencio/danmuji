@@ -1,0 +1,335 @@
+package library
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/fsnotify/fsnotify"
+)
+
+type scannerWatchRecorder struct {
+	added   []string
+	removed []string
+	events  chan fsnotify.Event
+	errors  chan error
+}
+
+func (w *scannerWatchRecorder) Add(path string) error {
+	w.added = append(w.added, path)
+	return nil
+}
+
+func (w *scannerWatchRecorder) Remove(path string) error {
+	w.removed = append(w.removed, path)
+	return nil
+}
+
+func (w *scannerWatchRecorder) Close() error {
+	return nil
+}
+
+func (w *scannerWatchRecorder) Events() <-chan fsnotify.Event {
+	if w.events != nil {
+		return w.events
+	}
+	return nil
+}
+
+func (w *scannerWatchRecorder) Errors() <-chan error {
+	if w.errors != nil {
+		return w.errors
+	}
+	return nil
+}
+
+type scannerWatchIngester struct {
+	paths  []string
+	cancel context.CancelFunc
+}
+
+func (s *scannerWatchIngester) IngestPath(ctx context.Context, path string) (*MediaItem, error) {
+	s.paths = append(s.paths, path)
+	if s.cancel != nil {
+		s.cancel()
+	}
+	return &MediaItem{Title: filepath.Base(path), Container: filepath.Ext(path)}, nil
+}
+
+unit "Scanner addRootWatches recursively adds existing directories" {
+	root := t.TempDir()
+	nested := filepath.Join(root, "nested")
+	err := os.MkdirAll(nested, 0o755)
+	expect err == nil
+
+	scanner := NewScanner([]string{root}, nil)
+	recorder := &scannerWatchRecorder{}
+
+	when "adding root watches" {
+		watches, err := scanner.addRootWatches(recorder)
+		stats := watches.stats()
+
+		then "succeeds" {
+			expect err == nil
+		}
+		then "adds the root and nested directory" {
+			expect len(recorder.added) == 2
+			expect recorder.added[0] == root
+			expect recorder.added[1] == nested
+		}
+		then "exposes memory-only watch stats" {
+			expect stats.WatchedDirs == 2
+			expect stats.WatchLimit == defaultScanWatchMaxDirs
+			expect stats.WatchFallbacks == 0
+		}
+	}
+}
+
+unit "Scanner recursive watches respect cap and mark fallback root" {
+	root := t.TempDir()
+	nested := filepath.Join(root, "nested")
+	deeper := filepath.Join(nested, "deeper")
+	err := os.MkdirAll(deeper, 0o755)
+	expect err == nil
+
+	recorder := &scannerWatchRecorder{}
+	watches := newScannerWatchSet(recorder, 2)
+
+	when "adding more directories than the watch cap" {
+		err := watches.addRoot(root)
+		stats := watches.stats()
+		fallbacks := watches.fallbackRoots()
+
+		then "root setup itself succeeds" {
+			expect err == nil
+		}
+		then "does not exceed the configured watch limit" {
+			expect len(recorder.added) == 2
+			expect stats.WatchedDirs == 2
+			expect stats.WatchLimit == 2
+		}
+		then "marks the root for bounded fallback scans" {
+			expect stats.WatchFallbacks == 1
+			expect len(fallbacks) == 1
+			expect fallbacks[0] == root
+		}
+	}
+}
+
+unit "Scanner recursive watches remove deleted subtrees" {
+	root := t.TempDir()
+	nested := filepath.Join(root, "nested")
+	deeper := filepath.Join(nested, "deeper")
+	err := os.MkdirAll(deeper, 0o755)
+	expect err == nil
+
+	recorder := &scannerWatchRecorder{}
+	watches := newScannerWatchSet(recorder, defaultScanWatchMaxDirs)
+	err = watches.addRoot(root)
+	expect err == nil
+
+	when "removing a watched subtree" {
+		watches.remove(nested)
+		stats := watches.stats()
+
+		then "removes the nested watches only" {
+			expect len(recorder.removed) == 2
+			expect recorder.removed[0] == deeper || recorder.removed[0] == nested
+			expect stats.WatchedDirs == 1
+		}
+	}
+}
+
+unit "Scanner recursive watches skip symlink escapes" {
+	root := t.TempDir()
+	outside := t.TempDir()
+	err := os.WriteFile(filepath.Join(outside, "movie.mp4"), []byte("movie"), 0o644)
+	expect err == nil
+	link := filepath.Join(root, "outside")
+	err = os.Symlink(outside, link)
+	expect err == nil
+
+	recorder := &scannerWatchRecorder{}
+	watches := newScannerWatchSet(recorder, defaultScanWatchMaxDirs)
+
+	when "adding a root with an escaping symlink" {
+		err := watches.addRoot(root)
+
+		then "succeeds" {
+			expect err == nil
+		}
+		then "does not add the symlinked outside directory" {
+			expect len(recorder.added) == 1
+			expect recorder.added[0] == root
+		}
+	}
+}
+
+@serial
+unit "Scanner watch adopts new nested directories from create events" {
+	t.Setenv("GOETROPE_SCAN_WATCH", "true")
+	t.Setenv("GOETROPE_SCAN_WATCH_DEBOUNCE", "1ms")
+	root := t.TempDir()
+	nested := filepath.Join(root, "nested")
+	err := os.MkdirAll(nested, 0o755)
+	expect err == nil
+	movie := filepath.Join(nested, "movie.mp4")
+	err = os.WriteFile(movie, []byte("movie"), 0o644)
+	expect err == nil
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	ingester := &scannerWatchIngester{cancel: cancel}
+	scanner := NewScanner([]string{root}, ingester)
+	scanner.scanInterval = time.Hour
+	recorder := &scannerWatchRecorder{
+		events: make(chan fsnotify.Event, 1),
+		errors: make(chan error),
+	}
+	oldWatcher := newScannerWatcher
+	newScannerWatcher = func() (scannerWatcher, error) {
+		return recorder, nil
+	}
+	defer func() {
+		newScannerWatcher = oldWatcher
+	}()
+	recorder.events <- fsnotify.Event{Name: nested, Op: fsnotify.Create}
+
+	when "watching after a nested directory create event" {
+		err := scanner.Watch(ctx)
+		stats := scanner.Stats()
+
+		then "succeeds" {
+			expect err == nil
+		}
+		then "adds a watch for the newly created nested directory" {
+			expect len(recorder.added) == 2
+			expect recorder.added[0] == root
+			expect recorder.added[1] == nested
+		}
+		then "indexes media inside the newly watched directory after debounce" {
+			expect len(ingester.paths) == 1
+			expect ingester.paths[0] == movie
+		}
+		then "publishes watch stats without persistent state" {
+			expect stats.WatchedDirs == 2
+			expect stats.WatchFallbacks == 0
+		}
+	}
+}
+
+@serial
+unit "Scanner watch disabled force polls nested trees" {
+	t.Setenv("GOETROPE_SCAN_WATCH", "false")
+	root := t.TempDir()
+	nested := filepath.Join(root, "nested")
+	err := os.MkdirAll(nested, 0o755)
+	expect err == nil
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	ingester := &scannerWatchIngester{cancel: cancel}
+	scanner := NewScanner([]string{root}, ingester)
+	scanner.scanInterval = time.Millisecond
+
+	err = scanner.scanPath(context.Background(), root, false)
+	expect err == nil
+
+	movie := filepath.Join(nested, "movie.mp4")
+	err = os.WriteFile(movie, []byte("movie"), 0o644)
+	expect err == nil
+
+	watcherCalls := 0
+	oldWatcher := newScannerWatcher
+	newScannerWatcher = func() (scannerWatcher, error) {
+		watcherCalls++
+		return nil, nil
+	}
+	defer func() {
+		newScannerWatcher = oldWatcher
+	}()
+
+	when "watching in polling-only mode" {
+		err := scanner.Watch(ctx)
+
+		then "succeeds" {
+			expect err == nil
+		}
+		then "does not attempt to create an fsnotify watcher" {
+			expect watcherCalls == 0
+		}
+		then "indexes a nested file added after the root was scanned" {
+			expect len(ingester.paths) == 1
+			expect ingester.paths[0] == movie
+		}
+	}
+}
+
+@serial
+unit "Scanner watch skips overlapping polling scan" {
+	t.Setenv("GOETROPE_SCAN_WATCH", "false")
+	root := t.TempDir()
+	movie := filepath.Join(root, "movie.mp4")
+	err := os.WriteFile(movie, []byte("movie"), 0o644)
+	expect err == nil
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	ingester := &scannerWatchIngester{}
+	scanner := NewScanner([]string{root}, ingester)
+	scanner.scanInterval = time.Millisecond
+	scanner.scanMu.Lock()
+	defer scanner.scanMu.Unlock()
+
+	when "a polling tick fires while another scan is running" {
+		err := scanner.Watch(ctx)
+
+		then "succeeds without blocking behind the active scan" {
+			expect err == nil
+		}
+		then "does not start a competing ingest pass" {
+			expect len(ingester.paths) == 0
+		}
+	}
+}
+
+@serial
+unit "Scanner watch enabled from env" {
+	when "env is empty" {
+		t.Setenv("GOETROPE_SCAN_WATCH", "")
+		enabled := scannerWatchEnabledFromEnv()
+
+		then "defaults to enabled" {
+			expect enabled == true
+		}
+	}
+
+	when "env is enabled" {
+		t.Setenv("GOETROPE_SCAN_WATCH", "enabled")
+		enabled := scannerWatchEnabledFromEnv()
+
+		then "returns enabled" {
+			expect enabled == true
+		}
+	}
+
+	when "env is disabled" {
+		t.Setenv("GOETROPE_SCAN_WATCH", "false")
+		enabled := scannerWatchEnabledFromEnv()
+
+		then "returns disabled" {
+			expect enabled == false
+		}
+	}
+
+	when "env is unknown" {
+		t.Setenv("GOETROPE_SCAN_WATCH", "maybe")
+		enabled := scannerWatchEnabledFromEnv()
+
+		then "defaults to enabled" {
+			expect enabled == true
+		}
+	}
+}

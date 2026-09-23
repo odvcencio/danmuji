@@ -1,0 +1,107 @@
+package subtitlecap_test
+
+import (
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/library"
+	"github.com/odvcencio/goetrope/pkg/subtitlecap"
+)
+
+unit "ForItem" {
+	then "rejects media with no subtitle tracks" {
+		capability := subtitlecap.ForItem(&library.MediaItem{
+			Streams: []library.Stream{{StreamType: "video", Codec: "h264"}},
+		})
+
+		expect capability.Kind == subtitlecap.KindUnavailable
+		reject capability.Usable()
+	}
+
+	then "accepts embedded text subtitles" {
+		capability := subtitlecap.ForItem(&library.MediaItem{
+			Streams: []library.Stream{
+				{StreamType: "subtitle", StreamIndex: 4, Codec: "ass", Language: "jpn"},
+			},
+		})
+
+		expect capability.Kind == subtitlecap.KindText
+		expect capability.Usable()
+		expect len(capability.TextTracks) == 1
+		reject capability.RequiresWarmup()
+	}
+
+	then "accepts sidecar subtitle tags as text" {
+		capability := subtitlecap.ForItem(&library.MediaItem{
+			Streams: []library.Stream{
+				{StreamType: "subtitle", StreamIndex: 9, CodecTag: "sidecar:srt", Language: "eng"},
+			},
+		})
+
+		expect capability.Kind == subtitlecap.KindText
+		expect len(capability.TextTracks) == 1
+	}
+
+	then "accepts bitmap subtitles without requiring OCR text" {
+		capability := subtitlecap.ForItem(&library.MediaItem{
+			Streams: []library.Stream{
+				{StreamType: "subtitle", StreamIndex: 2, Codec: "hdmv_pgs_subtitle", CodecTag: "pgs"},
+			},
+		})
+
+		expect capability.Kind == subtitlecap.KindBitmap
+		expect capability.Usable()
+		expect len(capability.BitmapTracks) == 1
+		expect capability.RequiresWarmup()
+		reject capability.Facts().BitmapReady
+	}
+
+	then "prefers text tracks over bitmap tracks for playback" {
+		capability := subtitlecap.ForItem(&library.MediaItem{
+			Streams: []library.Stream{
+				{StreamType: "subtitle", StreamIndex: 8, Codec: "pgs", CodecTag: "pgs"},
+				{StreamType: "subtitle", StreamIndex: 3, Codec: "subrip", CodecTag: "subrip"},
+			},
+		})
+
+		expect capability.Kind == subtitlecap.KindText
+		expect len(capability.TextTracks) == 1
+		expect len(capability.BitmapTracks) == 1
+	}
+
+	then "accepts an explicit generated caption artifact only when the caller says it is ready" {
+		capability := subtitlecap.ForItemWithOptions(&library.MediaItem{}, subtitlecap.Options{GeneratedReady: true})
+
+		expect capability.Kind == subtitlecap.KindGenerated
+		expect capability.Usable()
+	}
+
+	then "marks bitmap subtitles ready only from an explicit cache signal" {
+		capability := subtitlecap.ForItemWithOptions(&library.MediaItem{
+			Streams: []library.Stream{
+				{StreamType: "subtitle", StreamIndex: 2, Codec: "pgs", CodecTag: "pgs"},
+			},
+		}, subtitlecap.Options{BitmapReady: true})
+
+		expect capability.Kind == subtitlecap.KindBitmap
+		expect capability.Facts().BitmapReady
+		reject capability.RequiresWarmup()
+	}
+}
+
+unit "RenderableTracks" {
+	then "returns supported text and bitmap subtitles in stable playback order" {
+		tracks := subtitlecap.RenderableTracks(&library.MediaItem{
+			Streams: []library.Stream{
+				{StreamType: "subtitle", StreamIndex: 9, Codec: "ass", Language: "jpn"},
+				{StreamType: "subtitle", StreamIndex: 2, Codec: "pgs", CodecTag: "pgs"},
+				{StreamType: "subtitle", StreamIndex: 5, CodecTag: "sidecar:srt", Language: "eng", IsDefault: true},
+				{StreamType: "subtitle", StreamIndex: 7, Codec: "unknown"},
+			},
+		})
+
+		expect len(tracks) == 3
+		expect tracks[0].StreamIndex == 5
+		expect tracks[1].StreamIndex == 9
+		expect tracks[2].StreamIndex == 2
+	}
+}

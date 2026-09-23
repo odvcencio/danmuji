@@ -1,0 +1,28 @@
+package randomchannel
+
+import (
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/library"
+)
+
+unit "Random channel subtitle warmup selection" {
+	given "more renderable embedded subtitles than the eager warmup budget" {
+		item := &library.MediaItem{
+			Streams: []library.Stream{
+				{StreamType: "subtitle", StreamIndex: 9, Codec: "ass", CodecTag: "ass", Language: "jpn"},
+				{StreamType: "subtitle", StreamIndex: 2, Codec: "pgs", CodecTag: "pgs", Language: "eng", IsDefault: true},
+				{StreamType: "subtitle", StreamIndex: 5, Codec: "subrip", CodecTag: "subrip", Language: "eng"},
+				{StreamType: "subtitle", StreamIndex: 7, Codec: "ass", CodecTag: "ass", Language: "eng"},
+			},
+		}
+		tracks := preferredSubtitleWarmupStreams(item)
+
+		then "warms the default plus the next two preferred alternatives" {
+			expect len(tracks) == 3
+			expect tracks[0].StreamIndex == 2
+			expect tracks[1].StreamIndex == 5
+			expect tracks[2].StreamIndex == 7
+		}
+	}
+}

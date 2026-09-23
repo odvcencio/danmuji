@@ -1,0 +1,326 @@
+package main
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func validEvidenceSchema(t *testing.T) map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("..", "..", "tests", "evidence", "schema.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schema map[string]any
+	if err := json.Unmarshal(data, &schema); err != nil {
+		t.Fatal(err)
+	}
+	return schema
+}
+
+func evidenceProblems(t *testing.T, schema map[string]any) []string {
+	t.Helper()
+	root := t.TempDir()
+	dir := filepath.Join(root, "tests", "evidence")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "schema.json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	problems = nil
+	checkEvidence(root)
+	result := append([]string(nil), problems...)
+	problems = nil
+	return result
+}
+
+func containsProblem(found []string, needle string) bool {
+	for _, problem := range found {
+		if strings.Contains(problem, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func securityContractProblems(t *testing.T, alteredPath, alteredCommand string) []string {
+	t.Helper()
+	root := t.TempDir()
+	for _, relative := range []string{
+		"tests/security/README.md",
+		"scripts/verify.sh",
+	} {
+		path := filepath.Join(root, filepath.FromSlash(relative))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		command := securityGateCommand
+		if relative == alteredPath {
+			command = alteredCommand
+		}
+		if err := os.WriteFile(path, []byte("contract: "+command+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	problems = nil
+	checkSecurityGateContract(root)
+	result := append([]string(nil), problems...)
+	problems = nil
+	return result
+}
+
+func securityContractProblemsWithout(t *testing.T, omitted string) []string {
+	t.Helper()
+	root := t.TempDir()
+	for _, relative := range []string{
+		"tests/security/README.md",
+		"scripts/verify.sh",
+	} {
+		if relative == omitted {
+			continue
+		}
+		path := filepath.Join(root, filepath.FromSlash(relative))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("contract: "+securityGateCommand+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	problems = nil
+	checkSecurityGateContract(root)
+	result := append([]string(nil), problems...)
+	problems = nil
+	return result
+}
+
+@serial
+unit "Canonical security gate command" {
+	then "accepts the exact same seven-package command in the committed contract files" {
+		found := securityContractProblems(t, "", "")
+		expect len(found) == 0
+	}
+
+	then "rejects a documentation or script command that drops one package" {
+		altered := strings.Replace(securityGateCommand, " ./pkg/ingest", "", 1)
+		found := securityContractProblems(t, "tests/security/README.md", altered)
+		expect containsProblem(found, "security gate command diverges")
+	}
+
+	then "rejects a command with an appended eighth package" {
+		altered := securityGateCommand + " ./pkg/extra"
+		found := securityContractProblems(t, "tests/security/README.md", altered)
+		expect containsProblem(found, "security gate command diverges")
+		expect containsProblem(found, "exactly seven package tokens")
+	}
+
+	then "rejects a command with reordered packages" {
+		altered := strings.Replace(securityGateCommand, "./pkg/netfetch ./pkg/ingest", "./pkg/ingest ./pkg/netfetch", 1)
+		found := securityContractProblems(t, "scripts/verify.sh", altered)
+		expect containsProblem(found, "security gate command diverges")
+		expect containsProblem(found, "security gate package 2 diverges")
+	}
+
+	then "rejects a command with a duplicate package" {
+		altered := securityGateCommand + " ./pkg/netfetch"
+		found := securityContractProblems(t, "scripts/verify.sh", altered)
+		expect containsProblem(found, "duplicates package")
+	}
+
+	then "rejects alternate flags around the seven packages" {
+		altered := strings.Replace(securityGateCommand, "go test", "go test -race", 1)
+		found := securityContractProblems(t, "scripts/verify.sh", altered)
+		expect containsProblem(found, "security gate command diverges")
+		expect containsProblem(found, "security gate command prefix diverges")
+	}
+
+	then "fails when a committed contract file is missing" {
+		found := securityContractProblemsWithout(t, "scripts/verify.sh")
+		expect containsProblem(found, "security gate contract scripts/verify.sh")
+	}
+}
+
+@serial
+unit "Manifest ready-suite discovery" {
+	then "finds a recursively nested test carrying the declared build tag" {
+		root := t.TempDir()
+		nested := filepath.Join(root, "nested")
+		expect os.MkdirAll(nested, 0o755) == nil
+		source := "//go:build e2e\n\npackage nested\n\nimport \"testing\"\n\nfunc TestFirstRun(t *testing.T) {}\n"
+		expect os.WriteFile(filepath.Join(nested, "journey_test.go"), []byte(source), 0o644) == nil
+
+		found, err := realTest(root, "e2e")
+		expect err == nil
+		expect found
+	}
+
+	then "rejects a recursive test that omits the declared build tag" {
+		root := t.TempDir()
+		nested := filepath.Join(root, "nested")
+		expect os.MkdirAll(nested, 0o755) == nil
+		source := "package nested\n\nimport \"testing\"\n\nfunc TestFirstRun(t *testing.T) {}\n"
+		expect os.WriteFile(filepath.Join(nested, "journey_test.go"), []byte(source), 0o644) == nil
+
+		found, err := realTest(root, "e2e")
+		expect err == nil
+		reject found
+	}
+
+	then "rejects a recursive test whose build constraint negates the declared tag" {
+		root := t.TempDir()
+		nested := filepath.Join(root, "nested")
+		expect os.MkdirAll(nested, 0o755) == nil
+		source := "//go:build !e2e\n\npackage nested\n\nimport \"testing\"\n\nfunc TestFirstRun(t *testing.T) {}\n"
+		expect os.WriteFile(filepath.Join(nested, "journey_test.go"), []byte(source), 0o644) == nil
+
+		found, err := realTest(root, "e2e")
+		expect err == nil
+		reject found
+	}
+}
+
+@serial
+unit "Evidence schema structural validation" {
+	then "reports malformed object and array shapes without panicking" {
+		schema := map[string]any{
+			"$schema":    "https://json-schema.org/draft/2020-12/schema",
+			"required":   map[string]any{},
+			"properties": []any{},
+			"$defs":      []any{},
+		}
+
+		found := evidenceProblems(t, schema)
+		expect len(found) > 0
+		expect containsProblem(found, "required must be an array")
+		expect containsProblem(found, "properties must be an object")
+	}
+
+	then "rejects an ordinary verdict enum missing PASS-WAIVED-P1 even when the string exists elsewhere" {
+		schema := validEvidenceSchema(t)
+		defs := schema["$defs"].(map[string]any)
+		gateEvidence := defs["gateEvidence"].(map[string]any)
+		properties := gateEvidence["properties"].(map[string]any)
+		verdict := properties["verdict"].(map[string]any)
+		verdict["enum"] = []any{"PASS", "FAIL"}
+		schema["decoy"] = map[string]any{"enum": []any{"PASS-WAIVED-P1"}}
+
+		found := evidenceProblems(t, schema)
+		expect containsProblem(found, "$defs.gateEvidence.properties.verdict.enum is missing \"PASS-WAIVED-P1\"")
+	}
+
+	then "rejects a waiver safeguard moved outside the exact p1Waiver property" {
+		schema := validEvidenceSchema(t)
+		defs := schema["$defs"].(map[string]any)
+		waiver := defs["p1Waiver"].(map[string]any)
+		properties := waiver["properties"].(map[string]any)
+		properties["security_defect"] = map[string]any{"type": "boolean"}
+		defs["decoy"] = map[string]any{"security_defect": map[string]any{"const": false}}
+
+		found := evidenceProblems(t, schema)
+		expect containsProblem(found, "waiver safeguard \"security_defect\" must be const false")
+	}
+
+	then "rejects a gate wired to the wrong evidence definition" {
+		schema := validEvidenceSchema(t)
+		properties := schema["properties"].(map[string]any)
+		gates := properties["gates"].(map[string]any)
+		gateProperties := gates["properties"].(map[string]any)
+		gate03 := gateProperties["GATE-03"].(map[string]any)
+		gate03["$ref"] = "#/$defs/gate10Evidence"
+
+		found := evidenceProblems(t, schema)
+		expect containsProblem(found, "GATE-03 must reference #/$defs/gateEvidence")
+	}
+}
+
+unit "Fixture manifest path validation" {
+	then "accepts only clean repository-relative slash paths" {
+		expect validRepositoryPath("tests/fixtures/media/example.mp4")
+		reject validRepositoryPath("../outside.mp4")
+		reject validRepositoryPath("tests/fixtures/../outside.mp4")
+		reject validRepositoryPath("/tmp/outside.mp4")
+		reject validRepositoryPath("C:/outside.mp4")
+		reject validRepositoryPath("docs/example.mp4")
+		reject validRepositoryPath("tests\\fixtures\\media\\example.mp4")
+	}
+}
+
+func soakContractFixture(t *testing.T, theatreMutation, randomMutation string) string {
+	t.Helper()
+	root := t.TempDir()
+	dir := filepath.Join(root, "tests", "soak")
+	require.NoError(t, os.MkdirAll(dir, 0o755))
+	theatre := "//go:build soak\n\npackage soak\nimport \"testing\"\nfunc runTheatreJourney(*testing.T) {}\nfunc TestTheatreTransitions(t *testing.T) { const transitions = 20; executed := 0; for i := 0; i < transitions; i++ { executed++; runTheatreJourney(t) }; t.Logf(\"GATE06_EVIDENCE test=TestTheatreTransitions transitions=%d\", executed) }\n"
+	random := "//go:build soak\n\npackage soak\nimport \"testing\"\nfunc runRandomChannelJourney(*testing.T) {}\nfunc TestRandomChannelTransitions(t *testing.T) { const transitions = 50; executed := 0; for i := 0; i < transitions; i++ { executed++; runRandomChannelJourney(t) }; t.Logf(\"GATE06_EVIDENCE test=TestRandomChannelTransitions transitions=%d\", executed) }\n"
+	theatre = strings.Replace(theatre, "MUTATE", theatreMutation, 1)
+	random = strings.Replace(random, "MUTATE", randomMutation, 1)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "theatre_test.go"), []byte(theatre), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "random_test.go"), []byte(random), 0o644))
+	return root
+}
+
+unit "GATE-06 canonical execution contract" {
+	then "accepts both exact runnable tests and transition counts" {
+		root := soakContractFixture(t, "", "")
+		expect len(soakGateProblems(root)) == 0
+	}
+
+	then "rejects missing skipped wrong-signature wrong-build and wrong-count tests" {
+		root := soakContractFixture(t, "", "")
+		randomPath := filepath.Join(root, "tests", "soak", "random_test.go")
+		expect os.Remove(randomPath) == nil
+		expect containsProblem(soakGateProblems(root), "canonical test missing")
+
+		root = soakContractFixture(t, "", "")
+		theatrePath := filepath.Join(root, "tests", "soak", "theatre_test.go")
+		data, err := os.ReadFile(theatrePath)
+		expect err == nil
+		expect os.WriteFile(theatrePath, []byte(strings.Replace(string(data), "t.Logf(", "t.Skip(\"skip\"); t.Logf(", 1)), 0o644) == nil
+		expect containsProblem(soakGateProblems(root), "may skip")
+
+		root = soakContractFixture(t, "", "")
+		theatrePath = filepath.Join(root, "tests", "soak", "theatre_test.go")
+		data, err = os.ReadFile(theatrePath)
+		expect err == nil
+		expect os.WriteFile(theatrePath, []byte(strings.Replace(string(data), "t *testing.T", "t testing.T", 1)), 0o644) == nil
+		expect containsProblem(soakGateProblems(root), "wrong test signature")
+
+		root = soakContractFixture(t, "", "")
+		theatrePath = filepath.Join(root, "tests", "soak", "theatre_test.go")
+		data, err = os.ReadFile(theatrePath)
+		expect err == nil
+		expect os.WriteFile(theatrePath, []byte(strings.Replace(string(data), "//go:build soak", "//go:build !soak", 1)), 0o644) == nil
+		expect containsProblem(soakGateProblems(root), "not soak-build eligible")
+
+		root = soakContractFixture(t, "", "")
+		theatrePath = filepath.Join(root, "tests", "soak", "theatre_test.go")
+		data, err = os.ReadFile(theatrePath)
+		expect err == nil
+		expect os.WriteFile(theatrePath, []byte(strings.Replace(string(data), "transitions = 20", "transitions = 19", 1)), 0o644) == nil
+		expect containsProblem(soakGateProblems(root), "transition loop count")
+
+		root = soakContractFixture(t, "", "")
+		theatrePath = filepath.Join(root, "tests", "soak", "theatre_test.go")
+		data, err = os.ReadFile(theatrePath)
+		expect err == nil
+		duplicate := strings.Replace(string(data), "t.Logf(", "t.Logf(\"GATE06_EVIDENCE duplicate transitions=%d\", executed); t.Logf(", 1)
+		expect os.WriteFile(theatrePath, []byte(duplicate), 0o644) == nil
+		expect containsProblem(soakGateProblems(root), "evidence call count=2")
+
+		root = soakContractFixture(t, "", "")
+		theatrePath = filepath.Join(root, "tests", "soak", "theatre_test.go")
+		data, err = os.ReadFile(theatrePath)
+		expect err == nil
+		fabricated := strings.Replace(string(data), "executed) }", "transitions) }", 1)
+		expect os.WriteFile(theatrePath, []byte(fabricated), 0o644) == nil
+		expect containsProblem(soakGateProblems(root), "not derived from executed iterations")
+	}
+}

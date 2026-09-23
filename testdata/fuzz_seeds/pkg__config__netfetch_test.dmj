@@ -1,0 +1,97 @@
+package config
+
+import (
+	"strings"
+	"testing"
+)
+
+unit "declared DNS64 deployment policy" {
+	then "the default explicitly declares DNS64 off" {
+		cfg := Defaults()
+		expect cfg.Netfetch.DNS64Mode == DNS64Off
+		expect len(cfg.Netfetch.DNS64Prefixes) == 0
+		runtime, err := cfg.Netfetch.RuntimeConfig()
+		expect err == nil
+		expect len(runtime.DNS64Prefixes) == 0
+	}
+
+	then "declared mode requires a complete non-empty IPv6 prefix list" {
+		cfg := Defaults()
+		cfg.Security.Runtime = RuntimeDevelopment
+		cfg.Netfetch.DNS64Mode = DNS64Declared
+		err := Validate(cfg)
+		expect err != nil
+		expect strings.Contains(err.Error(), "netfetch.dns64_prefixes")
+
+		for _, invalid := range []string{"192.0.2.0/24", "not-a-prefix", "2001:db8::/65"} {
+			cfg.Netfetch.DNS64Prefixes = []string{invalid}
+			err = Validate(cfg)
+			expect err != nil
+			expect strings.Contains(err.Error(), "netfetch.dns64_prefixes[0]")
+		}
+	}
+
+	then "off mode rejects a stray declaration and unknown modes fail closed" {
+		cfg := Defaults()
+		cfg.Security.Runtime = RuntimeDevelopment
+		cfg.Netfetch.DNS64Prefixes = []string{"64:ff9b::/96"}
+		err := Validate(cfg)
+		expect err != nil
+		expect strings.Contains(err.Error(), "must be empty")
+
+		cfg.Netfetch.DNS64Mode = "automatic"
+		cfg.Netfetch.DNS64Prefixes = nil
+		err = Validate(cfg)
+		expect err != nil
+		expect strings.Contains(err.Error(), "netfetch.dns64_mode")
+	}
+
+	then "canonical duplicate declarations are rejected" {
+		cfg := Defaults()
+		cfg.Security.Runtime = RuntimeDevelopment
+		cfg.Netfetch.DNS64Mode = DNS64Declared
+		cfg.Netfetch.DNS64Prefixes = []string{" 2001:db8:64::/48 ", "2001:db8:64:1234::/48"}
+		err := Validate(cfg)
+		expect err != nil
+		expect strings.Contains(err.Error(), "duplicates an earlier prefix")
+	}
+
+	then "built-ins retain embedded IPv4 classification while custom prefixes become deny-only" {
+		cfg := NetfetchConfig{
+			DNS64Mode: DNS64Declared,
+			DNS64Prefixes: []string{"64:ff9b::/96", "64:ff9b:1::/48", "2001:4860:64::/48"},
+		}
+		runtime, err := cfg.RuntimeConfig()
+		expect err == nil
+		expect len(runtime.DNS64Prefixes) == 1
+		expect runtime.DNS64Prefixes[0].String() == "2001:4860:64::/48"
+	}
+}
+
+@serial
+unit "DNS64 configuration precedence" {
+	then "TOML environment and explicit flags share the normal precedence chain" {
+		dir := t.TempDir()
+		t.Chdir(dir)
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		writePrecedenceConfig(t, `
+[netfetch]
+dns64_mode = "declared"
+dns64_prefixes = ["2001:db8:10::/48"]
+`)
+		t.Setenv("GOETROPE_NETFETCH_DNS64_MODE", "declared")
+		t.Setenv("GOETROPE_NETFETCH_DNS64_PREFIXES", "2001:db8:20::/48")
+		t.Setenv("GOETROPE_SECURITY_RUNTIME", "development")
+		mode := " declared "
+		prefixes := []string{"2001:db8:30::/48"}
+		result, err := Load(LoadOptions{Flags: FlagOverrides{
+			NetfetchDNS64Mode: &mode,
+			NetfetchDNS64Prefixes: &prefixes,
+		}})
+		expect err == nil
+		expect result.Config.Netfetch.DNS64Mode == DNS64Declared
+		expect len(result.Config.Netfetch.DNS64Prefixes) == 1
+		expect result.Config.Netfetch.DNS64Prefixes[0] == "2001:db8:30::/48"
+		expect Validate(result.Config) == nil
+	}
+}

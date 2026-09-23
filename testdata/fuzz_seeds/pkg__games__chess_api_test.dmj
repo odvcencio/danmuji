@@ -1,0 +1,129 @@
+package games
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/netfetch"
+)
+
+type chessHTTPFixtureFetcher struct {
+	client *http.Client
+}
+
+func (f chessHTTPFixtureFetcher) Do(ctx context.Context, request netfetch.Request) (*netfetch.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, request.Method, request.URL, request.Body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header = request.Header.Clone()
+	resp, err := f.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		resp.Body.Close()
+		return nil, fmt.Errorf("fixture upstream unavailable")
+	}
+	return &netfetch.Response{StatusCode: resp.StatusCode, ContentType: resp.Header.Get("Content-Type"), Body: resp.Body}, nil
+}
+
+func newChessFixtureClient(server *httptest.Server) *ChessAPIClient {
+	return newChessAPIClient(server.URL, chessHTTPFixtureFetcher{client: server.Client()})
+}
+
+unit "ChessAPI best move" {
+    given "a mock server returning a valid move" {
+        srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            w.Header().Set("Content-Type", "application/json")
+            resp := map[string]string{
+                "from": "e2",
+                "to":   "e4",
+                "san":  "e4",
+                "fen":  "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
+            }
+            _ = json.NewEncoder(w).Encode(resp)
+        }))
+        defer srv.Close()
+
+        client := newChessFixtureClient(srv)
+        move, err := client.BestMove("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 10)
+
+        then "no error is returned" {
+            expect err == nil
+        }
+        then "From field is parsed" {
+            expect move.From == "e2"
+        }
+        then "To field is parsed" {
+            expect move.To == "e4"
+        }
+        then "SAN field is parsed" {
+            expect move.SAN == "e4"
+        }
+        then "FEN field is parsed" {
+            expect move.FEN == "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1"
+        }
+    }
+}
+
+unit "ChessAPI error handling" {
+    given "a mock server returning HTTP 500" {
+        srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            http.Error(w, "internal error", http.StatusInternalServerError)
+        }))
+        defer srv.Close()
+
+        client := newChessFixtureClient(srv)
+        _, err := client.BestMove("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 5)
+
+        then "error is returned for 500" {
+            expect err != nil
+        }
+    }
+
+    given "a mock server returning invalid JSON" {
+        srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            w.Header().Set("Content-Type", "application/json")
+            w.WriteHeader(http.StatusOK)
+            _, _ = w.Write([]byte("{not valid json"))
+        }))
+        defer srv.Close()
+
+        client := newChessFixtureClient(srv)
+        _, err := client.BestMove("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 5)
+
+        then "error is returned for invalid JSON" {
+            expect err != nil
+        }
+    }
+
+    given "a mock server returning empty body" {
+        srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            w.Header().Set("Content-Type", "application/json")
+            w.WriteHeader(http.StatusOK)
+        }))
+        defer srv.Close()
+
+        client := newChessFixtureClient(srv)
+        _, err := client.BestMove("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 5)
+
+        then "error is returned for empty body" {
+            expect err != nil
+        }
+    }
+}
+
+unit "ChessAPI default URL" {
+    given "a client created with empty base URL" {
+        client := NewChessAPIClient("")
+
+        then "base URL defaults to chess-api.com" {
+            expect client.BaseURL() == "https://chess-api.com"
+        }
+    }
+}

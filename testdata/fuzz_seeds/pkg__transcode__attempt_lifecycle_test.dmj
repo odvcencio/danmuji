@@ -1,0 +1,191 @@
+package transcode
+
+import (
+	"errors"
+	"fmt"
+	"testing"
+	"time"
+)
+
+unit "authoritative attempt progress fence" {
+	given "a fake monotonic clock, two compatible sessions, and one dispatched job" {
+		clock := &attemptFakeClock{now: time.Unix(1_700_000_000, 0)}
+		sequence := 0
+		coord, err := newCoordinatorWithOptions(CoordinatorOptions{
+			Now: clock.Now,
+			ID: func(prefix string) (string, error) { sequence++; return fmt.Sprintf("%s-%d", prefix, sequence), nil },
+			CredentialGeneration: func() uint64 { return 7 },
+		})
+		if err != nil { t.Fatal(err) }
+		worker1, _, _, err := coord.RegisterWorkerSession(attemptTestWorker("one"))
+		if err != nil { t.Fatal(err) }
+		jobs1, _, err := coord.Subscribe(worker1)
+		if err != nil { t.Fatal(err) }
+		worker2, _, _, err := coord.RegisterWorkerSession(attemptTestWorker("two"))
+		if err != nil { t.Fatal(err) }
+		jobs2, _, err := coord.Subscribe(worker2)
+		if err != nil { t.Fatal(err) }
+		record, created := coord.Enqueue(attemptTestJob())
+		if !created { t.Fatal("job not created") }
+		first, replacement := attemptReceiveDispatch(t, record.Job.ID, jobs1, jobs2)
+		start := clock.Now()
+
+		when "heartbeats renew the lease through T+89.999 without semantic progress" {
+			for elapsed := 10 * time.Second; elapsed <= 80 * time.Second; elapsed += 10 * time.Second {
+				clock.Set(start.Add(elapsed))
+				if _, err := coord.RenewAttemptLease(first.Fence); err != nil { t.Fatalf("renew at %s: %v", elapsed, err) }
+			}
+			if err := coord.ReportProgressFenced(first.Fence, 0, 0); err != nil { t.Fatal(err) }
+			clock.Set(start.Add(89*time.Second + 999*time.Millisecond))
+			if _, err := coord.RenewAttemptLease(first.Fence); err != nil { t.Fatal(err) }
+
+			then "the attempt is still current at T+89.999" {
+				reject len(coord.FenceStalledAttempts()) != 0
+			}
+
+			when "the clock reaches the exact T+90 boundary" {
+				clock.Set(start.Add(90 * time.Second))
+				fenced := coord.FenceStalledAttempts()
+				next := attemptReceive(t, replacement)
+
+				then "the old authority is fenced before cancellation and work is immediately reissued" {
+					expect len(fenced) == 1
+					expect next.ID == first.ID
+					reject next.Fence.equal(first.Fence)
+					reject coord.ReportProgressFenced(first.Fence, 1, 1) == nil
+					reject coord.ReportCompletionFenced(first.Fence, true, "late") == nil
+				}
+
+				then "the old worker can acknowledge only its exact cancellation fence" {
+					expect coord.AcknowledgeCancellation(first.Fence) == nil
+					stale := first.Fence
+					stale.LeaseID += "-wrong"
+					expect errors.Is(coord.AcknowledgeCancellation(stale), ErrStaleJobLease)
+				}
+
+				then "replacement dispatch is within T+95 and accepted progress can occur by T+120" {
+					clock.Set(start.Add(95 * time.Second))
+					expect coord.ReportProgressFenced(next.Fence, 1, 1) == nil
+					clock.Set(start.Add(120 * time.Second))
+					expect coord.ReportProgressFenced(next.Fence, 2, 2) == nil
+				}
+			}
+		}
+	}
+}
+
+unit "active cancellation fences running attempts" {
+	given "an active attempt with each coordinator cancellation API" {
+		when "a group cancellation is requested" {
+			then "the attempt becomes acknowledgement-safe and cannot be requeued" {
+				assertActiveCancellationPath(t, Job{Type: JobTypeOnDemand, SourcePath: "/media/group.mkv", Quality: "original", Chunk: &ChunkSpec{GroupID: "cancel-group", TotalChunks: 1}}, func(c *Coordinator) int { return c.CancelGroup("cancel-group") })
+			}
+		}
+		when "live-cache work outside the current item is cancelled" {
+			then "the attempt remains terminal" {
+				assertActiveCancellationPath(t, Job{Type: JobTypeLiveCache, MediaItemID: 22, SourcePath: "/media/live.mkv", Quality: "h264-720p"}, func(c *Coordinator) int { return c.CancelLiveCacheExceptItems(11) })
+			}
+		}
+		when "live-cache work outside a requested window is cancelled" {
+			then "the watchdog cannot resurrect the attempt" {
+				assertActiveCancellationPath(t, Job{Type: JobTypeLiveCache, MediaItemID: 33, SourcePath: "/media/live.mkv", Quality: "h264-720p", Chunk: &ChunkSpec{StartSegment: 0, EndSegment: 10}}, func(c *Coordinator) int { return c.CancelLiveCacheOutsideWindow(33, 20, 30) })
+			}
+		}
+		when "theatre work outside a requested window is cancelled" {
+			then "the old worker can acknowledge the exact fence" {
+				assertActiveCancellationPath(t, Job{Type: JobTypeTheatre, MediaItemID: 44, SourcePath: "/media/theatre.mkv", Quality: "h264-720p", Chunk: &ChunkSpec{StartSegment: 0, EndSegment: 10}}, func(c *Coordinator) int { return c.CancelTheatreOutsideWindow(44, 20, 30) })
+			}
+		}
+	}
+}
+
+type attemptFakeClock struct { now time.Time }
+func (c *attemptFakeClock) Now() time.Time { return c.now }
+func (c *attemptFakeClock) Set(value time.Time) { c.now = value }
+
+func attemptTestWorker(label string) WorkerState {
+	return WorkerState{Label: label, MediaRoots: []string{"/media"}, HasFFmpeg: true, CPUAvailable: true}
+}
+
+func attemptTestJob() Job {
+	return Job{Type: JobTypeOnDemand, MediaItemID: 42, SourcePath: "/media/movie.mkv", Quality: "h264-720p"}
+}
+
+func attemptReceiveDispatch(t *testing.T, jobID string, one, two <-chan Job) (Job, <-chan Job) {
+	t.Helper()
+	select {
+	case job := <-one: return job, two
+	case job := <-two: return job, one
+	case <-time.After(time.Second): t.Fatalf("timed out waiting for %s", jobID); return Job{}, nil
+	}
+}
+
+func attemptReceive(t *testing.T, jobs <-chan Job) Job {
+	t.Helper()
+	select { case job := <-jobs: return job; case <-time.After(time.Second): t.Fatal("timed out waiting for replacement"); return Job{} }
+}
+
+func assertActiveCancellationPath(t *testing.T, job Job, cancel func(*Coordinator) int) {
+	t.Helper()
+	coord := NewCoordinator()
+	workerID := coord.RegisterWorker(WorkerState{WorkerID: "cancel-worker", MediaRoot: "/media", HasFFmpeg: true, CPUAvailable: true, VideoEncoders: []string{"libx264"}})
+	jobs, stop, err := coord.Subscribe(workerID)
+	if err != nil { t.Fatalf("Subscribe: %v", err) }
+	defer stop()
+	record, inserted := coord.Enqueue(job)
+	if !inserted { t.Fatal("expected job insertion") }
+	dispatched := <-jobs
+	if dispatched.Fence != record.Job.Fence || !dispatched.Fence.Valid() { t.Fatalf("dispatch fence = %+v, want %+v", dispatched.Fence, record.Job.Fence) }
+	if got := cancel(coord); got != 1 { t.Fatalf("cancelled = %d, want 1", got) }
+	current, ok := coord.GetJob(record.Job.ID)
+	if !ok || current.Status != JobStatusCancelled { t.Fatalf("current = %+v ok=%t, want cancelled", current, ok) }
+	history := coord.AttemptHistory(record.Job.ID)
+	if len(history) != 1 || history[0].State != AttemptStateCancelRequested { t.Fatalf("history = %+v, want one cancel_requested attempt", history) }
+	if got := coord.FenceStalledAttempts(); len(got) != 0 { t.Fatalf("watchdog resurrected cancelled jobs: %v", got) }
+	if err := coord.AcknowledgeCancellation(dispatched.Fence); err != nil { t.Fatalf("AcknowledgeCancellation: %v", err) }
+	history = coord.AttemptHistory(record.Job.ID)
+	if history[0].State != AttemptStateCancelAcknowledged { t.Fatalf("history after ack = %+v, want cancel_acknowledged", history) }
+}
+
+unit "local attempt execution renewal" {
+	given "a fake clock and one dispatched local attempt" {
+		clock := &attemptFakeClock{now: time.Unix(1_800_000_000, 0)}
+		sequence := 0
+		coord, err := newCoordinatorWithOptions(CoordinatorOptions{
+			Now: clock.Now,
+			ID: func(prefix string) (string, error) { sequence++; return fmt.Sprintf("%s-%d", prefix, sequence), nil },
+			CredentialGeneration: func() uint64 { return 9 },
+			ProgressFence: 2 * time.Second,
+			LeaseDuration: 10 * time.Second,
+		})
+		if err != nil { t.Fatal(err) }
+		workerID, _, _, err := coord.RegisterWorkerSession(attemptTestWorker("embedded-local"))
+		if err != nil { t.Fatal(err) }
+		jobs, _, err := coord.Subscribe(workerID)
+		if err != nil { t.Fatal(err) }
+		record, created := coord.Enqueue(attemptTestJob())
+		if !created { t.Fatal("job not created") }
+		job := attemptReceive(t, jobs)
+		if job.ID != record.Job.ID { t.Fatalf("job id = %s, want %s", job.ID, record.Job.ID) }
+
+		when "the embedded runner renews local execution before the progress fence" {
+			clock.Set(clock.Now().Add(1500 * time.Millisecond))
+			expect coord.RenewLocalAttemptExecution(job.Fence) == nil
+			clock.Set(clock.Now().Add(1500 * time.Millisecond))
+
+			then "the attempt is not fenced at the original deadline" {
+				expect len(coord.FenceStalledAttempts()) == 0
+			}
+
+			when "local execution stops renewing past the extended deadline" {
+				clock.Set(clock.Now().Add(3 * time.Second))
+				fenced := coord.FenceStalledAttempts()
+
+				then "the watchdog still fences abandoned work" {
+					expect len(fenced) == 1
+					expect fenced[0] == job.ID
+				}
+			}
+		}
+	}
+}

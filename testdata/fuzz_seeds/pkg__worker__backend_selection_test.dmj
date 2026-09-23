@@ -1,0 +1,203 @@
+package worker
+
+import (
+	"context"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/container/mp4"
+	"github.com/odvcencio/goetrope/pkg/transcode"
+)
+
+unit "Executor backend selection" {
+	given "an executor with ffmpeg and native backends" {
+		exec := &Executor{
+			ffmpegPath: "ffmpeg",
+			ffmpeg:     &ffmpegTranscodeBackend{ffmpegPath: "ffmpeg"},
+			native:     &nativeTranscodeBackend{caps: transcode.Capabilities{NativeNVENC: true}, ffmpegPath: "ffmpeg"},
+			caps: transcode.Capabilities{
+				PreferredBackend: transcode.BackendNative,
+				HasFFmpeg:        true,
+				CPUAvailable:     true,
+				NativeNVENC:      true,
+				VideoEncoders:    []string{"libx264"},
+			},
+		}
+
+		when "ffmpeg fallback is derived from a native preference" {
+			profile := exec.ffmpegFallbackProfile(transcode.Job{Quality: "h264-480p"}, &mp4.MediaInfo{
+				Container: "mkv",
+				Streams: []mp4.StreamInfo{
+					{Type: "video", Codec: "h264"},
+				},
+			})
+
+			then "it chooses a non-native backend" {
+				expect profile.Backend == transcode.BackendCPU
+				expect profile.VideoEncoder == "libx264"
+			}
+		}
+
+		when "no native backend is requested" {
+			backend := exec.selectVideoBackend(transcode.Job{}, transcode.VideoProfile{
+				Backend:      transcode.BackendCPU,
+				VideoEncoder: "libx264",
+			}, nil)
+			_, ok := backend.(*ffmpegTranscodeBackend)
+
+			then "ffmpeg is used" {
+				expect ok
+			}
+		}
+
+		when "native h264 is requested for a supported mp4 source" {
+			backend := exec.selectVideoBackend(transcode.Job{}, transcode.VideoProfile{
+				Backend:      transcode.BackendNative,
+				Codec:        transcode.CodecH264,
+				VideoEncoder: "h264_nvenc",
+			}, &mp4.MediaInfo{
+				Container: "mp4",
+				Streams: []mp4.StreamInfo{
+					{Type: "video", Codec: "hevc"},
+					{Type: "audio", Codec: "aac"},
+				},
+			})
+			_, ok := backend.(*nativeTranscodeBackend)
+
+			then "native is used" {
+				expect ok
+			}
+		}
+
+		when "native hevc is requested for a supported mp4 source" {
+			backend := exec.selectVideoBackend(transcode.Job{}, transcode.VideoProfile{
+				Backend:      transcode.BackendNative,
+				Codec:        transcode.CodecHEVC,
+				VideoEncoder: "hevc_nvenc",
+			}, &mp4.MediaInfo{
+				Container: "mp4",
+				Streams: []mp4.StreamInfo{
+					{Type: "video", Codec: "h264"},
+					{Type: "audio", Codec: "aac"},
+				},
+			})
+			_, ok := backend.(*nativeTranscodeBackend)
+
+			then "native is used" {
+				expect ok
+			}
+		}
+
+		when "theatre playback requests native" {
+			backend := exec.selectVideoBackend(transcode.Job{Type: transcode.JobTypeTheatre}, transcode.VideoProfile{
+				Backend:      transcode.BackendNative,
+				Codec:        transcode.CodecH264,
+				VideoEncoder: "h264_nvenc",
+			}, &mp4.MediaInfo{
+				Container: "mp4",
+				Streams: []mp4.StreamInfo{
+					{Type: "video", Codec: "hevc"},
+					{Type: "audio", Codec: "aac"},
+				},
+			})
+			_, ok := backend.(*nativeTranscodeBackend)
+
+			then "native is used for theatre" {
+				expect ok
+			}
+		}
+
+		when "a source has unsupported audio for direct copy" {
+			backend := exec.selectVideoBackend(transcode.Job{}, transcode.VideoProfile{
+				Backend:      transcode.BackendNative,
+				Codec:        transcode.CodecH264,
+				VideoEncoder: "h264_nvenc",
+			}, &mp4.MediaInfo{
+				Container: "mp4",
+				Streams: []mp4.StreamInfo{
+					{Type: "video", Codec: "hevc"},
+					{Type: "audio", Codec: "ac3"},
+				},
+			})
+			_, ok := backend.(*nativeTranscodeBackend)
+
+			then "native still wins because audio can be extracted" {
+				expect ok
+			}
+		}
+
+		when "a source is video-only mkv" {
+			backend := exec.selectVideoBackend(transcode.Job{}, transcode.VideoProfile{
+				Backend:      transcode.BackendNative,
+				Codec:        transcode.CodecH264,
+				VideoEncoder: "h264_nvenc",
+			}, &mp4.MediaInfo{
+				Container: "mkv",
+				Streams: []mp4.StreamInfo{
+					{Type: "video", Codec: "h264"},
+				},
+			})
+			_, ok := backend.(*nativeTranscodeBackend)
+
+			then "native is allowed" {
+				expect ok
+			}
+		}
+	}
+}
+
+unit "Native backend support checks" {
+	given "an nvenc-only native backend" {
+		backend := &nativeTranscodeBackend{caps: transcode.Capabilities{NativeNVENC: true}}
+
+		then "vaapi profiles are rejected" {
+			reject backend.Supports(transcode.VideoProfile{
+				Backend:      transcode.BackendNative,
+				VideoEncoder: "h264_vaapi",
+			})
+		}
+
+		then "matching nvenc h264 is supported" {
+			expect backend.Supports(transcode.VideoProfile{
+				Backend:      transcode.BackendNative,
+				Codec:        transcode.CodecH264,
+				VideoEncoder: "h264_nvenc",
+			})
+		}
+
+		then "matching nvenc hevc is supported" {
+			expect backend.Supports(transcode.VideoProfile{
+				Backend:      transcode.BackendNative,
+				Codec:        transcode.CodecHEVC,
+				VideoEncoder: "hevc_nvenc",
+			})
+		}
+	}
+}
+
+unit "Native backend explicit errors" {
+	given "a native backend with a non-nvenc runtime" {
+		origOpenNativeRuntime := openNativeRuntime
+		openNativeRuntime = func(caps transcode.Capabilities, profile transcode.VideoProfile) (*transcode.NativeRuntime, error) {
+			return &transcode.NativeRuntime{Kind: transcode.NativeRuntimeVAAPI}, nil
+		}
+		defer func() {
+			openNativeRuntime = origOpenNativeRuntime
+		}()
+
+		backend := &nativeTranscodeBackend{caps: transcode.Capabilities{NativeNVENC: true}, ffmpegPath: "ffmpeg"}
+
+		when "transcoding hls" {
+			completion, err := backend.TranscodeHLS(context.Background(), transcode.Job{ID: "job-native", Quality: "h264-1080p"}, transcode.VideoProfile{
+				Backend:      transcode.BackendNative,
+				Codec:        transcode.CodecH264,
+				VideoEncoder: "h264_nvenc",
+			}, nil)
+
+			then "the backend reports the unimplemented native path honestly" {
+				expect err is transcode.ErrNativePipelineNotImplemented
+				reject completion.Success
+				expect completion.Message contains "vaapi session ready"
+			}
+		}
+	}
+}

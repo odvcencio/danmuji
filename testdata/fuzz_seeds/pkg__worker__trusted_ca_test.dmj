@@ -1,0 +1,40 @@
+package worker
+
+import (
+	"encoding/pem"
+	"strings"
+	"testing"
+)
+
+@serial
+unit "trusted worker CA preflight" {
+	then "accepts a certificate-only PEM bundle" {
+		certificate, _ := testWorkerCertificate(t)
+		bundle := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Certificate[0]})
+		roots, err := ParseTrustedWorkerCARoots(bundle)
+		expect err == nil
+		expect roots != nil
+	}
+
+	then "rejects an empty bundle without exposing source details" {
+		roots, err := ParseTrustedWorkerCARoots(nil)
+		expect roots is_nil
+		expect err != nil
+		expect !strings.Contains(err.Error(), "GOETROPE_WORKER_TLS_CA_SOURCE")
+	}
+
+	then "rejects malformed and mixed PEM input before listener bind" {
+		certificate, _ := testWorkerCertificate(t)
+		valid := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Certificate[0]})
+		for _, bundle := range [][]byte{
+			[]byte("not a certificate"),
+			append(append([]byte(nil), valid...), []byte("trailing garbage")...),
+			append([]byte("-----BEGIN PRIVATE KEY-----\nZm9v\n-----END PRIVATE KEY-----\n"), valid...),
+		} {
+			roots, err := ParseTrustedWorkerCARoots(bundle)
+			expect roots is_nil
+			expect err != nil
+			expect !strings.Contains(err.Error(), "trailing garbage")
+		}
+	}
+}

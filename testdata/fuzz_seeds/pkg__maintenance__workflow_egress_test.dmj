@@ -1,0 +1,138 @@
+package maintenance
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"slices"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	"github.com/odvcencio/arbiter/expert/factsource"
+	"github.com/odvcencio/goetrope/pkg/library"
+)
+
+type workflowEgressTrap struct {
+	endpoint string
+	loads atomic.Int32
+	resolves atomic.Int32
+	dials atomic.Int32
+}
+
+func (t *workflowEgressTrap) LoadFacts(string) ([]factsource.Fact, error) {
+	t.loads.Add(1)
+	t.resolves.Add(1)
+	transport := &http.Transport{Proxy: nil}
+	dialer := &net.Dialer{}
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		t.dials.Add(1)
+		return dialer.DialContext(ctx, network, address)
+	}
+	client := &http.Client{Transport: transport}
+	request, _ := http.NewRequest(http.MethodGet, t.endpoint, nil)
+	response, err := client.Do(request)
+	if err == nil {
+		response.Body.Close()
+	}
+	return nil, errors.New("trap loader executed")
+}
+
+type workflowEgressStore struct{}
+
+func (workflowEgressStore) MetadataRefreshState(context.Context) (library.MetadataRefreshSnapshot, error) {
+	return library.MetadataRefreshSnapshot{MissingArtwork: true, MaxAgeDays: 31}, nil
+}
+
+func (workflowEgressStore) ListMetadataRefreshCandidates(context.Context, int, int) ([]library.MetadataRefreshCandidate, error) {
+	return []library.MetadataRefreshCandidate{{MediaItemID: 1, Path: "/media/local.mkv", AgeDays: 31}}, nil
+}
+
+type workflowEgressPipeline struct { calls atomic.Int32 }
+
+func (p *workflowEgressPipeline) IngestPath(context.Context, string) (*library.MediaItem, error) {
+	p.calls.Add(1)
+	return &library.MediaItem{ID: 1, Path: "/media/local.mkv"}, nil
+}
+
+func workflowEgressPolicy(target string) string {
+	return fmt.Sprintf(`
+feature maintenance from "maintenance-state" {
+    cache_volume_usage_pct: number
+    metadata_missing_artwork: bool
+    metadata_age_days: number
+    local_hour: number
+}
+
+outcome MaintenanceAction { task: string reason: string urgency: string }
+outcome MaintenanceRuntimeResult { action: string status: string detail: string }
+
+expert rule LocalEnvelopeStillRuns {
+    when { maintenance.metadata_missing_artwork == true }
+    then emit MaintenanceAction { task: "refresh_metadata", reason: "local", urgency: "high" }
+}
+
+worker execute_maintenance {
+    input MaintenanceAction
+    output MaintenanceRuntimeResult
+    exec "goetrope-maintenance"
+}
+
+arbiter maintenance_scheduler {
+    poll 1h
+    source %s
+    on MaintenanceAction worker execute_maintenance
+}
+`, target)
+}
+
+unit "maintenance external fact source boundary" {
+	then "the code-owned loader returns one fixed safe category for every target" {
+		for _, target := range []string{
+			"http://127.0.0.1:5432/private?token=WORKFLOW_MARKER_111",
+			"file:///etc/passwd",
+			"postgres://user:password@db.internal/facts",
+			"censys://search?key=WORKFLOW_MARKER_112",
+			"gsheet://private-sheet",
+		} {
+			facts, err := rejectExternalWorkflowSource(context.Background(), target)
+			expect facts is_nil
+			expect errors.Is(err, ErrExternalWorkflowSourceUnavailable)
+			expect err.Error() == "feature_unavailable"
+			reject strings.Contains(err.Error(), target)
+			reject strings.Contains(err.Error(), "password")
+			reject strings.Contains(err.Error(), "WORKFLOW_MARKER")
+		}
+	}
+}
+
+@serial
+unit "maintenance runner never inherits Arbiter factsource loaders" {
+	then "registered file network database and provider loaders cannot execute while local envelope facts continue" {
+		var serverCalls atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			serverCalls.Add(1)
+		}))
+		defer server.Close()
+		trap := &workflowEgressTrap{endpoint: server.URL}
+		// Trap the dependency's complete registered loader surface, plus source
+		// forms which Arbiter may add in a future release. If Runner ever stops
+		// honoring Goetrope's explicit Loader, the regression remains local and
+		// observable rather than reaching a file, database, provider, or network.
+		dependencySchemes := factsource.Schemes()
+		for _, required := range []string{"http://", "https://", "postgres://", "postgresql://", "censys://", "gsheet://", "terraform://", ".csv", ".json", ".jsonl", ".tf", ".tfvars", ".hcl"} {
+			expect slices.Contains(dependencySchemes, required)
+		}
+		registeredSchemes, err := exerciseEveryRegisteredWorkflowScheme(t, trap)
+		expect err == nil
+		expect slices.Contains(registeredSchemes, "goetrope-egress-trap://")
+
+		expect trap.loads.Load() == int32(0)
+		expect trap.resolves.Load() == int32(0)
+		expect trap.dials.Load() == int32(0)
+		expect serverCalls.Load() == int32(0)
+	}
+}

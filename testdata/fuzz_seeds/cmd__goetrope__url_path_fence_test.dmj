@@ -1,0 +1,44 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/odvcencio/goetrope/pkg/ingest"
+)
+
+@serial
+unit "CLI path URL-like activation fence" {
+	then "every URL-like path spelling fails before credential resolution or database access" {
+		originalConnect := ingestNewPoolCredential
+		defer func() { ingestNewPoolCredential = originalConnect }()
+		var dialCalls int
+		ingestNewPoolCredential = func(_ context.Context, _ []byte) (*pgxpool.Pool, error) {
+			dialCalls++
+			return nil, errors.New("unexpected dial")
+		}
+		for _, marker := range []string{
+			"HTTPS://user:password@private.example/path?token=CLI_PATH_MARKER_106",
+			"HtTp://PRIVATE.EXAMPLE:5432/path?secret=CLI_PATH_MARKER_107",
+			"hTTps:opaque-path?secret=CLI_PATH_MARKER_108",
+			"HTTP://[::1]:9090/internal?key=CLI_PATH_MARKER_109",
+		} {
+			cmd := newIngestSpecCommand()
+			err := cmd.Flags().Set("postgres-dsn-source", "file:/definitely-not-readable/DB_MARKER_106")
+			expect err == nil
+			err = cmd.Flags().Set("path", marker)
+			expect err == nil
+			runErr := runIngest(cmd, nil)
+			expect errors.Is(runErr, ingest.ErrURLIngestUnavailable)
+			expect runErr.Error() == "feature_unavailable"
+			reject strings.Contains(runErr.Error(), marker)
+			reject strings.Contains(runErr.Error(), "private.example")
+			reject strings.Contains(runErr.Error(), "password")
+			reject strings.Contains(runErr.Error(), "CLI_PATH_MARKER")
+		}
+		expect dialCalls == 0
+	}
+}

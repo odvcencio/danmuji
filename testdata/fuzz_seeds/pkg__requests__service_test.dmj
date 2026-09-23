@@ -1,0 +1,103 @@
+package requests_test
+
+import (
+	"context"
+	"fmt"
+	"testing"
+
+	"github.com/docker/go-connections/nat"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
+
+	"github.com/odvcencio/goetrope/pkg/db"
+	"github.com/odvcencio/goetrope/pkg/requests"
+)
+
+integration "Request service" {
+	before all {
+		ctx := context.Background()
+		pgReq := testcontainers.ContainerRequest{
+			Image:        "postgres:15",
+			ExposedPorts: []string{"5432/tcp"},
+			Env: map[string]string{
+				"POSTGRES_USER":     "test",
+				"POSTGRES_PASSWORD": "test",
+				"POSTGRES_DB":       "goetrope_test",
+			},
+			WaitingFor: wait.ForAll(
+				wait.ForListeningPort(nat.Port("5432/tcp")),
+				wait.ForLog("database system is ready to accept connections").WithOccurrence(2),
+			),
+		}
+		pgContainer, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+			ContainerRequest: pgReq,
+			Started:          true,
+		})
+		if err != nil {
+			t.Fatalf("start postgres: %v", err)
+		}
+		t.Cleanup(func() { _ = pgContainer.Terminate(ctx) })
+
+		pgHost, err := pgContainer.Host(ctx)
+		if err != nil {
+			t.Fatalf("get host: %v", err)
+		}
+		pgPort, err := pgContainer.MappedPort(ctx, "5432/tcp")
+		if err != nil {
+			t.Fatalf("get port: %v", err)
+		}
+		connStr := fmt.Sprintf("postgres://test:test@%s:%s/goetrope_test?sslmode=disable", pgHost, pgPort.Port())
+		pool, err := pgxpool.New(ctx, connStr)
+		if err != nil {
+			t.Fatalf("connect: %v", err)
+		}
+		t.Cleanup(func() { pool.Close() })
+		if migErr := db.Migrate(ctx, pool); migErr != nil {
+			t.Fatalf("migrate: %v", migErr)
+		}
+
+		service := requests.NewService(pool)
+	}
+
+	given "an empty request list" {
+		when "adding a request" {
+			item, added, err := service.AddRequest(ctx, "The Matrix", "neo", "42")
+
+			then "succeeds" {
+				expect err == nil
+				expect added
+				expect item not_nil
+			}
+		}
+
+		when "adding a duplicate request" {
+			_, _, _ = service.AddRequest(ctx, "The Matrix", "neo", "42")
+			item, added, err := service.AddRequest(ctx, "the matrix", "trinity", "43")
+
+			then "does not add a second copy" {
+				expect err == nil
+				reject added
+				expect item == nil
+			}
+		}
+	}
+
+	given "a pending request exists" {
+		_, _, _ = service.AddRequest(ctx, "Blade Runner 2049", "k", "9")
+
+		when "fulfilling by fuzzy title match" {
+			match, err := service.CheckAndFulfillRequest(ctx, "Blade Runner 2049 (2017)")
+			pending, _ := service.GetRequests(ctx)
+			fulfilled, fulfilledErr := service.GetFulfilled(ctx, 10)
+
+			then "moves the request to fulfilled history" {
+				expect err == nil
+				expect fulfilledErr == nil
+				expect match not_nil
+				expect requests.FindMatchingRequest("Blade Runner 2049", pending) == nil
+				expect len(fulfilled) >= 1
+			}
+		}
+	}
+}

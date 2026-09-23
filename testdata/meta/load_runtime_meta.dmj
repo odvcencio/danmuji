@@ -4,8 +4,15 @@ import "testing"
 
 load "local health endpoint" {
 	rate 5
-	duration 200ms
-	rampup 100ms
+	// Written as explicit Go expressions, not "200ms"/"100ms" shorthand:
+	// the pinned gotreesitter build silently drops a bare duration_literal's
+	// unit suffix when it isn't the last statement in the block, falling
+	// back to Go's own int_literal ("200ms" -> 200) and then misreading
+	// that as 200 * time.Second — i.e. this spec used to attack for
+	// ~200s instead of ~200ms. Tracked against the gotreesitter upgrade;
+	// this form has no such ambiguity and transpiles to the exact value.
+	duration 200 * time.Millisecond
+	rampup 100 * time.Millisecond
 	concurrency 2
 	target get "http://127.0.0.1:18084/health"
 

@@ -1,0 +1,356 @@
+package randomchannel
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/cachepath"
+	"github.com/odvcencio/goetrope/pkg/theatre"
+	"github.com/odvcencio/goetrope/pkg/transcode"
+)
+
+type scopedQueueRecorder struct {
+	mu              sync.Mutex
+	keeps           [][]int64
+	windowCalls      int
+	detailedCalls    int
+	boundedCalls     int
+	observer         transcode.SegmentObserver
+	observedSegments []int64
+}
+
+func (q *scopedQueueRecorder) SplitAndEnqueue(transcode.SplitRequest) ([]transcode.JobRecord, error) {
+	return []transcode.JobRecord{{Job: transcode.Job{ID: "split"}}}, nil
+}
+
+func (q *scopedQueueRecorder) SplitAndEnqueueDetailed(transcode.SplitRequest) (transcode.SplitResult, error) {
+	q.mu.Lock()
+	q.detailedCalls++
+	q.mu.Unlock()
+	return transcode.SplitResult{Records: []transcode.JobRecord{{Job: transcode.Job{ID: "detailed"}}}}, nil
+}
+
+func (q *scopedQueueRecorder) TrySplitAndEnqueueContext(context.Context, transcode.SplitRequest) (transcode.SplitResult, error) {
+	q.mu.Lock()
+	q.boundedCalls++
+	q.mu.Unlock()
+	return transcode.SplitResult{Records: []transcode.JobRecord{{Job: transcode.Job{ID: "bounded"}}}}, nil
+}
+
+func (q *scopedQueueRecorder) CancelLiveCacheExceptItems(ids ...int64) int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.keeps = append(q.keeps, append([]int64(nil), ids...))
+	return len(ids)
+}
+
+func (q *scopedQueueRecorder) CancelLiveCacheOutsideWindow(int64, int, int) int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.windowCalls++
+	return 1
+}
+
+func (q *scopedQueueRecorder) SetSegmentObserver(obs transcode.SegmentObserver) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.observer = obs
+}
+
+type recordingSegmentObserver struct {
+	mu    sync.Mutex
+	items []int64
+}
+
+func (o *recordingSegmentObserver) OnSegment(item int64, quality string, idx int, durSec float64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.items = append(o.items, item)
+}
+
+@serial
+unit "Random channel registry configuration" {
+	given "the default movie service" {
+		manager := &recoveryRoomManager{room: &theatre.Room{RoomCode: RoomCode}}
+		playback := theatre.NewPlaybackStateManager()
+		playback.Set(RoomCode, theatre.PlaybackState{})
+		svc := New(nil, nil, nil, playback, nil)
+		svc.manager = manager
+
+		when "summarizing the channel" {
+			summary, err := svc.Summary(context.Background())
+
+			then "keeps the legacy address and advertises movies" {
+				expect err == nil
+				expect summary.Alias == "1"
+				expect summary.RoomCode == "CHAN01"
+				expect summary.Name == "Random Movies"
+				expect svc.ContentKind() == ContentKindMovies
+			}
+		}
+	}
+
+	given "the configured show service" {
+		config := ShowChannelConfig()
+		manager := &recoveryRoomManager{room: &theatre.Room{RoomCode: config.RoomCode}}
+		playback := theatre.NewPlaybackStateManager()
+		playback.Set(config.RoomCode, theatre.PlaybackState{})
+		svc := NewWithConfig(config, nil, nil, nil, playback, nil)
+		svc.manager = manager
+
+		when "summarizing the channel" {
+			summary, err := svc.Summary(context.Background())
+
+			then "exposes the second channel identity" {
+				expect err == nil
+				expect summary.Alias == "2"
+				expect summary.RoomCode == "SHOW01"
+				expect summary.Name == "Random Shows"
+				expect svc.ContentKind() == ContentKindShows
+			}
+		}
+	}
+
+	given "a registry with movie and show services" {
+		movie := New(nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+		show := NewWithConfig(ShowChannelConfig(), nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+		movie.SetChannelProducer(stubProducer{})
+		show.SetChannelProducer(stubProducer{})
+		movie.viewerFollowDelay = 8
+		show.viewerFollowDelay = 11
+		movie.setProducerOwned(101, 102)
+		show.setProducerOwned(201, 202)
+		registry := MustRegistry(movie, show)
+
+		when "looking up services by alias and room" {
+			byAlias, aliasOK := registry.Service("2")
+			byRoom, roomOK := registry.ServiceForRoom("SHOW01")
+
+			then "routes both indexes to the show channel" {
+				expect aliasOK
+				expect roomOK
+				expect byAlias == show
+				expect byRoom == show
+			}
+		}
+
+		when "asking for follow delay by room" {
+			movieDelay, movieOK := registry.FollowDelaySeconds("CHAN01")
+			showDelay, showOK := registry.FollowDelaySeconds("SHOW01")
+			_, otherOK := registry.FollowDelaySeconds("PARTY1")
+
+			then "delegates to the configured channel only" {
+				expect movieOK
+				expect showOK
+				expect movieDelay == 8
+				expect showDelay == 11
+				reject otherOK
+			}
+		}
+
+		when "checking producer ownership" {
+			ownsMovie := registry.ProducerOwnsItem(102)
+			ownsShow := registry.ProducerOwnsItem(201)
+			ownsOther := registry.ProducerOwnsItem(303)
+
+			then "aggregates ownership across channels" {
+				expect ownsMovie
+				expect ownsShow
+				reject ownsOther
+			}
+		}
+	}
+
+	given "a registry with summarizeable services" {
+		movieManager := &recoveryRoomManager{room: &theatre.Room{RoomCode: RoomCode}}
+		showConfig := ShowChannelConfig()
+		showManager := &recoveryRoomManager{room: &theatre.Room{RoomCode: showConfig.RoomCode}}
+		moviePlayback := theatre.NewPlaybackStateManager()
+		showPlayback := theatre.NewPlaybackStateManager()
+		moviePlayback.Set(RoomCode, theatre.PlaybackState{})
+		showPlayback.Set(showConfig.RoomCode, theatre.PlaybackState{})
+		movie := New(nil, nil, nil, moviePlayback, nil)
+		show := NewWithConfig(showConfig, nil, nil, nil, showPlayback, nil)
+		movie.manager = movieManager
+		show.manager = showManager
+		registry := MustRegistry(movie, show)
+
+		when "summarizing by a known alias" {
+			summary, ok, err := registry.Summary(context.Background(), "2")
+
+			then "returns only that channel summary" {
+				expect ok
+				expect err == nil
+				expect summary.Alias == "2"
+				expect summary.RoomCode == "SHOW01"
+			}
+		}
+
+		when "summarizing by an unknown alias" {
+			summary, ok, err := registry.Summary(context.Background(), "99")
+
+			then "reports a miss without invoking service work" {
+				reject ok
+				expect err == nil
+				expect summary == nil
+			}
+		}
+	}
+
+	given "duplicate channel addresses" {
+		first := New(nil, nil, nil, nil, nil)
+		second := NewWithConfig(ChannelConfig{Alias: "1", RoomCode: "SHOW01", Name: "Duplicate", ContentKind: ContentKindShows}, nil, nil, nil, nil, nil)
+
+		when "building the registry" {
+			_, err := NewRegistry(first, second)
+
+			then "rejects duplicate aliases" {
+				expect err != nil
+				expect strings.Contains(err.Error(), "duplicate random channel alias")
+			}
+		}
+	}
+
+	given "a registry scoped shared transcode queue" {
+		movie := New(nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+		show := NewWithConfig(ShowChannelConfig(), nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+		registry := MustRegistry(movie, show)
+		queue := &scopedQueueRecorder{}
+		registry.SetTranscodeQueue(queue)
+
+		when "both channels retain live cache work" {
+			moviePruner := movie.transcode.(liveCacheGenerationPruner)
+			showPruner := show.transcode.(liveCacheGenerationPruner)
+			moviePruner.CancelLiveCacheExceptItems(10, 11)
+			showPruner.CancelLiveCacheExceptItems(20, 21)
+			moviePruner.CancelLiveCacheExceptItems()
+			queue.mu.Lock()
+			first := append([]int64(nil), queue.keeps[0]...)
+			second := append([]int64(nil), queue.keeps[1]...)
+			third := append([]int64(nil), queue.keeps[2]...)
+			queue.mu.Unlock()
+
+			then "global pruning always keeps the union of active channel scopes" {
+				expect first == []int64{10, 11}
+				expect second == []int64{10, 11, 20, 21}
+				expect third == []int64{20, 21}
+			}
+		}
+
+		when "a service prunes local disk cache before its sibling runs eviction" {
+			root := t.TempDir()
+			t.Setenv(cachepath.RootEnv, root)
+			writeCacheDir := func(key string, id int64) {
+				dir := filepath.Join(root, key, "h264-720p")
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(root, key, ".media_item_id"), []byte(strconv.FormatInt(id, 10)), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "seg00000.ts"), []byte("data"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			writeCacheDir("movie-current", 10)
+			writeCacheDir("show-current", 20)
+			writeCacheDir("show-upcoming", 21)
+			writeCacheDir("stale", 99)
+			movie.manager = &recoveryRoomManager{room: &theatre.Room{RoomCode: DefaultMovieRoomCode, Playlist: []int64{10}}}
+			show.manager = &recoveryRoomManager{room: &theatre.Room{RoomCode: DefaultShowRoomCode, Playlist: []int64{20, 21}}}
+			show.SetChannelProducer(stubProducer{})
+			show.setProducerOwned(20, 21)
+			movie.runLocalEviction(context.Background(), []int64{10})
+			_, movieErr := os.Stat(filepath.Join(root, "movie-current"))
+			_, showCurrentErr := os.Stat(filepath.Join(root, "show-current"))
+			_, showUpcomingErr := os.Stat(filepath.Join(root, "show-upcoming"))
+			_, staleErr := os.Stat(filepath.Join(root, "stale"))
+
+			then "registry retention leaves shared managed cache directories to the ledger" {
+				expect movieErr == nil
+				expect showCurrentErr == nil
+				expect showUpcomingErr == nil
+				expect staleErr == nil
+			}
+		}
+
+		when "using optional transcode capabilities" {
+			detailed, detailedOK := movie.transcode.(detailedTranscodeQueue)
+			bounded, boundedOK := show.transcode.(interface {
+				TrySplitAndEnqueueContext(context.Context, transcode.SplitRequest) (transcode.SplitResult, error)
+			})
+			window, windowOK := movie.transcode.(liveCacheWindowPruner)
+			detailedResult, detailedErr := detailed.SplitAndEnqueueDetailed(transcode.SplitRequest{})
+			boundedResult, boundedErr := bounded.TrySplitAndEnqueueContext(context.Background(), transcode.SplitRequest{})
+			cancelled := window.CancelLiveCacheOutsideWindow(10, 0, 10)
+
+			then "the scoped wrapper preserves the shared queue behavior" {
+				expect detailedOK
+				expect boundedOK
+				expect windowOK
+				expect detailedErr == nil
+				expect boundedErr == nil
+				expect detailedResult.Records[0].Job.ID == "detailed"
+				expect boundedResult.Records[0].Job.ID == "bounded"
+				expect cancelled == 1
+				expect queue.detailedCalls == 1
+				expect queue.boundedCalls == 1
+				expect queue.windowCalls == 1
+			}
+		}
+
+		when "registering observers from both scoped services" {
+			movieRegistrar := movie.transcode.(segmentObserverRegistrar)
+			showRegistrar := show.transcode.(segmentObserverRegistrar)
+			movieObserver := &recordingSegmentObserver{}
+			showObserver := &recordingSegmentObserver{}
+			movieRegistrar.SetSegmentObserver(movieObserver)
+			showRegistrar.SetSegmentObserver(showObserver)
+			queue.mu.Lock()
+			fanout := queue.observer
+			queue.mu.Unlock()
+			fanout.OnSegment(42, "h264-720p", 7, 2)
+
+			then "the shared coordinator observer fans out instead of letting the last channel win" {
+				expect movieObserver.items == []int64{42}
+				expect showObserver.items == []int64{42}
+			}
+		}
+	}
+
+	given "concurrent scoped retention updates" {
+		movie := New(nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+		show := NewWithConfig(ShowChannelConfig(), nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+		registry := MustRegistry(movie, show)
+		queue := &scopedQueueRecorder{}
+		registry.SetTranscodeQueue(queue)
+
+		when "channels prune at the same time" {
+			var wg sync.WaitGroup
+			for i := 0; i < 128; i++ {
+				wg.Add(2)
+				go func(i int) {
+					defer wg.Done()
+					movie.transcode.(liveCacheGenerationPruner).CancelLiveCacheExceptItems(int64(10+i), int64(110+i))
+				}(i)
+				go func(i int) {
+					defer wg.Done()
+					show.transcode.(liveCacheGenerationPruner).CancelLiveCacheExceptItems(int64(20+i), int64(120+i))
+				}(i)
+			}
+			wg.Wait()
+
+			then "updates complete without data races or panics" {
+				queue.mu.Lock()
+				callCount := len(queue.keeps)
+				queue.mu.Unlock()
+				expect callCount == 256
+			}
+		}
+	}
+}

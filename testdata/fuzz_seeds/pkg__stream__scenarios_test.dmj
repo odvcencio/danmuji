@@ -1,0 +1,102 @@
+package stream_test
+
+import (
+	"bytes"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/stream"
+)
+
+unit "TS packet format across codec and audio combinations" {
+	given "h264 with audio" {
+		var buf bytes.Buffer
+		tw := stream.NewTSWriter(&buf)
+		_ = tw.WritePAT()
+		_ = tw.WritePMT("h264", true)
+		_ = tw.WriteVideoPacket(make([]byte, 300), 90000, true)
+		_ = tw.WriteAudioPacket(make([]byte, 50), 90000)
+
+		then "output is 188-byte aligned" {
+			expect buf.Len() % 188 == 0
+		}
+	}
+
+	given "hevc without audio" {
+		var buf bytes.Buffer
+		tw := stream.NewTSWriter(&buf)
+		_ = tw.WritePAT()
+		_ = tw.WritePMT("hevc", false)
+		_ = tw.WriteVideoPacket(make([]byte, 300), 90000, true)
+
+		then "output is 188-byte aligned" {
+			expect buf.Len() % 188 == 0
+		}
+	}
+
+	given "h264 without audio" {
+		var buf bytes.Buffer
+		tw := stream.NewTSWriter(&buf)
+		_ = tw.WritePAT()
+		_ = tw.WritePMT("h264", false)
+		_ = tw.WriteVideoPacket(make([]byte, 300), 90000, true)
+
+		then "output is 188-byte aligned" {
+			expect buf.Len() % 188 == 0
+		}
+	}
+
+	given "hevc with audio" {
+		var buf bytes.Buffer
+		tw := stream.NewTSWriter(&buf)
+		_ = tw.WritePAT()
+		_ = tw.WritePMT("hevc", true)
+		_ = tw.WriteVideoPacket(make([]byte, 300), 90000, true)
+		_ = tw.WriteAudioPacket(make([]byte, 50), 90000)
+
+		then "output is 188-byte aligned" {
+			expect buf.Len() % 188 == 0
+		}
+	}
+}
+
+unit "Segment duration edge cases" {
+	each "duration" {
+		defaults { durationMs: int64(0), segDur: 4.0, minSegments: 1 }
+		{ name: "zero ms",           durationMs: int64(0),       segDur: 4.0,  minSegments: 1 }
+		{ name: "sub-segment",       durationMs: int64(2000),    segDur: 4.0,  minSegments: 1 }
+		{ name: "exact boundary",    durationMs: int64(8000),    segDur: 4.0,  minSegments: 2 }
+		{ name: "2 hour movie",      durationMs: int64(7200000), segDur: 4.0,  minSegments: 1800 }
+		{ name: "10 hour audiobook", durationMs: int64(36000000), segDur: 4.0, minSegments: 9000 }
+		{ name: "1 second segment",  durationMs: int64(10000),   segDur: 1.0,  minSegments: 10 }
+	} do {
+		then "segment count meets minimum" {
+			count := stream.CalculateSegments(scenario.durationMs.(int64), scenario.segDur.(float64))
+			expect count >= scenario.minSegments.(int)
+		}
+	}
+}
+
+unit "HLS variant playlist generation" {
+	given "a media item with video" {
+		variants := []stream.Variant{
+			{Bandwidth: 5000000, Resolution: "1920x1080", URI: "/stream/1/original/playlist.m3u8"},
+		}
+
+		when "generating master playlist" {
+			playlist := stream.GenerateMasterPlaylist(1, variants)
+
+			then "contains EXTM3U" {
+				expect len(playlist) > 0
+			}
+		}
+	}
+}
+
+unit "Low latency segment duration" {
+	then "low latency constant is 1 second" {
+		expect stream.LowLatencySegmentDuration == 1.0
+	}
+	then "default segment duration is 4 seconds" {
+		expect stream.DefaultSegmentDuration == 4.0
+	}
+}

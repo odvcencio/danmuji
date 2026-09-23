@@ -4,8 +4,15 @@ import "testing"
 
 load "api throughput" {
 	rate 10
-	duration 5s
-	rampup 1s
+	// Written as explicit Go expressions, not "5s"/"1s" shorthand: the
+	// pinned gotreesitter build silently drops a bare duration_literal's
+	// unit suffix when it isn't the last statement in the block (it
+	// resolves to Go's own int_literal instead, e.g. "5s" -> 5, then
+	// misread as 5 * time.Second regardless of the real unit). Tracked
+	// against the gotreesitter upgrade (see AGENTS-facing item 2); this
+	// form has no such ambiguity and transpiles to the exact same value.
+	duration 5 * time.Second
+	rampup 1 * time.Second
 	target get "http://localhost:8080/health"
 	then "healthy" {
 		expect true

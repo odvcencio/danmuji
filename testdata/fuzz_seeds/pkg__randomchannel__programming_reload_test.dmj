@@ -1,0 +1,291 @@
+package randomchannel
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+unit "Random channel programming hot reload" {
+	then "applies valid program and theme changes to every service" {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "channels.toml")
+		writeProgrammingReloadFile(t, path, programmingReloadTOML("Initial", "Initial Theme", DefaultShowRoomCode))
+		recorder := newProgrammingReloadRecorder()
+		movie := NewWithConfig(MovieChannelConfig(), nil, nil, nil, nil, nil)
+		show := NewWithConfig(ShowChannelConfig(), nil, nil, nil, nil, nil)
+		cancel, done := startProgrammingReloadWatcher(path, recorder, []*Service{movie, show})
+		defer stopProgrammingReloadWatcher(t, cancel, done)
+		initial := recorder.wait(t, 2*time.Second, func(result ProgrammingReloadResult) bool {
+			return result.Initial && result.Applied
+		})
+
+		writeProgrammingReloadFile(t, path, programmingReloadTOML("Reloaded", "Reloaded Theme", DefaultShowRoomCode))
+		reloaded := recorder.wait(t, 2*time.Second, func(result ProgrammingReloadResult) bool {
+			return result.Applied && !result.Initial
+		})
+		movieProgram, movieTheme, movieOK := movie.activeProgram()
+		showProgram, showTheme, showOK := show.activeProgram()
+
+		expect initial.Err == nil
+		expect reloaded.Err == nil
+		expect movieOK
+		expect showOK
+		expect movieProgram.Name == "Reloaded Movies"
+		expect showProgram.Name == "Reloaded Shows"
+		expect movieTheme.Name == "Reloaded Theme"
+		expect showTheme.Name == "Reloaded Theme"
+	}
+
+	then "preserves the last good snapshot when a saved file is invalid" {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "channels.toml")
+		writeProgrammingReloadFile(t, path, programmingReloadTOML("Good", "Good Theme", DefaultShowRoomCode))
+		recorder := newProgrammingReloadRecorder()
+		movie := NewWithConfig(MovieChannelConfig(), nil, nil, nil, nil, nil)
+		show := NewWithConfig(ShowChannelConfig(), nil, nil, nil, nil, nil)
+		cancel, done := startProgrammingReloadWatcher(path, recorder, []*Service{movie, show})
+		defer stopProgrammingReloadWatcher(t, cancel, done)
+		_ = recorder.wait(t, 2*time.Second, func(result ProgrammingReloadResult) bool {
+			return result.Initial && result.Applied
+		})
+
+		writeProgrammingReloadFile(t, path, "[[programs")
+		invalid := recorder.wait(t, 2*time.Second, func(result ProgrammingReloadResult) bool {
+			return !result.Initial && result.Err != nil
+		})
+		movieProgram, _, movieOK := movie.activeProgram()
+		showProgram, _, showOK := show.activeProgram()
+
+		expect invalid.Applied == false
+		expect invalid.RestartRequired == false
+		expect invalid.Err.Error() contains "parse random channel programming toml"
+		expect movieOK
+		expect showOK
+		expect movieProgram.Name == "Good Movies"
+		expect showProgram.Name == "Good Shows"
+	}
+
+	then "observes atomic rename saves by watching the parent directory" {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "channels.toml")
+		writeProgrammingReloadFile(t, path, programmingReloadTOML("Before", "Before Theme", DefaultShowRoomCode))
+		recorder := newProgrammingReloadRecorder()
+		movie := NewWithConfig(MovieChannelConfig(), nil, nil, nil, nil, nil)
+		show := NewWithConfig(ShowChannelConfig(), nil, nil, nil, nil, nil)
+		cancel, done := startProgrammingReloadWatcher(path, recorder, []*Service{movie, show})
+		defer stopProgrammingReloadWatcher(t, cancel, done)
+		_ = recorder.wait(t, 2*time.Second, func(result ProgrammingReloadResult) bool {
+			return result.Initial && result.Applied
+		})
+
+		tmp := filepath.Join(dir, ".channels.toml.tmp")
+		writeProgrammingReloadFile(t, tmp, programmingReloadTOML("Renamed", "Renamed Theme", DefaultShowRoomCode))
+		renameErr := os.Rename(tmp, path)
+		reloaded := recorder.wait(t, 2*time.Second, func(result ProgrammingReloadResult) bool {
+			return result.Applied && !result.Initial
+		})
+		program, _, ok := show.activeProgram()
+
+		expect renameErr == nil
+		expect reloaded.Err == nil
+		expect ok
+		expect program.Name == "Renamed Shows"
+	}
+
+	then "rejects alias and room identity changes as restart-required" {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "channels.toml")
+		writeProgrammingReloadFile(t, path, programmingReloadTOML("Good", "Good Theme", DefaultShowRoomCode))
+		recorder := newProgrammingReloadRecorder()
+		movie := NewWithConfig(MovieChannelConfig(), nil, nil, nil, nil, nil)
+		show := NewWithConfig(ShowChannelConfig(), nil, nil, nil, nil, nil)
+		cancel, done := startProgrammingReloadWatcher(path, recorder, []*Service{movie, show})
+		defer stopProgrammingReloadWatcher(t, cancel, done)
+		_ = recorder.wait(t, 2*time.Second, func(result ProgrammingReloadResult) bool {
+			return result.Initial && result.Applied
+		})
+
+		writeProgrammingReloadFile(t, path, programmingReloadTOML("Moved", "Moved Theme", "NEWSHOW"))
+		roomChange := recorder.wait(t, 2*time.Second, func(result ProgrammingReloadResult) bool {
+			return result.RestartRequired && result.Err != nil && strings.Contains(result.Err.Error(), "room changed")
+		})
+		showProgram, _, showOK := show.activeProgram()
+
+		expect roomChange.Applied == false
+		expect showOK
+		expect showProgram.Name == "Good Shows"
+
+		next := strings.Replace(programmingReloadTOML("Added", "Added Theme", DefaultShowRoomCode), "[[channels]]\nalias = \"2\"", "[[channels]]\nalias = \"3\"", 1)
+		writeProgrammingReloadFile(t, path, next)
+		aliasChange := recorder.wait(t, 2*time.Second, func(result ProgrammingReloadResult) bool {
+			return result.RestartRequired && result.Err != nil && strings.Contains(result.Err.Error(), "alias")
+		})
+
+		expect aliasChange.Applied == false
+	}
+
+	then "coalesces rapid writes and exits cleanly on context cancellation" {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "channels.toml")
+		writeProgrammingReloadFile(t, path, programmingReloadTOML("Initial", "Initial Theme", DefaultShowRoomCode))
+		recorder := newProgrammingReloadRecorder()
+		movie := NewWithConfig(MovieChannelConfig(), nil, nil, nil, nil, nil)
+		show := NewWithConfig(ShowChannelConfig(), nil, nil, nil, nil, nil)
+		cancel, done := startProgrammingReloadWatcher(path, recorder, []*Service{movie, show})
+		_ = recorder.wait(t, 2*time.Second, func(result ProgrammingReloadResult) bool {
+			return result.Initial && result.Applied
+		})
+
+		writeProgrammingReloadFile(t, path, programmingReloadTOML("First", "First Theme", DefaultShowRoomCode))
+		writeProgrammingReloadFile(t, path, programmingReloadTOML("Second", "Second Theme", DefaultShowRoomCode))
+		writeProgrammingReloadFile(t, path, programmingReloadTOML("Final", "Final Theme", DefaultShowRoomCode))
+		_ = recorder.wait(t, 2*time.Second, func(result ProgrammingReloadResult) bool {
+			if !result.Applied || result.Initial || result.Snapshot == nil {
+				return false
+			}
+			program, ok := result.Snapshot.Program("shows")
+			return ok && program.Name == "Final Shows"
+		})
+		cancel()
+		waitProgrammingReloadDone(t, done)
+		appliedBeforeCancel := recorder.countApplied()
+		writeProgrammingReloadFile(t, path, programmingReloadTOML("AfterCancel", "After Cancel Theme", DefaultShowRoomCode))
+		time.Sleep(50 * time.Millisecond)
+		appliedAfterCancel := recorder.countApplied()
+		program, _, ok := show.activeProgram()
+
+		expect ok
+		expect program.Name == "Final Shows"
+		expect appliedAfterCancel == appliedBeforeCancel
+	}
+}
+
+type programmingReloadRecorder struct {
+	mu      sync.Mutex
+	results []ProgrammingReloadResult
+	notify  chan struct{}
+}
+
+func newProgrammingReloadRecorder() *programmingReloadRecorder {
+	return &programmingReloadRecorder{notify: make(chan struct{}, 16)}
+}
+
+func (r *programmingReloadRecorder) record(result ProgrammingReloadResult) {
+	r.mu.Lock()
+	r.results = append(r.results, result)
+	r.mu.Unlock()
+	select {
+	case r.notify <- struct{}{}:
+	default:
+	}
+}
+
+func (r *programmingReloadRecorder) wait(t *testing.T, timeout time.Duration, predicate func(ProgrammingReloadResult) bool) ProgrammingReloadResult {
+	t.Helper()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	for {
+		r.mu.Lock()
+		for _, result := range r.results {
+			if predicate(result) {
+				r.mu.Unlock()
+				return result
+			}
+		}
+		r.mu.Unlock()
+		select {
+		case <-r.notify:
+		case <-deadline.C:
+			t.Fatalf("timed out waiting for programming reload result")
+		}
+	}
+}
+
+func (r *programmingReloadRecorder) countApplied() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	count := 0
+	for _, result := range r.results {
+		if result.Applied {
+			count++
+		}
+	}
+	return count
+}
+
+func programmingReloadTOML(programName, themeName, roomCode string) string {
+	return "timezone = \"America/Los_Angeles\"\n\n" +
+		"[[themes]]\n" +
+		"id = \"theme\"\n" +
+		"name = \"" + themeName + "\"\n" +
+		"css_class = \"theme-hot\"\n\n" +
+		"[[programs]]\n" +
+		"id = \"movies\"\n" +
+		"name = \"" + programName + " Movies\"\n" +
+		"kind = \"random_movies\"\n" +
+		"content_kind = \"movies\"\n" +
+		"theme_id = \"theme\"\n\n" +
+		"[[programs]]\n" +
+		"id = \"shows\"\n" +
+		"name = \"" + programName + " Shows\"\n" +
+		"kind = \"random_shows\"\n" +
+		"content_kind = \"shows\"\n" +
+		"theme_id = \"theme\"\n\n" +
+		"[[channels]]\n" +
+		"alias = \"1\"\n" +
+		"room_code = \"CHAN01\"\n" +
+		"name = \"Random Movies\"\n" +
+		"content_kind = \"movies\"\n" +
+		"program_id = \"movies\"\n\n" +
+		"[[channels]]\n" +
+		"alias = \"2\"\n" +
+		"room_code = \"" + roomCode + "\"\n" +
+		"name = \"Random Shows\"\n" +
+		"content_kind = \"shows\"\n" +
+		"program_id = \"shows\"\n"
+}
+
+func writeProgrammingReloadFile(t *testing.T, path string, body string) {
+	t.Helper()
+	err := os.WriteFile(path, []byte(body), 0o600)
+	if err != nil {
+		t.Fatalf("write programming file: %v", err)
+	}
+}
+
+func startProgrammingReloadWatcher(path string, recorder *programmingReloadRecorder, services []*Service) (context.CancelFunc, <-chan error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- WatchProgrammingConfig(ctx, ProgrammingReloadOptions{
+			Path:     path,
+			Services: services,
+			Debounce: 15 * time.Millisecond,
+			OnResult: recorder.record,
+		})
+	}()
+	return cancel, done
+}
+
+func stopProgrammingReloadWatcher(t *testing.T, cancel context.CancelFunc, done <-chan error) {
+	t.Helper()
+	cancel()
+	waitProgrammingReloadDone(t, done)
+}
+
+func waitProgrammingReloadDone(t *testing.T, done <-chan error) {
+	t.Helper()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("programming watcher returned: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("programming watcher did not stop")
+	}
+}

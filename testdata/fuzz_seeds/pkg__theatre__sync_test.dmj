@@ -1,0 +1,137 @@
+package theatre_test
+
+import (
+	"math"
+	"sync"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/theatre"
+)
+
+unit "SyncHeartbeat binary protocol" {
+	given "a heartbeat with known values" {
+		hb := theatre.SyncHeartbeat{
+			ServerTime:  1234567890,
+			Position:    42.5,
+			Playing:     true,
+			ViewerCount: 7,
+		}
+
+		when "encoding and decoding" {
+			encoded := theatre.EncodeSyncHeartbeat(hb)
+			msg, ok := theatre.DecodeMessage(encoded[:])
+
+			then "decodes successfully" {
+				expect ok
+				expect msg not_nil
+				expect msg.SyncHeartbeat not_nil
+			}
+			then "round trips all fields" {
+				expect msg.SyncHeartbeat.ServerTime == uint64(1234567890)
+				expect msg.SyncHeartbeat.ViewerCount == uint16(7)
+				expect msg.SyncHeartbeat.Playing
+			}
+			then "position round trips within float32 precision" {
+				diff := math.Abs(float64(msg.SyncHeartbeat.Position - 42.5))
+				expect diff < 0.001
+			}
+		}
+	}
+}
+
+unit "PingPong binary protocol" {
+	given "a ping message" {
+		pp := theatre.PingPong{Timestamp: 9876543210}
+
+		when "encoding as ping and decoding" {
+			encoded := theatre.EncodePing(pp)
+			msg, ok := theatre.DecodeMessage(encoded[:])
+
+			then "decodes as ping" {
+				expect ok
+				expect msg.Ping not_nil
+				expect msg.Ping.Timestamp == uint64(9876543210)
+			}
+		}
+
+		when "encoding as pong and decoding" {
+			encoded := theatre.EncodePong(pp)
+			msg, ok := theatre.DecodeMessage(encoded[:])
+
+			then "decodes as pong" {
+				expect ok
+				expect msg.Pong not_nil
+				expect msg.Pong.Timestamp == uint64(9876543210)
+			}
+		}
+	}
+}
+
+unit "DecodeMessage rejects bad input" {
+	given "empty data" {
+		msg, ok := theatre.DecodeMessage(nil)
+
+		then "returns false" {
+			reject ok
+			expect msg == nil
+		}
+	}
+
+	given "truncated heartbeat" {
+		data := make([]byte, 5)
+		data[0] = 0x01
+		msg, ok := theatre.DecodeMessage(data)
+
+		then "returns false" {
+			reject ok
+			expect msg == nil
+		}
+	}
+
+	given "unknown message type" {
+		data := []byte{0xFF, 0x00, 0x00}
+		msg, ok := theatre.DecodeMessage(data)
+
+		then "returns false" {
+			reject ok
+			expect msg == nil
+		}
+	}
+}
+
+unit "PlaybackStateManager concurrent access" {
+	given "a shared playback state manager" {
+		mgr := theatre.NewPlaybackStateManager()
+
+		when "10 goroutines write while 10 read" {
+			var wg sync.WaitGroup
+			for i := 0; i < 10; i++ {
+				wg.Add(1)
+				go func(id int) {
+					defer wg.Done()
+					for j := 0; j < 100; j++ {
+						mgr.Set("room1", theatre.PlaybackState{
+							Position: float64(j * 1000),
+							Playing:  j%2 == 0,
+						})
+					}
+				}(i)
+			}
+			for i := 0; i < 10; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for j := 0; j < 100; j++ {
+						mgr.Get("room1")
+						mgr.ComputePosition("room1")
+					}
+				}()
+			}
+			wg.Wait()
+
+			then "no data race" {
+				expect true
+			}
+		}
+	}
+}

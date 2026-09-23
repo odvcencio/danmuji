@@ -312,13 +312,31 @@ func DanmujiGrammar() *Grammar {
 		// ---------------------------------------------------------------
 		g.Define("load_config", Choice(
 			Seq(Str("rate"), Sym("_expression")),
+			// Listing duration_literal before _expression matches the
+			// convention already used by await_statement/timeout_directive
+			// below, but on the pinned gotreesitter build it does NOT
+			// actually resolve the ambiguity for "duration"/"rampup" when
+			// they aren't the last statement in the load{} block: Go's own
+			// numeric grammar still wins, matching only the leading digits
+			// of "5s" as a bare int_literal and silently dropping the unit
+			// suffix with no ERROR node (confirmed: the compiled
+			// language.bin is byte-identical whether duration_literal is
+			// listed first or last here — Choice order alone doesn't
+			// change gotreesitter's ambiguity resolution). See
+			// TestTranspileDanmujiRejectsMidBlockDurationShorthand and
+			// CheckTreeCoversSource (errors.go), which is what actually
+			// catches this today; testdata/load.dmj and
+			// testdata/meta/load_runtime_meta.dmj work around it by
+			// spelling durations as explicit `N * time.Unit` expressions.
+			// Left here anyway for consistency and in case a future
+			// gotreesitter version's conflict resolution does honor it.
 			Seq(Str("duration"), Choice(
-				Sym("_expression"),
 				Sym("duration_literal"),
+				Sym("_expression"),
 			)),
 			Seq(Str("rampup"), Choice(
-				Sym("_expression"),
 				Sym("duration_literal"),
+				Sym("_expression"),
 			)),
 			Seq(Str("concurrency"), Sym("_expression")),
 		))
@@ -552,9 +570,15 @@ func DanmujiGrammar() *Grammar {
 			Field("name", Sym("_string_literal")),
 			Optional(Seq(
 				Str("within"),
+				// duration_literal listed first for consistency with the
+				// other duration fields in this file; unlike load_config's
+				// "duration"/"rampup" (which sit mid-statement-list),
+				// this field is immediately followed by the body block, so
+				// "5s" parses correctly today regardless of Choice order —
+				// verified directly, not just by convention.
 				Field("duration", Choice(
-					Sym("_expression"),
 					Sym("duration_literal"),
+					Sym("_expression"),
 				)),
 			)),
 			Field("body", Sym("block")),
@@ -565,9 +589,10 @@ func DanmujiGrammar() *Grammar {
 			Field("name", Sym("_string_literal")),
 			Optional(Seq(
 				Str("for"),
+				// See eventually_block's comment above.
 				Field("duration", Choice(
-					Sym("_expression"),
 					Sym("duration_literal"),
+					Sym("_expression"),
 				)),
 			)),
 			Field("body", Sym("block")),
@@ -617,9 +642,12 @@ func DanmujiGrammar() *Grammar {
 		g.Define("ready_clause", Seq(
 			Str("ready"),
 			Field("mode", Sym("ready_mode")),
+			// See eventually_block's comment above: this field is
+			// immediately followed by the end of the rule, so "5s" parses
+			// correctly today regardless of Choice order.
 			Field("target", Choice(
-				Sym("_expression"),
 				Sym("duration_literal"),
+				Sym("_expression"),
 			)),
 		))
 

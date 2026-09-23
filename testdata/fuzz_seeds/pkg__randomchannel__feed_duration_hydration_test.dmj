@@ -1,0 +1,223 @@
+package randomchannel
+
+import (
+	"context"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/odvcencio/arbiter/vm"
+	"github.com/odvcencio/goetrope/pkg/library"
+	"github.com/odvcencio/goetrope/pkg/theatre"
+)
+
+unit "Feed model duration hydration" {
+	given "a large unchanged playlist" {
+		svc := feedModelTestService(t, true)
+		ids := make([]int64, 96)
+		for i := range ids {
+			ids[i] = int64(i + 1)
+		}
+		room := &theatre.Room{
+			RoomCode: RoomCode,
+			Playlist: ids,
+			CurrentItemIndex: 0,
+		}
+		bulkCalls := 0
+		singleCalls := 0
+		var bulkBatch int
+		svc.loadItems = func(_ context.Context, got []int64) (map[int64]*library.MediaItem, error) {
+			bulkCalls++
+			bulkBatch = len(got)
+			items := make(map[int64]*library.MediaItem, len(got))
+			for _, id := range got {
+				items[id] = &library.MediaItem{ID: id, Path: fmt.Sprintf("/media/%d.mkv", id), DurationMs: 600_000}
+			}
+			return items, nil
+		}
+		svc.loadItem = func(_ context.Context, id int64) (*library.MediaItem, error) {
+			singleCalls++
+			return &library.MediaItem{ID: id, Path: fmt.Sprintf("/media/%d.mkv", id), DurationMs: 600_000}, nil
+		}
+		svc.feedCacheLookup = func(*library.MediaItem, string) ([]string, error) { return nil, nil }
+
+		when "refreshing repeatedly without changing the playlist generation" {
+			svc.refreshFeedState(context.Background(), room)
+			first := svc.feed.snapshotPlaylist()
+			svc.refreshFeedState(context.Background(), room)
+			svc.refreshFeedState(context.Background(), room)
+			steady := svc.feed.snapshotPlaylist()
+
+			then "bulk loads the playlist once and preserves ordered durations" {
+				expect bulkCalls == 1
+				expect bulkBatch == len(ids)
+				expect singleCalls == 2
+				expect len(first.ItemDuration) == len(ids)
+				expect first.ItemDuration[95] == 600
+				expect steady.ItemDuration[95] == 600
+			}
+		}
+	}
+
+	given "a playlist replacement after hydration" {
+		svc := feedModelTestService(t, true)
+		bulkCalls := 0
+		svc.loadItems = func(_ context.Context, got []int64) (map[int64]*library.MediaItem, error) {
+			bulkCalls++
+			items := make(map[int64]*library.MediaItem, len(got))
+			for _, id := range got {
+				items[id] = &library.MediaItem{ID: id, Path: fmt.Sprintf("/media/%d.mkv", id), DurationMs: id * 1000}
+			}
+			return items, nil
+		}
+		svc.feedCacheLookup = func(*library.MediaItem, string) ([]string, error) { return nil, nil }
+		firstRoom := &theatre.Room{RoomCode: RoomCode, Playlist: []int64{10, 20}, CurrentItemIndex: 0}
+		secondRoom := &theatre.Room{RoomCode: RoomCode, Playlist: []int64{10, 30}, CurrentItemIndex: 0}
+
+		when "the playlist identity changes once" {
+			svc.refreshFeedState(context.Background(), firstRoom)
+			svc.refreshFeedState(context.Background(), firstRoom)
+			svc.refreshFeedState(context.Background(), secondRoom)
+			svc.refreshFeedState(context.Background(), secondRoom)
+			pl := svc.feed.snapshotPlaylist()
+
+			then "refreshes duration hydration only for the new generation" {
+				expect bulkCalls == 2
+				expect pl.ItemIDs[1] == int64(30)
+				expect pl.ItemDuration[1] == 30
+			}
+		}
+	}
+
+	given "a playlist with missing media rows" {
+		svc := feedModelTestService(t, true)
+		now := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+		svc.now = func() time.Time { return now }
+		bulkCalls := 0
+		includeMissing := false
+		svc.loadItems = func(_ context.Context, got []int64) (map[int64]*library.MediaItem, error) {
+			bulkCalls++
+			items := map[int64]*library.MediaItem{
+				1: &library.MediaItem{ID: 1, Path: "/media/1.mkv", DurationMs: 100_000},
+				3: &library.MediaItem{ID: 3, Path: "/media/3.mkv", DurationMs: 300_000},
+			}
+			if includeMissing {
+				items[2] = &library.MediaItem{ID: 2, Path: "/media/2.mkv", DurationMs: 200_000}
+			}
+			return items, nil
+		}
+		svc.feedCacheLookup = func(*library.MediaItem, string) ([]string, error) { return nil, nil }
+		room := &theatre.Room{RoomCode: RoomCode, Playlist: []int64{1, 2, 3}, CurrentItemIndex: 0}
+
+		when "refreshing before and after the incomplete-generation retry interval" {
+			svc.refreshFeedState(context.Background(), room)
+			svc.refreshFeedState(context.Background(), room)
+			beforeRetry := svc.feed.snapshotPlaylist()
+			includeMissing = true
+			now = now.Add(feedDurationRetryInterval + time.Second)
+			svc.refreshFeedState(context.Background(), room)
+			afterRetry := svc.feed.snapshotPlaylist()
+
+			then "does not bulk-load every tick but retries missing durations later" {
+				expect bulkCalls == 2
+				expect beforeRetry.ItemDuration[0] == 100
+				expect beforeRetry.ItemDuration[1] == 0
+				expect beforeRetry.ItemDuration[2] == 300
+				expect afterRetry.ItemDuration[1] == 200
+			}
+		}
+	}
+
+	given "a current item missing from bulk duration hydration" {
+		svc := feedModelTestService(t, true)
+		now := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+		svc.now = func() time.Time { return now }
+		bulkCalls := 0
+		singleCalls := 0
+		svc.loadItems = func(_ context.Context, got []int64) (map[int64]*library.MediaItem, error) {
+			bulkCalls++
+			return map[int64]*library.MediaItem{
+				1: &library.MediaItem{ID: 1, Path: "/media/1.mkv", DurationMs: 100_000},
+				3: &library.MediaItem{ID: 3, Path: "/media/3.mkv", DurationMs: 300_000},
+			}, nil
+		}
+		svc.loadItem = func(_ context.Context, id int64) (*library.MediaItem, error) {
+			singleCalls++
+			return &library.MediaItem{ID: id, Path: fmt.Sprintf("/media/%d.mkv", id), DurationMs: id * 100_000}, nil
+		}
+		svc.feedCacheLookup = func(*library.MediaItem, string) ([]string, error) { return nil, nil }
+		room := &theatre.Room{RoomCode: RoomCode, Playlist: []int64{1, 2, 3}, CurrentItemIndex: 1}
+
+		when "refreshing the same generation before the retry interval" {
+			svc.refreshFeedState(context.Background(), room)
+			svc.refreshFeedState(context.Background(), room)
+			pl := svc.feed.snapshotPlaylist()
+
+			then "repairs the current duration with O(1) loading instead of another bulk pass" {
+				expect bulkCalls == 1
+				expect singleCalls == 1
+				expect pl.ItemDuration[1] == 200
+			}
+		}
+	}
+
+	given "an oversized programmed queue" {
+		when "loading channel programming" {
+			_, err := NewProgrammingSnapshot(ProgrammingConfig{
+				Programs: []ProgramConfig{{
+					ID: "huge", Kind: ProgramKindRandomMovies, QueueSize: maxProgramQueueSize + 1,
+				}},
+				Channels: []ChannelProgramConfig{{
+					Alias: "1", RoomCode: "CHAN01", Name: "Huge", ProgramID: "huge",
+				}},
+			})
+
+			then "rejects the configuration before runtime" {
+				expect err != nil
+				expect err.Error() contains "queue_size cannot exceed"
+			}
+		}
+	}
+
+	given "an oversized runtime queue target from policy" {
+		snapshot, snapshotErr := NewProgrammingSnapshot(ProgrammingConfig{
+			Programs: []ProgramConfig{{
+				ID: "show-9", Name: "Show 9 Marathon", Kind: ProgramKindSeriesMarathon, SeriesID: 9,
+			}},
+			Channels: []ChannelProgramConfig{{
+				Alias: DefaultShowAlias, RoomCode: DefaultShowRoomCode, Name: DefaultShowChannelName, ProgramID: "show-9",
+			}},
+		})
+		manager := &recoveryRoomManager{room: &theatre.Room{RoomCode: DefaultShowRoomCode, Playlist: []int64{}, CurrentItemIndex: 0}}
+		svc := NewWithConfig(ShowChannelConfig(), nil, nil, nil, nil, nil)
+		svc.manager = manager
+		setErr := svc.SetProgrammingSource(snapshot)
+		svc.getSeriesState = func(context.Context, string, int64) (*library.RandomChannelSeriesState, error) {
+			return nil, nil
+		}
+		svc.listEpisodesForSeries = func(context.Context, int64) ([]*library.MediaItem, error) {
+			items := make([]*library.MediaItem, 200)
+			for i := range items {
+				items[i] = &library.MediaItem{ID: int64(i + 1)}
+			}
+			return items, nil
+		}
+		svc.loadItem = func(_ context.Context, id int64) (*library.MediaItem, error) {
+			return &library.MediaItem{ID: id, Metadata: &library.Metadata{SeriesID: 9}, Streams: []library.Stream{{StreamIndex: 2, StreamType: "subtitle", Codec: "subrip"}}}, nil
+		}
+
+		when "applying a refill action above the max queue size" {
+			updated, _, err := svc.applyAction(context.Background(), manager.room, 0, vm.MatchedRule{
+				Action: "RefillQueue",
+				Params: map[string]any{"target_queue_size": maxProgramQueueSize + 1},
+			})
+
+			then "clamps the resulting playlist to the configured maximum" {
+				expect snapshotErr == nil
+				expect setErr == nil
+				expect err == nil
+				expect len(updated.Playlist) == maxProgramQueueSize
+			}
+		}
+	}
+}

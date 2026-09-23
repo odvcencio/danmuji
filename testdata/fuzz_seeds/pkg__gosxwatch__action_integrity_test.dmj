@@ -1,0 +1,43 @@
+package gosxwatch
+
+import (
+	"os"
+	"strings"
+	"testing"
+)
+
+unit "GoSX action forms carry mutation integrity fields" {
+	then "native post templates render csrf_token fields" {
+		paths := []string{
+			"app/control/page.gsx",
+			"app/media/[id]/page.gsx",
+			"app/party/[slug]/page.gsx",
+			"app/requests/page.gsx",
+		}
+		totalForms := 0
+		totalTokens := 0
+		for _, path := range paths {
+			bodyBytes, err := os.ReadFile(path)
+			expect err == nil
+			body := string(bodyBytes)
+			totalForms += strings.Count(body, `<form method="post"`)
+			totalTokens += strings.Count(body, `name="csrf_token"`)
+		}
+		expect totalForms == totalTokens
+		expect totalTokens >= 20
+	}
+
+	then "host shortcut fetches have a token source and CSRF header" {
+		pageBytes, pageErr := os.ReadFile("app/party/[slug]/page.gsx")
+		expect pageErr == nil
+		page := string(pageBytes)
+		expect strings.Contains(page, `<If when={data.manage.playback_enabled}>`)
+		expect strings.Contains(page, `data-watch-csrf={data.csrf.token}`)
+
+		runtimeBytes, runtimeErr := os.ReadFile("public/watch-runtime.js")
+		expect runtimeErr == nil
+		runtime := string(runtimeBytes)
+		expect strings.Contains(runtime, `var csrfToken = controls.dataset.watchCsrf || ""`)
+		expect strings.Contains(runtime, `"X-Goetrope-CSRF": csrfToken || ""`)
+	}
+}

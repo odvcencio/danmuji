@@ -12,6 +12,16 @@ import (
 var sharedTestModuleDir string
 
 func TestMain(m *testing.M) {
+	// GOWORK=off keeps a stray go.work anywhere above t.TempDir()'s parent
+	// (commonly the shared /tmp root) from hijacking module resolution for
+	// the throwaway test modules below. Setting it once, process-wide,
+	// covers both the exec.Command calls in this file and the ones inside
+	// the production runTest/runBuild code paths that tests exercise.
+	if err := os.Setenv("GOWORK", "off"); err != nil {
+		fmt.Fprintf(os.Stderr, "setenv GOWORK: %v\n", err)
+		os.Exit(1)
+	}
+
 	dir, err := prepareSharedTestModule()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "prepare shared test module: %v\n", err)

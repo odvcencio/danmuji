@@ -1,0 +1,109 @@
+package theatre
+
+import (
+	"encoding/json"
+	"testing"
+
+	"github.com/gorilla/websocket"
+)
+
+unit "Hub wire outbound text framing" {
+	given "a typed JSON text payload" {
+		payload := wrapHubWireTextPayload([]byte(`{"type":"sync_play","position":12.5,"playing":true}`))
+		var env struct {
+			Event string          `json:"event"`
+			Data  json.RawMessage `json:"data"`
+		}
+		err := json.Unmarshal(payload, &env)
+		var data map[string]any
+		dataErr := json.Unmarshal(env.Data, &data)
+
+		then "wraps the original payload under its type event" {
+			expect err == nil
+			expect env.Event == "sync_play"
+			expect dataErr == nil
+			expect data["type"] == "sync_play"
+			expect data["position"] == float64(12.5)
+		}
+	}
+}
+
+unit "Raw websocket client framing" {
+	given "a raw text payload" {
+		client := NewWsClient("room", "visitor", false)
+		msg := outboundMessage{messageType: websocket.TextMessage, payload: []byte(`{"type":"sync_play"}`)}
+		messageType, payload, ok := (&WebSocketHandler{}).outboundForClient("room", client, msg)
+
+		then "passes through unchanged" {
+			expect ok
+			expect messageType == websocket.TextMessage
+			expect string(payload) == `{"type":"sync_play"}`
+		}
+	}
+}
+
+unit "Hub wire inbound event framing" {
+	given "an event envelope with object data" {
+		payload := unwrapHubWireTextPayload([]byte(`{"event":"buffer_ready","data":{"position":44}}`))
+		var msg map[string]any
+		err := json.Unmarshal(payload, &msg)
+
+		then "routes as the existing typed text message" {
+			expect err == nil
+			expect msg["type"] == "buffer_ready"
+			expect msg["position"] == float64(44)
+		}
+	}
+
+	given "an event envelope with a conflicting data type" {
+		payload := unwrapHubWireTextPayload([]byte(`{"event":"buffer_ready","data":{"type":"sync_request"}}`))
+		var msg map[string]any
+		err := json.Unmarshal(payload, &msg)
+
+		then "routes by the envelope event" {
+			expect err == nil
+			expect msg["type"] == "buffer_ready"
+		}
+	}
+}
+
+unit "Hub wire heartbeat framing" {
+	given "a binary sync heartbeat" {
+		encoded := EncodeSyncHeartbeat(SyncHeartbeat{
+			ServerTime:  1234,
+			Position:    9.25,
+			Playing:     true,
+			ViewerCount: 3,
+		})
+		payload, ok := hubWireHeartbeatFromBinary(encoded[:])
+		var env struct {
+			Event string          `json:"event"`
+			Data  json.RawMessage `json:"data"`
+		}
+		err := json.Unmarshal(payload, &env)
+		var data map[string]any
+		dataErr := json.Unmarshal(env.Data, &data)
+
+		then "converts to a JSON sync heartbeat with viewer count" {
+			expect ok
+			expect err == nil
+			expect env.Event == "sync_heartbeat"
+			expect dataErr == nil
+			expect data["viewer_count"] == float64(3)
+			expect data["viewerCount"] == float64(3)
+		}
+	}
+}
+
+unit "Hub wire clients" {
+	given "a gosx-hub protocol client" {
+		client := NewWsClient("room", "visitor", false)
+		client.Protocol = wsProtocolGoSXHub
+		client.AckCapable = client.UsesHubWire()
+
+		then "marks the protocol and can ack coordination" {
+			expect client.UsesHubWire()
+			expect client.AckCapable
+		}
+	}
+}

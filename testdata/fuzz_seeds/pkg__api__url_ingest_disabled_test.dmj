@@ -1,0 +1,93 @@
+package api
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/library"
+)
+
+type disabledURLIngestSpecPipeline struct {
+	pathCalls int
+	urlCalls int
+}
+
+func (p *disabledURLIngestSpecPipeline) IngestPath(context.Context, string) (*library.MediaItem, error) {
+	p.pathCalls++
+	return nil, errors.New("unexpected path ingest")
+}
+
+func (p *disabledURLIngestSpecPipeline) IngestURL(context.Context, string) (*library.MediaItem, error) {
+	p.urlCalls++
+	return nil, errors.New("URL_MARKER_82 downstream failure")
+}
+
+unit "API URL ingest activation fence" {
+	then "a submitted URL returns a fixed unavailable response without invoking the pipeline or reflecting the URL" {
+		pipeline := &disabledURLIngestSpecPipeline{}
+		handler := &ingestHandler{ingester: pipeline}
+		marker := "https://user:secret@private.example/media/item?token=URL_MARKER_82"
+		req := httptest.NewRequest(http.MethodPost, "/api/ingest", strings.NewReader(`{"url":"`+marker+`"}`))
+		rec := httptest.NewRecorder()
+		handler.handleSubmit(rec, req)
+
+		expect rec.Code == http.StatusNotImplemented
+		expect strings.TrimSpace(rec.Body.String()) == "feature_unavailable"
+		expect pipeline.pathCalls == 0
+		expect pipeline.urlCalls == 0
+		expect !strings.Contains(rec.Body.String(), marker)
+		expect !strings.Contains(rec.Body.String(), "private.example")
+		expect !strings.Contains(rec.Body.String(), "URL_MARKER_82")
+	}
+
+	then "the URL fence does not depend on a configured pipeline" {
+		handler := &ingestHandler{}
+		req := httptest.NewRequest(http.MethodPost, "/api/ingest", strings.NewReader(`{"url":"https://private.example/URL_MARKER_84"}`))
+		rec := httptest.NewRecorder()
+		handler.handleSubmit(rec, req)
+		expect rec.Code == http.StatusNotImplemented
+		expect strings.TrimSpace(rec.Body.String()) == "feature_unavailable"
+		expect !strings.Contains(rec.Body.String(), "private.example")
+		expect !strings.Contains(rec.Body.String(), "URL_MARKER_84")
+	}
+
+	then "mixed-case schemes with userinfo and query secrets receive the same fixed response" {
+		handler := &ingestHandler{}
+		marker := "HTTPS://user:password@private.example/path?token=MIXED_API_URL_MARKER_95"
+		req := httptest.NewRequest(http.MethodPost, "/api/ingest", strings.NewReader(`{"url":"`+marker+`"}`))
+		rec := httptest.NewRecorder()
+		handler.handleSubmit(rec, req)
+		expect rec.Code == http.StatusNotImplemented
+		expect strings.TrimSpace(rec.Body.String()) == "feature_unavailable"
+		expect !strings.Contains(rec.Body.String(), "private.example")
+		expect !strings.Contains(rec.Body.String(), "password")
+		expect !strings.Contains(rec.Body.String(), "MIXED_API_URL_MARKER_95")
+	}
+
+	then "every URL-like path spelling has the same defense before the ingester" {
+		for _, marker := range []string{
+			"HTTPS://user:password@private.example/path?token=MIXED_API_PATH_MARKER_105",
+			"HtTp://PRIVATE.EXAMPLE:5432/path?secret=MIXED_API_PATH_MARKER_106",
+			"hTTps:opaque-path?secret=MIXED_API_PATH_MARKER_107",
+			"HTTP://[::1]:9090/internal?key=MIXED_API_PATH_MARKER_108",
+		} {
+			pipeline := &disabledURLIngestSpecPipeline{}
+			handler := &ingestHandler{ingester: pipeline}
+			req := httptest.NewRequest(http.MethodPost, "/api/ingest", strings.NewReader(`{"path":"`+marker+`"}`))
+			rec := httptest.NewRecorder()
+			handler.handleSubmit(rec, req)
+			expect rec.Code == http.StatusNotImplemented
+			expect strings.TrimSpace(rec.Body.String()) == "feature_unavailable"
+			expect pipeline.pathCalls == 0
+			expect pipeline.urlCalls == 0
+			reject strings.Contains(rec.Body.String(), marker)
+			reject strings.Contains(rec.Body.String(), "private.example")
+			reject strings.Contains(rec.Body.String(), "password")
+			reject strings.Contains(rec.Body.String(), "MIXED_API_PATH_MARKER")
+		}
+	}
+}

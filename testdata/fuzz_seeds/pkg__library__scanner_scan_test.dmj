@@ -1,0 +1,178 @@
+package library
+
+import (
+	"context"
+	"errors"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+type scannerScanIngester struct {
+	paths []string
+}
+
+func (s *scannerScanIngester) IngestPath(ctx context.Context, path string) (*MediaItem, error) {
+	s.paths = append(s.paths, path)
+	return &MediaItem{Title: filepath.Base(path), Container: filepath.Ext(path)}, nil
+}
+
+@serial
+unit "Scanner scanPath skips unchanged files" {
+	root := t.TempDir()
+	movie := filepath.Join(root, "movie.mp4")
+	err := os.WriteFile(movie, []byte("movie"), 0o644)
+	expect err == nil
+
+	ingester := &scannerScanIngester{}
+	scanner := NewScanner([]string{root}, ingester)
+
+	when "scanning the same file twice" {
+		firstErr := scanner.scanPath(context.Background(), movie, false)
+		secondErr := scanner.scanPath(context.Background(), movie, false)
+
+		then "both scans succeed" {
+			expect firstErr == nil
+			expect secondErr == nil
+		}
+		then "indexes only once" {
+			expect len(ingester.paths) == 1
+			expect ingester.paths[0] == movie
+		}
+	}
+}
+
+@serial
+unit "Scanner incremental scans skip unchanged directory trees" {
+	root := t.TempDir()
+	movie := filepath.Join(root, "movies", "movie.mp4")
+	err := os.MkdirAll(filepath.Dir(movie), 0o755)
+	expect err == nil
+	err = os.WriteFile(movie, []byte("movie"), 0o644)
+	expect err == nil
+
+	ingester := &scannerScanIngester{}
+	scanner := NewScanner([]string{root}, ingester)
+	walkCalls := 0
+	scanner.walkDir = func(path string, fn fs.WalkDirFunc) error {
+		walkCalls++
+		return filepath.WalkDir(path, fn)
+	}
+
+	when "running a full scan then an incremental scan" {
+		fullErr := scanner.scanPath(context.Background(), root, true)
+		incrementalErr := scanner.scanPath(context.Background(), root, false)
+
+		then "both scans succeed" {
+			expect fullErr == nil
+			expect incrementalErr == nil
+		}
+		then "the incremental scan skips walking the unchanged root" {
+			expect walkCalls == 1
+		}
+	}
+}
+
+@serial
+unit "Scanner full scans still revisit unchanged directory trees" {
+	root := t.TempDir()
+	movie := filepath.Join(root, "movies", "movie.mp4")
+	err := os.MkdirAll(filepath.Dir(movie), 0o755)
+	expect err == nil
+	err = os.WriteFile(movie, []byte("movie"), 0o644)
+	expect err == nil
+
+	ingester := &scannerScanIngester{}
+	scanner := NewScanner([]string{root}, ingester)
+	walkCalls := 0
+	scanner.walkDir = func(path string, fn fs.WalkDirFunc) error {
+		walkCalls++
+		return filepath.WalkDir(path, fn)
+	}
+
+	when "running two forced full scans" {
+		firstErr := scanner.scanPath(context.Background(), root, true)
+		secondErr := scanner.scanPath(context.Background(), root, true)
+
+		then "both scans succeed" {
+			expect firstErr == nil
+			expect secondErr == nil
+		}
+		then "both scans walk the tree" {
+			expect walkCalls == 2
+		}
+	}
+}
+
+@serial
+unit "Scanner full scan prunes stale file state only after completion" {
+	root := t.TempDir()
+	firstMovie := filepath.Join(root, "first.mp4")
+	secondMovie := filepath.Join(root, "second.mp4")
+	err := os.WriteFile(firstMovie, []byte("first"), 0o644)
+	expect err == nil
+	err = os.WriteFile(secondMovie, []byte("second"), 0o644)
+	expect err == nil
+
+	ingester := &scannerScanIngester{}
+	scanner := NewScanner([]string{root}, ingester)
+
+	when "a completed full scan follows a delete" {
+		firstErr := scanner.InitialScan(context.Background())
+		removeErr := os.Remove(secondMovie)
+		secondErr := scanner.InitialScan(context.Background())
+		stats := scanner.Stats()
+
+		then "both scans succeed" {
+			expect firstErr == nil
+			expect removeErr == nil
+			expect secondErr == nil
+		}
+		then "only the remaining file stays in scanner state" {
+			expect stats.Completed == true
+			expect stats.SeenFiles == 1
+			expect stats.ScannedDirs == 1
+		}
+	}
+}
+
+@serial
+unit "Scanner budgeted full scan does not prune previous complete state" {
+	root := t.TempDir()
+	oldMovie := filepath.Join(root, "old.mp4")
+	err := os.WriteFile(oldMovie, []byte("old"), 0o644)
+	expect err == nil
+
+	ingester := &scannerScanIngester{}
+	scanner := NewScanner([]string{root}, ingester)
+	scanner.scanBudget = scanBudget{MaxFiles: 10, MaxDirs: 10, MaxDuration: time.Minute}
+
+	firstErr := scanner.InitialScan(context.Background())
+	expect firstErr == nil
+
+	err = os.Remove(oldMovie)
+	expect err == nil
+	newMovie := filepath.Join(root, "new.mp4")
+	overflowMovie := filepath.Join(root, "overflow.mp4")
+	err = os.WriteFile(newMovie, []byte("new"), 0o644)
+	expect err == nil
+	err = os.WriteFile(overflowMovie, []byte("overflow"), 0o644)
+	expect err == nil
+	scanner.scanBudget = scanBudget{MaxFiles: 1, MaxDirs: 10, MaxDuration: time.Minute}
+
+	when "the next full scan hits its file budget" {
+		secondErr := scanner.InitialScan(context.Background())
+		stats := scanner.Stats()
+
+		then "the scan reports an incomplete budget stop" {
+			expect errors.Is(secondErr, errScanBudgetExceeded)
+			expect stats.Completed == false
+			expect stats.BudgetExceeded == true
+		}
+		then "previous state is retained because the scan did not complete" {
+			expect stats.SeenFiles == 2
+		}
+	}
+}

@@ -1,0 +1,134 @@
+//go:build linux
+
+package transcode
+
+import (
+	"errors"
+	"os"
+	"testing"
+
+	"github.com/ebitengine/purego"
+)
+
+@serial
+unit "Native capability probing" {
+	given "driver libraries are unavailable" {
+		origDlopen := nativeDlopen
+		origDlclose := nativeDlclose
+		origDlsym := nativeDlsym
+		origOpenFD := nativeOpenFD
+		origCloseFD := nativeCloseFD
+		defer func() {
+			nativeDlopen = origDlopen
+			nativeDlclose = origDlclose
+			nativeDlsym = origDlsym
+			nativeOpenFD = origOpenFD
+			nativeCloseFD = origCloseFD
+		}()
+
+		nativeDlopen = func(string) (uintptr, error) { return 0, errors.New("missing") }
+		nativeDlclose = func(uintptr) error { return nil }
+		nativeDlsym = func(uintptr, string) (uintptr, error) { return 0, errors.New("missing") }
+		nativeOpenFD = func(string) (int, error) { return 0, errors.New("missing") }
+		nativeCloseFD = func(int) error { return nil }
+
+		caps := detectNativeCapabilities("", "/dev/dri/renderD128")
+
+		then "uses purego mode" {
+			expect caps.ProbeMode == nativeProbeModePureGo
+		}
+		then "reports no native acceleration" {
+			reject caps.CUDA
+			reject caps.NVENC
+			reject caps.VAAPI
+			expect caps.NVENCVersion == uint32(0)
+		}
+	}
+
+	given "driver libraries and symbols are available" {
+		renderNode, err := os.CreateTemp("", "goetrope-render-*")
+		expect err == nil
+		defer os.Remove(renderNode.Name())
+		expect renderNode.Close() == nil
+
+		origDlopen := nativeDlopen
+		origDlclose := nativeDlclose
+		origDlsym := nativeDlsym
+		origOpenFD := nativeOpenFD
+		origCloseFD := nativeCloseFD
+		defer func() {
+			nativeDlopen = origDlopen
+			nativeDlclose = origDlclose
+			nativeDlsym = origDlsym
+			nativeOpenFD = origOpenFD
+			nativeCloseFD = origCloseFD
+		}()
+
+		nativeDlopen = func(path string) (uintptr, error) {
+			switch path {
+			case "libcuda.so.1":
+				return 1, nil
+			case "libnvidia-encode.so.1":
+				return 2, nil
+			case "libva.so.2":
+				return 3, nil
+			case "libva-drm.so.2":
+				return 4, nil
+			default:
+				return 0, errors.New("missing")
+			}
+		}
+		nativeDlclose = func(uintptr) error { return nil }
+		nativeOpenFD = func(string) (int, error) { return 17, nil }
+		nativeCloseFD = func(int) error { return nil }
+
+		cuInit := purego.NewCallback(func(uint32) int32 { return 0 })
+		cuDeviceGetCount := purego.NewCallback(func(count *int32) int32 {
+			*count = 2
+			return 0
+		})
+		getVersion := purego.NewCallback(func(version *uint32) int32 {
+			*version = 0x000f0001
+			return 0
+		})
+		vaGetDisplay := purego.NewCallback(func(int32) uintptr { return 99 })
+		vaInitialize := purego.NewCallback(func(_ uintptr, major, minor *int32) int32 {
+			*major = 1
+			*minor = 22
+			return 0
+		})
+		vaTerminate := purego.NewCallback(func(uintptr) int32 { return 0 })
+
+		nativeDlsym = func(handle uintptr, name string) (uintptr, error) {
+			switch {
+			case handle == 1 && name == "cuInit":
+				return cuInit, nil
+			case handle == 1 && name == "cuDeviceGetCount":
+				return cuDeviceGetCount, nil
+			case handle == 2 && name == "NvEncodeAPIGetMaxSupportedVersion":
+				return getVersion, nil
+			case handle == 3 && name == "vaInitialize":
+				return vaInitialize, nil
+			case handle == 3 && name == "vaTerminate":
+				return vaTerminate, nil
+			case handle == 4 && name == "vaGetDisplayDRM":
+				return vaGetDisplay, nil
+			default:
+				return 0, errors.New("missing")
+			}
+		}
+
+		caps := detectNativeCapabilities("1", renderNode.Name())
+
+		then "reports native acceleration" {
+			expect caps.CUDA
+			expect caps.NVENC
+			expect caps.VAAPI
+		}
+		then "captures driver versions" {
+			expect caps.NVENCVersion == uint32(0x000f0001)
+			expect caps.VAAPIMajor == int32(1)
+			expect caps.VAAPIMinor == int32(22)
+		}
+	}
+}

@@ -1,0 +1,125 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+type readinessSpecDatabase struct {
+	err error
+}
+
+func (d readinessSpecDatabase) Ping(context.Context) error { return d.err }
+
+func serveReadinessSpec(t *testing.T, db databasePinger, worker WorkerReadinessProbe) (int, map[string]any, string) {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/ready", nil)
+	(&readinessHandler{database: db, worker: worker}).ServeHTTP(recorder, request)
+	var body map[string]any
+	_ = json.Unmarshal(recorder.Body.Bytes(), &body)
+	return recorder.Code, body, recorder.Body.String()
+}
+
+unit "process liveness" {
+	then "live is process-only and never reports dependencies" {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/live", nil)
+		(&livenessHandler{}).ServeHTTP(recorder, request)
+		expect recorder.Code == http.StatusOK
+		var body map[string]any
+		expect json.Unmarshal(recorder.Body.Bytes(), &body) == nil
+		expect body["status"] == "live"
+		reject body["postgres"] != nil
+		reject body["worker"] != nil
+		reject body["uptime"] != nil
+	}
+}
+
+unit "selected-worker readiness truth" {
+	given "a reachable database and ready embedded worker" {
+		code, body, _ := serveReadinessSpec(t, readinessSpecDatabase{}, func() ReadinessState {
+			return ReadinessState{Ready: true}
+		})
+
+		then "ready returns 200" {
+			expect code == http.StatusOK
+			expect body["status"] == "ready"
+		}
+	}
+
+	given "a reachable database and degraded-ready embedded worker" {
+		code, body, _ := serveReadinessSpec(t, readinessSpecDatabase{}, func() ReadinessState {
+			return ReadinessState{Ready: true, Degraded: true}
+		})
+
+		then "degradation stays ready with only a safe category" {
+			expect code == http.StatusOK
+			expect body["status"] == "degraded"
+			expect body["reason"] == readinessReasonWorkerDegraded
+		}
+	}
+
+	given "an unavailable database" {
+		code, body, raw := serveReadinessSpec(t, readinessSpecDatabase{err: errors.New("postgres://secret@host/database")}, func() ReadinessState {
+			return ReadinessState{Ready: true}
+		})
+
+		then "ready fails closed without leaking the database error" {
+			expect code == http.StatusServiceUnavailable
+			expect body["status"] == "unready"
+			expect body["reason"] == readinessReasonDatabaseUnavailable
+			reject strings.Contains(raw, "secret")
+			reject strings.Contains(raw, "host")
+		}
+	}
+
+	given "an unavailable selected worker" {
+		code, body, _ := serveReadinessSpec(t, readinessSpecDatabase{}, func() ReadinessState {
+			return ReadinessState{Ready: false}
+		})
+
+		then "ready returns non-200" {
+			expect code == http.StatusServiceUnavailable
+			expect body["status"] == "unready"
+			expect body["reason"] == readinessReasonWorkerUnavailable
+		}
+	}
+
+	given "missing readiness dependencies" {
+		code, body, _ := serveReadinessSpec(t, nil, nil)
+
+		then "ready fails closed" {
+			expect code == http.StatusServiceUnavailable
+			expect body["status"] == "unready"
+			expect body["reason"] == readinessReasonDatabaseUnavailable
+		}
+	}
+}
+
+unit "health route compatibility" {
+	given "a router without runtime dependencies" {
+		router := NewUnsafeRouterWithoutStreamAuth(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+
+		then "live remains 200 while ready and deprecated health fail closed" {
+			for _, testCase := range []struct {
+				path string
+				code int
+			}{
+				{path: "/live", code: http.StatusOK},
+				{path: "/ready", code: http.StatusServiceUnavailable},
+				{path: "/health", code: http.StatusServiceUnavailable},
+			} {
+				recorder := httptest.NewRecorder()
+				request := httptest.NewRequest(http.MethodGet, testCase.path, nil)
+				router.ServeHTTP(recorder, request)
+				expect recorder.Code == testCase.code
+			}
+		}
+	}
+}

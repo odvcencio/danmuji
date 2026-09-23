@@ -1,0 +1,336 @@
+package api_test
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/docker/go-connections/nat"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
+
+	"github.com/odvcencio/goetrope/pkg/api"
+	"github.com/odvcencio/goetrope/pkg/db"
+	"github.com/odvcencio/goetrope/pkg/decision"
+	"github.com/odvcencio/goetrope/pkg/ingest"
+	"github.com/odvcencio/goetrope/pkg/library"
+	"github.com/odvcencio/goetrope/pkg/requests"
+	"github.com/odvcencio/goetrope/pkg/theatre"
+	"github.com/odvcencio/goetrope/pkg/transcode"
+)
+
+integration "API handlers with real Postgres" {
+	before all {
+		ctx := context.Background()
+		pgReq := testcontainers.ContainerRequest{
+			Image:        "postgres:15",
+			ExposedPorts: []string{"5432/tcp"},
+			Env: map[string]string{
+				"POSTGRES_USER":     "test",
+				"POSTGRES_PASSWORD": "test",
+				"POSTGRES_DB":       "goetrope_test",
+			},
+			WaitingFor: wait.ForListeningPort(nat.Port("5432/tcp")),
+		}
+		pgContainer, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+			ContainerRequest: pgReq,
+			Started:          true,
+		})
+		if err != nil {
+			t.Fatalf("start postgres: %v", err)
+		}
+		t.Cleanup(func() { _ = pgContainer.Terminate(ctx) })
+
+		pgHost, err := pgContainer.Host(ctx)
+		if err != nil {
+			t.Fatalf("get host: %v", err)
+		}
+		pgPort, err := pgContainer.MappedPort(ctx, "5432/tcp")
+		if err != nil {
+			t.Fatalf("get port: %v", err)
+		}
+		connStr := fmt.Sprintf("postgres://test:test@%s:%s/goetrope_test?sslmode=disable", pgHost, pgPort.Port())
+		pool, err := pgxpool.New(ctx, connStr)
+		if err != nil {
+			t.Fatalf("connect: %v", err)
+		}
+		t.Cleanup(func() { pool.Close() })
+		if migErr := db.Migrate(ctx, pool); migErr != nil {
+			t.Fatalf("migrate: %v", migErr)
+		}
+
+		store := library.NewStore(pool)
+		policyDir, err := os.MkdirTemp("", "goetrope-api-policies-*")
+		if err != nil {
+			t.Fatalf("policy temp dir: %v", err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(policyDir) })
+		entries, err := os.ReadDir("../../policies")
+		if err != nil {
+			t.Fatalf("read policies: %v", err)
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || filepath.Ext(entry.Name()) != ".arb" {
+				continue
+			}
+			source, readErr := os.ReadFile(filepath.Join("../../policies", entry.Name()))
+			if readErr != nil {
+				t.Fatalf("read policy %s: %v", entry.Name(), readErr)
+			}
+			if writeErr := os.WriteFile(filepath.Join(policyDir, entry.Name()), source, 0o644); writeErr != nil {
+				t.Fatalf("write policy %s: %v", entry.Name(), writeErr)
+			}
+		}
+		engine, _ := decision.NewEngine(policyDir)
+		pipeline := ingest.NewPipeline(store, engine)
+		requestSvc := requests.NewService(pool)
+		pipeline.SetRequestMatcher(requestSvc)
+		theatreMgr := theatre.NewManager(pool, engine)
+		coord := transcode.NewCoordinator()
+		handler := api.NewUnsafeRouterWithoutStreamAuth(pool, store, nil, pipeline, theatreMgr, nil, nil, engine, nil, requestSvc, coord)
+
+		store.UpsertItem(ctx, &library.MediaItem{
+			Path: "/media/test-movie.mp4", Title: "Test Movie",
+			Year: 2024, DurationMs: 7200000, Container: "mp4",
+			Streams: []library.Stream{
+				{StreamIndex: 0, StreamType: "video", Codec: "h264", Width: 1920, Height: 1080, Bitrate: 5000000},
+				{StreamIndex: 1, StreamType: "audio", Codec: "aac", SampleRate: 48000, Channels: 2},
+			},
+		})
+		store.UpsertItem(ctx, &library.MediaItem{
+			Path: "/media/another-movie.mp4", Title: "Another Movie",
+			Year: 2023, DurationMs: 5400000, Container: "mp4",
+			Streams: []library.Stream{
+				{StreamIndex: 0, StreamType: "video", Codec: "h264", Width: 1280, Height: 720, Bitrate: 3000000},
+				{StreamIndex: 1, StreamType: "audio", Codec: "aac", SampleRate: 48000, Channels: 2},
+			},
+		})
+	}
+
+	given "the library has items" {
+		when "listing the library" {
+			rec := danmujiHTTP.Serve(handler, danmujiHTTP.GET("/api/library"))
+
+			then "returns items" {
+				expect rec.Code == 200
+				var body map[string]any
+				json.Unmarshal(rec.Body.Bytes(), &body)
+				items := body["items"].([]any)
+				expect len(items) >= 1
+			}
+		}
+
+		when "listing the library with a cursor" {
+			first := danmujiHTTP.Serve(handler, danmujiHTTP.GET("/api/library?limit=1"))
+			var firstBody map[string]any
+			json.Unmarshal(first.Body.Bytes(), &firstBody)
+			cursor, _ := firstBody["next_cursor"].(string)
+			second := danmujiHTTP.Serve(handler, danmujiHTTP.GET("/api/library?limit=1&cursor="+cursor))
+
+			then "returns the next bounded page" {
+				expect first.Code == 200
+				expect cursor != ""
+				expect second.Code == 200
+				var secondBody map[string]any
+				json.Unmarshal(second.Body.Bytes(), &secondBody)
+				firstItems := firstBody["items"].([]any)
+				items := secondBody["items"].([]any)
+				firstItem := firstItems[0].(map[string]any)
+				secondItem := items[0].(map[string]any)
+				expect len(items) == 1
+				expect firstItem["id"] != secondItem["id"]
+				expect firstItem["title"] == "Another Movie"
+				expect secondItem["title"] == "Test Movie"
+				expect secondBody["cursor"] == cursor
+			}
+		}
+
+		when "searching the library" {
+			rec := danmujiHTTP.Serve(handler, danmujiHTTP.GET("/api/library?q=Test+Movie"))
+
+			then "returns matching results" {
+				expect rec.Code == 200
+			}
+		}
+
+		when "listing watch history" {
+			historyReq := danmujiHTTP.POST("/api/library/1/history", map[string]any{
+				"position_ms": 240000,
+				"completed": false,
+			})
+			historyReq.Header.Set("Content-Type", "application/json")
+			_ = danmujiHTTP.Serve(handler, historyReq)
+			rec := danmujiHTTP.Serve(handler, danmujiHTTP.GET("/api/library/history"))
+
+			then "returns history items" {
+				expect rec.Code == 200
+				var body map[string]any
+				json.Unmarshal(rec.Body.Bytes(), &body)
+				items := body["items"].([]any)
+				expect len(items) >= 1
+			}
+		}
+
+		when "getting a nonexistent item" {
+			rec := danmujiHTTP.Serve(handler, danmujiHTTP.GET("/api/library/99999"))
+
+			then "returns 404" {
+				expect rec.Code == 404
+			}
+		}
+	}
+
+	given "the ingest pipeline" {
+		when "submitting a nonexistent file" {
+			rec := danmujiHTTP.Serve(handler, danmujiHTTP.POST("/api/ingest", map[string]string{"path": "/nonexistent/movie.mp4"}))
+
+			then "returns error" {
+				expect rec.Code >= 400
+			}
+		}
+
+		when "submitting with no path" {
+			rec := danmujiHTTP.Serve(handler, danmujiHTTP.POST("/api/ingest", map[string]string{}))
+
+			then "returns error" {
+				expect rec.Code >= 400
+			}
+		}
+	}
+
+	given "the request system" {
+		when "adding a request" {
+			rec := danmujiHTTP.Serve(handler, danmujiHTTP.POST("/api/requests", map[string]any{
+				"title": "The Matrix",
+				"requested_by": "discord-user",
+				"requested_by_id": "42",
+			}))
+
+			then "creates the request" {
+				expect rec.Code == 201
+			}
+		}
+
+		when "listing requests" {
+			_ = danmujiHTTP.Serve(handler, danmujiHTTP.POST("/api/requests", map[string]any{
+				"title": "Blade Runner",
+			}))
+			rec := danmujiHTTP.Serve(handler, danmujiHTTP.GET("/api/requests"))
+
+			then "returns pending requests" {
+				expect rec.Code == 200
+				var body map[string]any
+				json.Unmarshal(rec.Body.Bytes(), &body)
+				items := body["items"].([]any)
+				expect len(items) >= 1
+			}
+		}
+	}
+
+	given "the theatre manager" {
+		when "creating a public room" {
+			rec := danmujiHTTP.Serve(handler, danmujiHTTP.POST("/api/theatre/create", map[string]string{"access_mode": "public"}))
+
+			then "returns success with room code" {
+				expect rec.Code >= 200
+				expect rec.Code < 300
+				var body map[string]any
+				json.Unmarshal(rec.Body.Bytes(), &body)
+				code, ok := body["room_code"].(string)
+				expect ok
+				expect len(code) == 6
+			}
+		}
+
+		when "getting a nonexistent room" {
+			rec := danmujiHTTP.Serve(handler, danmujiHTTP.GET("/api/theatre/ZZZZZZ"))
+
+			then "returns 404" {
+				expect rec.Code == 404
+			}
+		}
+	}
+
+	given "the liveness endpoint" {
+		when "checking liveness" {
+			rec := danmujiHTTP.Serve(handler, danmujiHTTP.GET("/live"))
+
+			then "returns process-only status" {
+				expect rec.Code == 200
+				var body map[string]any
+				json.Unmarshal(rec.Body.Bytes(), &body)
+				expect body["status"] == "live"
+				reject body["postgres"] != nil
+			}
+		}
+	}
+
+	given "the streaming endpoints" {
+		when "requesting master playlist" {
+			rec := danmujiHTTP.Serve(handler, danmujiHTTP.GET("/stream/1/master.m3u8"))
+
+			then "returns HLS playlist" {
+				// May be 200 if item 1 exists, or 404 if ID doesn't match
+				expect rec.Code == 200 || rec.Code == 404
+			}
+		}
+
+		when "requesting nonexistent stream" {
+			rec := danmujiHTTP.Serve(handler, danmujiHTTP.GET("/stream/99999/master.m3u8"))
+
+			then "returns 404" {
+				expect rec.Code == 404
+			}
+		}
+
+		when "negotiating stream" {
+			rec := danmujiHTTP.Serve(handler, danmujiHTTP.POST("/api/stream/1/negotiate", map[string]any{"supports_hevc": false}))
+
+			then "returns action" {
+				// 200 if item exists, 404 otherwise
+				expect rec.Code == 200 || rec.Code == 404
+			}
+		}
+	}
+
+	given "the retired admin api surface" {
+		when "requesting legacy overview from loopback" {
+			req := danmujiHTTP.GET("/api/admin/overview")
+			req.RemoteAddr = "127.0.0.1:12345"
+			rec := danmujiHTTP.Serve(handler, req)
+
+			then "returns not found" {
+				expect rec.Code == 404
+			}
+		}
+
+		when "updating metadata through the retired admin route" {
+			req := danmujiHTTP.PUT("/api/admin/library/1/metadata", map[string]any{
+				"resolved_title": "Corrected Movie",
+			})
+			req.RemoteAddr = "127.0.0.1:12345"
+			rec := danmujiHTTP.Serve(handler, req)
+
+			then "returns not found" {
+				expect rec.Code == 404
+			}
+		}
+
+		when "saving policy through the retired admin route" {
+			req := danmujiHTTP.PUT("/api/admin/policies/stream", map[string]any{
+				"source": "rule Fallback priority 0 { when { true } then Allow { scope: \"public\", reason: \"noop\" } }",
+			})
+			req.RemoteAddr = "127.0.0.1:12345"
+			rec := danmujiHTTP.Serve(handler, req)
+
+			then "returns not found" {
+				expect rec.Code == 404
+			}
+		}
+	}
+}

@@ -1,0 +1,139 @@
+package theatre_test
+
+import (
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/odvcencio/goetrope/pkg/theatre"
+)
+
+var _ = fmt.Sprint
+
+
+unit "Playback sync lifecycle" {
+	given "a playback manager with an active room" {
+		mgr := theatre.NewPlaybackStateManager()
+		mgr.Set("sync-room", theatre.PlaybackState{Position: 10000.0, Playing: true})
+
+		when "starting a sync operation" {
+			ok := mgr.StartSync("sync-room", 10000.0)
+
+			then "sync starts" {
+				expect ok
+			}
+			then "is in syncing state" {
+				expect mgr.IsSyncing("sync-room")
+			}
+		}
+
+		when "starting sync then completing" {
+			mgr.StartSync("sync-room", 10000.0)
+			mgr.CompleteSync("sync-room", 10500.0)
+
+			then "no longer syncing" {
+				reject mgr.IsSyncing("sync-room")
+			}
+		}
+
+		when "starting sync then cancelling" {
+			mgr.StartSync("sync-room", 10000.0)
+			mgr.CancelSync("sync-room")
+
+			then "no longer syncing" {
+				reject mgr.IsSyncing("sync-room")
+			}
+		}
+
+		when "double starting sync" {
+			first := mgr.StartSync("sync-room", 10000.0)
+			second := mgr.StartSync("sync-room", 10000.0)
+
+			then "first succeeds" {
+				expect first
+			}
+			then "second fails" {
+				reject second
+			}
+		}
+	}
+}
+
+unit "Playback position computation" {
+	given "a playing state" {
+		mgr := theatre.NewPlaybackStateManager()
+		mgr.Set("playing-room", theatre.PlaybackState{Position: 5000.0, Playing: true})
+
+		when "computing position after brief delay" {
+			time.Sleep(50 * time.Millisecond)
+			pos := mgr.ComputePosition("playing-room")
+
+			then "position has advanced" {
+				expect pos >= 5000.0
+			}
+		}
+	}
+
+	given "a paused state" {
+		mgr := theatre.NewPlaybackStateManager()
+		mgr.Set("paused-room", theatre.PlaybackState{Position: 30000.0, Playing: false})
+
+		when "computing position after delay" {
+			time.Sleep(50 * time.Millisecond)
+			pos := mgr.ComputePosition("paused-room")
+
+			then "position has not advanced" {
+				expect pos == 30000.0
+			}
+		}
+	}
+}
+
+unit "Playback state with multiple rooms" {
+	given "multiple rooms with different states" {
+		mgr := theatre.NewPlaybackStateManager()
+		mgr.Set("room-A", theatre.PlaybackState{Position: 1000.0, Playing: true})
+		mgr.Set("room-B", theatre.PlaybackState{Position: 50000.0, Playing: false})
+		mgr.Set("room-C", theatre.PlaybackState{Position: 0.0, Playing: true})
+
+		then "each room is independent" {
+			sA, okA := mgr.Get("room-A")
+			sB, okB := mgr.Get("room-B")
+			sC, okC := mgr.Get("room-C")
+			expect okA
+			expect okB
+			expect okC
+			expect sA.Playing
+			reject sB.Playing
+			expect sC.Playing
+			expect sA.Position == 1000.0
+			expect sB.Position == 50000.0
+			expect sC.Position == 0.0
+		}
+	}
+}
+
+unit "RateLimiter window behavior" {
+	given "a limiter with 3 messages per 100ms" {
+		limiter := theatre.NewRateLimiter(3, 100*time.Millisecond)
+
+		when "messages arrive in bursts" {
+			// First burst: 3 allowed
+			expect limiter.Check()
+			expect limiter.Check()
+			expect limiter.Check()
+			reject limiter.Check()
+
+			// Wait for window to expire
+			time.Sleep(110 * time.Millisecond)
+
+			// Second burst: 3 more allowed
+			then "window resets" {
+				expect limiter.Check()
+				expect limiter.Check()
+				expect limiter.Check()
+				reject limiter.Check()
+			}
+		}
+	}
+}

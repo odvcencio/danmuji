@@ -408,6 +408,159 @@ func FormatParseError(source []byte, root *gotreesitter.Node, lang *gotreesitter
 	return strings.Join(parts, "\n\n")
 }
 
+// coverageCheckedContainers lists the node types worth checking for gaps
+// between their own children. gotreesitter routinely matches a literal or
+// pattern token as part of a parent rule's span without giving it a
+// dedicated child node — e.g. `handler_directive`'s own `:=`, or `tag`'s
+// identifier half of `@skip`. That is harmless PROVIDED the node is
+// eventually emitted through emitDefault's gap-preserving fallback (it
+// copies `source[prevChildEnd:nextChildStart]` verbatim — see
+// transpile_core.go), which is what happens to every node type that has no
+// case in emit()'s switch.
+//
+// It stops being harmless for the node types that DO have a hand-written
+// case in that switch: their emitters reconstruct output from specific
+// named fields (childByField, walkChildren) and never fall back to a raw
+// byte-copy for whatever falls between them. If gotreesitter drops a whole
+// `expect` statement and the next `then` header into an unlabeled gap
+// between, say, then_block's "description" and "body" fields (the V3
+// defect), that text is gone for good in the emitted output. This set is
+// exactly transpile_core.go emit()'s switch cases that do real,
+// selective reconstruction (not a text/"" passthrough), plus
+// source_file/statement_list, whose own hand-written traversal
+// (collectTopLevel's second pass, emitBlockInner) walks named children one
+// by one and would silently skip a vanished sibling.
+var coverageCheckedContainers = map[string]bool{
+	"source_file":          true,
+	"statement_list":       true,
+	"test_block":           true,
+	"given_block":          true,
+	"when_block":           true,
+	"then_block":           true,
+	"expect_statement":     true,
+	"reject_statement":     true,
+	"build_expression":     true,
+	"lifecycle_hook":       true,
+	"verify_statement":     true,
+	"needs_block":          true,
+	"load_block":           true,
+	"benchmark_block":      true,
+	"exec_block":           true,
+	"profile_block":        true,
+	"spy_declaration":      true,
+	"snapshot_block":       true,
+	"eventually_block":     true,
+	"consistently_block":   true,
+	"await_statement":      true,
+	"property_block":       true,
+	"fuzz_block":           true,
+	"each_do_block":        true,
+	"matrix_block":         true,
+	"table_declaration":    true,
+	"each_row_block":       true,
+	"no_leaks_directive":   true,
+	"fake_clock_directive": true,
+	"process_block":        true,
+	"stop_block":           true,
+}
+
+// CheckTreeCoversSource walks the parse tree and verifies that no two
+// sibling statements/declarations (see coverageCheckedContainers) have a
+// gap between them that contains non-whitespace source text. A gap like
+// that means the parser silently dropped one or more whole statements
+// while still reporting a clean parse (root.HasError() == false).
+//
+// This is the defense behind the "delete one brace" defect: an unbalanced
+// `{`/`}` pair can make gotreesitter's error recovery quietly re-sync a
+// few tokens later, consuming an entire `expect` statement and the next
+// `then` header without ever emitting an ERROR or MISSING node. `danmuji
+// build` used to exit 0 and the resulting `go test` passed anyway. Call
+// this immediately after confirming root.HasError() == false; a caller
+// must never treat a clean HasError() as proof the whole file was parsed.
+func CheckTreeCoversSource(source []byte, root *gotreesitter.Node, lang *gotreesitter.Language, sourceFile string) error {
+	var gapStart, gapEnd uint32
+	foundGap := false
+
+	var walk func(n *gotreesitter.Node)
+	walk = func(n *gotreesitter.Node) {
+		cc := int(n.ChildCount())
+		if cc == 0 {
+			return
+		}
+		checkGaps := coverageCheckedContainers[n.Type(lang)]
+		prevEnd := n.StartByte()
+		for i := 0; i < cc; i++ {
+			if foundGap {
+				return
+			}
+			c := n.Child(i)
+			if checkGaps && c.StartByte() > prevEnd && strings.TrimSpace(string(source[prevEnd:c.StartByte()])) != "" {
+				gapStart, gapEnd = prevEnd, c.StartByte()
+				foundGap = true
+				return
+			}
+			walk(c)
+			if foundGap {
+				return
+			}
+			if c.EndByte() > prevEnd {
+				prevEnd = c.EndByte()
+			}
+		}
+	}
+	walk(root)
+
+	// The one place a trailing gap IS checked regardless of container type:
+	// the very end of the file, after the root's last top-level child. A
+	// source_file has no parent to reattach dropped content to, so a real
+	// end-of-file drop would otherwise go unnoticed.
+	if !foundGap {
+		tailStart := uint32(0)
+		if cc := int(root.ChildCount()); cc > 0 {
+			if last := root.Child(cc - 1); last.EndByte() > tailStart {
+				tailStart = last.EndByte()
+			}
+		}
+		if tailStart < uint32(len(source)) && strings.TrimSpace(string(source[tailStart:])) != "" {
+			gapStart, gapEnd = tailStart, uint32(len(source))
+			foundGap = true
+		}
+	}
+
+	if !foundGap {
+		return nil
+	}
+
+	// Trim leading whitespace from the gap so the caret lands on the first
+	// dropped byte, not on a blank line before it.
+	trimmedStart := gapStart
+	for trimmedStart < gapEnd && isDanmujiSpaceByte(source[trimmedStart]) {
+		trimmedStart++
+	}
+
+	row, col := byteOffsetToPoint(source, int(trimmedStart))
+	previewEnd := gapEnd
+	if previewEnd-trimmedStart > 60 {
+		previewEnd = trimmedStart + 60
+	}
+	preview := strings.TrimSpace(string(source[trimmedStart:previewEnd]))
+	endCol := col + len(preview)
+	sourceContext := formatSourceLine(source, row, col, endCol)
+
+	message := fmt.Sprintf("parser silently dropped source text (parsed clean, but %q was never attached to the tree)", preview)
+	return fmt.Errorf("%s", formatError(sourceFile, row, col, message, sourceContext,
+		"this usually means an unbalanced { or } earlier in the file; check brace pairing"))
+}
+
+func isDanmujiSpaceByte(b byte) bool {
+	switch b {
+	case ' ', '\t', '\n', '\r', '\v', '\f':
+		return true
+	default:
+		return false
+	}
+}
+
 // formatSingleError formats one ERROR or MISSING node into a human-readable
 // diagnostic using three layers of message resolution:
 //   - Layer 2: hand-written overlay table keyed by parent type + prefix signature

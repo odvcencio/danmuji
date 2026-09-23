@@ -1,0 +1,354 @@
+package gosxwatch
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/library"
+	"github.com/odvcencio/goetrope/pkg/randomchannel"
+)
+
+unit "viewer player position" {
+	given "an actively playing channel" {
+		when "the canonical clock has delay headroom" {
+			position := viewerPlayerPosition(100, true, 8)
+			then "starts the player behind the canonical clock" {
+				expect position == 92
+			}
+		}
+		when "the canonical clock is inside the delay cushion" {
+			position := viewerPlayerPosition(5, true, 8)
+			then "floors the player start at zero" {
+				expect position == 0
+			}
+		}
+	}
+	given "a paused channel" {
+		when "the page is rendered with a configured delay" {
+			position := viewerPlayerPosition(100, false, 8)
+			then "leaves the player at the canonical clock" {
+				expect position == 100
+			}
+		}
+	}
+}
+
+unit "watch playback position bounds" {
+	given "a channel clock past the current item duration" {
+		position := boundedPlaybackPosition(558.003, 8000)
+		then "keeps the rendered clock and stream offset inside the playable media" {
+			expect position == 7
+			expect formatClock(position) == "00:07"
+			expect playbackProgressPercent(position, 8000) == 88
+		}
+	}
+	given "a negative channel clock" {
+		position := boundedPlaybackPosition(-3, 8000)
+		then "floors the rendered clock at zero" {
+			expect position == 0
+			expect formatClock(position) == "00:00"
+		}
+	}
+}
+
+unit "channel player suppression" {
+	given "an intermission summary" {
+		when "the previous playlist entry is still current" {
+			summary := &randomchannel.Summary{
+				Intermission:    randomchannel.Intermission{Active: true},
+				CurrentPosition: 120,
+			}
+			entry := &randomchannel.PlaylistEntry{DurationMS: 120000}
+			then "keeps the video engine mounted for the no reload handoff" {
+				reject suppressChannelPlayer(summary, entry)
+			}
+		}
+	}
+	given "an off hours summary" {
+		when "the channel is intentionally idle" {
+			summary := &randomchannel.Summary{NetworkIdle: true}
+			entry := &randomchannel.PlaylistEntry{DurationMS: 120000}
+			then "does not render the video engine" {
+				expect suppressChannelPlayer(summary, entry)
+			}
+		}
+	}
+	given "a paused summary at the item tail" {
+		when "the canonical position is within the tail tolerance" {
+			summary := &randomchannel.Summary{CurrentPosition: 119.9}
+			entry := &randomchannel.PlaylistEntry{DurationMS: 120000}
+			then "does not reload the last frames of the item" {
+				expect suppressChannelPlayer(summary, entry)
+			}
+		}
+	}
+	given "a paused summary in the middle of an item" {
+		when "the canonical position is not near the tail" {
+			summary := &randomchannel.Summary{CurrentPosition: 30}
+			entry := &randomchannel.PlaylistEntry{DurationMS: 120000}
+			then "keeps the player available" {
+				reject suppressChannelPlayer(summary, entry)
+			}
+		}
+	}
+	given "a playing summary near the item tail" {
+		when "the channel is still actively playing" {
+			summary := &randomchannel.Summary{Playing: true, CurrentPosition: 119.9}
+			entry := &randomchannel.PlaylistEntry{DurationMS: 120000}
+			then "keeps the player available for normal playback" {
+				reject suppressChannelPlayer(summary, entry)
+			}
+		}
+	}
+}
+
+unit "watch player HLS runtime config" {
+	given "a GoSX video player snapshot" {
+		item := &library.MediaItem{ID: 42}
+		snapshot := videoPlayerSnapshot(item, "CHAN01", "", 0, 0)
+		hls, ok := snapshot["hls"].(map[string]any)
+
+		then "uses explicit duration live sync instead of count-based low latency sync" {
+			expect ok
+			expect hls["lowLatencyMode"] == false
+			expect hls["liveSyncDuration"] == 1
+			expect hls["liveMaxLatencyDuration"] == 30
+			_, hasLiveSyncCount := hls["liveSyncDurationCount"]
+			_, hasLiveMaxLatencyCount := hls["liveMaxLatencyDurationCount"]
+			reject hasLiveSyncCount
+			reject hasLiveMaxLatencyCount
+		}
+	}
+}
+
+unit "watch player explicit audio tracks" {
+	given "a media item with alternate audio" {
+		item := &library.MediaItem{
+			ID: 42,
+			Streams: []library.Stream{
+				{StreamType: "audio", StreamIndex: 1, Codec: "aac", Language: "eng", Channels: 2},
+				{StreamType: "audio", StreamIndex: 3, Codec: "aac", Language: "jpn", Channels: 6, IsDefault: true},
+			},
+		}
+		snapshot := videoPlayerSnapshot(item, "CHAN01", "", 12.5, 0)
+		tracks, ok := snapshot["audio_tracks"].([]map[string]any)
+		src, _ := snapshot["src"].(string)
+
+		then "keeps default audio implicit while exposing alternate tracks" {
+			expect ok
+			expect len(tracks) == 2
+			expect snapshot["audio_track"] == "3"
+			expect tracks[0]["id"] == "3"
+			expect tracks[0]["selected"] == true
+			expect strings.Contains(strField(tracks[0], "label"), "default")
+			reject strings.Contains(src, "audio=")
+		}
+	}
+}
+
+unit "watch player external subtitle tracks" {
+	given "a media item with renderable subtitles" {
+		item := &library.MediaItem{
+			ID: 42,
+			Streams: []library.Stream{
+				{StreamType: "subtitle", StreamIndex: 5, Codec: "subrip", CodecTag: "subrip", Language: "eng"},
+			},
+		}
+		tracks := videoSubtitleTracks(item)
+
+		then "emits browser-visible subtitle tracks while the engine owns cue painting" {
+			expect len(tracks) == 1
+			expect tracks[0]["kind"] == "subtitles"
+			expect tracks[0]["src"] == "/stream/42/subtitles/5.vtt"
+			expect tracks[0]["default"] == false
+			expect tracks[0]["selected"] == false
+		}
+	}
+
+	given "a media item with bitmap subtitles" {
+		item := &library.MediaItem{
+			ID: 42,
+			Streams: []library.Stream{
+				{StreamType: "subtitle", StreamIndex: 8, Codec: "hdmv_pgs_subtitle", CodecTag: "pgs", Language: "jpn", IsDefault: true},
+			},
+		}
+		tracks := videoSubtitleTracks(item)
+
+		then "requests image WebVTT so the runtime can paint bitmap cues without waiting on OCR text" {
+			expect len(tracks) == 1
+			expect tracks[0]["bitmap"] == true
+			expect tracks[0]["src"] == "/stream/42/subtitles/8.vtt?format=image"
+			expect strings.Contains(strField(tracks[0], "label"), "bitmap")
+			expect tracks[0]["selected"] == false
+		}
+	}
+
+	given "a media item with both text and bitmap subtitles" {
+		item := &library.MediaItem{
+			ID: 42,
+			Streams: []library.Stream{
+				{StreamType: "subtitle", StreamIndex: 2, Codec: "hdmv_pgs_subtitle", CodecTag: "pgs", Language: "eng", IsDefault: true},
+				{StreamType: "subtitle", StreamIndex: 3, Codec: "subrip", CodecTag: "subrip", Language: "eng"},
+				{StreamType: "subtitle", StreamIndex: 4, CodecTag: "sidecar:srt", Language: "eng"},
+			},
+		}
+		tracks := videoSubtitleTracks(item)
+
+		then "hides bitmap options once text tracks can satisfy the selector" {
+			expect len(tracks) == 2
+			expect tracks[0]["id"] == "3"
+			expect tracks[1]["id"] == "4"
+			reject boolField(tracks[0], "bitmap")
+			reject boolField(tracks[1], "bitmap")
+		}
+	}
+
+	given "a live playlist rendered after the first low-latency window" {
+		item := &library.MediaItem{
+			ID: 42,
+			Streams: []library.Stream{
+				{StreamType: "subtitle", StreamIndex: 5, Codec: "subrip", CodecTag: "subrip", Language: "eng"},
+			},
+		}
+		tracks := videoSubtitleTracks(item)
+
+		then "keeps external subtitle timecodes canonical so the runtime can sync to server time" {
+			expect len(tracks) == 1
+			expect tracks[0]["src"] == "/stream/42/subtitles/5.vtt"
+		}
+	}
+
+	given "a media item with a sidecar subtitle track" {
+		item := &library.MediaItem{
+			ID: 42,
+			Streams: []library.Stream{
+				{StreamType: "subtitle", StreamIndex: 9, CodecTag: "sidecar:srt", Language: "eng"},
+			},
+		}
+		tracks := videoSubtitleTracks(item)
+
+		then "keeps the subtitle option visible through the shared subtitle capability helper" {
+			expect len(tracks) == 1
+			expect tracks[0]["src"] == "/stream/42/subtitles/9.vtt"
+			reject boolField(tracks[0], "bitmap")
+		}
+	}
+}
+
+unit "multi-channel watch snapshot" {
+	given "a registry with movie and show channels" {
+		setConfig(Config{
+			BasePath: DefaultBasePath,
+			Channels: stubChannelSummaryRegistry{byAlias: map[string]*randomchannel.Summary{
+				"1": {
+					Alias:      randomchannel.DefaultMovieAlias,
+					Name:       randomchannel.DefaultMovieChannelName,
+					RoomCode:   randomchannel.DefaultMovieRoomCode,
+					AccessMode: "public",
+				},
+				"2": {
+					Alias:      randomchannel.DefaultShowAlias,
+					Name:       randomchannel.DefaultShowChannelName,
+					RoomCode:   randomchannel.DefaultShowRoomCode,
+					AccessMode: "public",
+					Program: randomchannel.ProgramSummary{
+						ID:           "twin-peaks-marathon",
+						Name:         "Twin Peaks Marathon",
+						Kind:         randomchannel.ProgramKindSeriesMarathon,
+						ContentKind:  randomchannel.ContentKindShows,
+						SeriesID:     9,
+						SeriesTitle:  "Twin Peaks",
+						SubtitleMode: "required",
+					},
+					Theme: randomchannel.ThemeSummary{
+						ID:          "black-lodge",
+						Name:        "Black Lodge",
+						CSSClass:    "theme-black-lodge unsafe<script>",
+						AccentColor: "#b91c1c",
+					},
+					Playlist: []randomchannel.PlaylistEntry{
+						{MediaItemID: 77, DisplayTitle: "Pilot", DurationMS: 1800000},
+					},
+				},
+			}},
+		})
+		defer setConfig(Config{BasePath: DefaultBasePath})
+		req := httptest.NewRequest(http.MethodGet, DefaultBasePath+"/watch/2", nil)
+		req = req.WithContext(context.WithValue(req.Context(), requestBasePathKey{}, DefaultBasePath))
+		snapshot := roomSnapshot(context.Background(), req, "2")
+		room := mapField(snapshot, "room")
+		player := mapField(snapshot, "player")
+		program := mapField(snapshot, "program")
+
+		then "uses the selected channel identity for API and room links" {
+			expect strField(room, "title") == "Random Shows"
+			expect strField(room, "code") == "SHOW01"
+			expect strField(room, "api_href") == DefaultBasePath+"/api/channel/2"
+			expect strField(room, "watch_href") == DefaultBasePath+"/watch/2"
+			expect strField(player, "primary_href") == DefaultBasePath+"/party/SHOW01"
+		}
+
+		then "exposes sanitized programming and theme metadata" {
+			expect strField(program, "id") == "twin-peaks-marathon"
+			expect strField(program, "kind") == "series_marathon"
+			expect strField(program, "label") == "Twin Peaks Marathon · Twin Peaks"
+			expect strField(program, "theme_class") == "theme-black-lodge"
+			expect strField(program, "theme_style") == "--channel-accent: #b91c1c"
+			reject strings.Contains(strField(program, "theme_class"), "<script>")
+		}
+	}
+
+	given "an unknown watch alias" {
+		setConfig(Config{
+			BasePath: DefaultBasePath,
+			Channels: stubChannelSummaryRegistry{byAlias: map[string]*randomchannel.Summary{
+				"1": {Alias: randomchannel.DefaultMovieAlias, Name: randomchannel.DefaultMovieChannelName, RoomCode: randomchannel.DefaultMovieRoomCode},
+			}},
+		})
+		defer setConfig(Config{BasePath: DefaultBasePath})
+		req := httptest.NewRequest(http.MethodGet, DefaultBasePath+"/watch/404", nil)
+		req = req.WithContext(context.WithValue(req.Context(), requestBasePathKey{}, DefaultBasePath))
+		snapshot := roomSnapshot(context.Background(), req, "404")
+		room := mapField(snapshot, "room")
+		player := mapField(snapshot, "player")
+
+		then "does not silently fall back to the movie channel" {
+			expect strField(room, "title") == "Channel not found"
+			expect strField(room, "api_href") == DefaultBasePath+"/api/channel/404"
+			reject strings.Contains(strField(player, "tertiary_href"), "/api/channel/1")
+		}
+	}
+
+	given "a known watch alias with an empty playlist" {
+		setConfig(Config{
+			BasePath: DefaultBasePath,
+			Channels: stubChannelSummaryRegistry{byAlias: map[string]*randomchannel.Summary{
+				"2": {
+					Alias:      randomchannel.DefaultShowAlias,
+					Name:       randomchannel.DefaultShowChannelName,
+					RoomCode:   randomchannel.DefaultShowRoomCode,
+					AccessMode: "public",
+					Playing:    true,
+				},
+			}},
+		})
+		defer setConfig(Config{BasePath: DefaultBasePath})
+		req := httptest.NewRequest(http.MethodGet, DefaultBasePath+"/watch/2", nil)
+		req = req.WithContext(context.WithValue(req.Context(), requestBasePathKey{}, DefaultBasePath))
+		snapshot := roomSnapshot(context.Background(), req, "2")
+		room := mapField(snapshot, "room")
+		current := mapField(snapshot, "current_item")
+		player := mapField(snapshot, "player")
+
+		then "renders a waiting player state instead of panicking" {
+			expect strField(room, "title") == "Random Shows"
+			expect current["media_item_id"] == int64(0)
+			expect strField(current, "display_title") == "Waiting for queue state"
+			reject boolField(player, "playable")
+			reject boolField(player, "has_subtitles")
+		}
+	}
+}

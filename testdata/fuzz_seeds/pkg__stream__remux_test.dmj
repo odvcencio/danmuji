@@ -1,0 +1,136 @@
+package stream_test
+
+import (
+	"bytes"
+	"os"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/stream"
+)
+
+unit "ADTS header" {
+	given "standard AAC-LC at 44100 Hz stereo" {
+		hdr := stream.ADTSHeader(100, stream.AACObjectTypeLC, 4, 2)
+
+		then "is exactly 7 bytes" {
+			expect len(hdr) == 7
+		}
+		then "starts with syncword 0xFFF" {
+			expect hdr[0] == byte(0xFF)
+			expect hdr[1]&0xF0 == byte(0xF0)
+		}
+		then "frame length encodes correctly" {
+			frameLenHigh := int(hdr[3]&0x03) << 11
+			frameLenMid := int(hdr[4]) << 3
+			frameLenLow := int(hdr[5]>>5) & 0x07
+			frameLen := frameLenHigh | frameLenMid | frameLenLow
+			expect frameLen == 107
+		}
+	}
+
+	each "sample rate" {
+		defaults { rate: 44100, expectedIdx: 4 }
+		{ name: "96000",  rate: 96000,  expectedIdx: 0 }
+		{ name: "48000",  rate: 48000,  expectedIdx: 3 }
+		{ name: "44100",  rate: 44100,  expectedIdx: 4 }
+		{ name: "22050",  rate: 22050,  expectedIdx: 7 }
+		{ name: "8000",   rate: 8000,   expectedIdx: 11 }
+		{ name: "unknown", rate: 12345, expectedIdx: 4 }
+	} do {
+		then "SampleRateIndex returns correct index" {
+			expect stream.SampleRateIndex(scenario.rate.(int)) == scenario.expectedIdx.(int)
+		}
+	}
+}
+
+unit "WriteSegment error handling" {
+	given "a nonexistent file" {
+		var buf bytes.Buffer
+		err := stream.WriteSegment(&buf, "/nonexistent/file.mp4", 0, 4.0)
+
+		then "returns an error" {
+			expect err != nil
+		}
+		then "writes nothing" {
+			expect buf.Len() == 0
+		}
+	}
+
+	given "an empty file" {
+		tmp, createErr := os.CreateTemp("", "empty-*.mp4")
+		expect createErr == nil
+		tmpPath := tmp.Name()
+		tmp.Close()
+		defer os.Remove(tmpPath)
+
+		var buf bytes.Buffer
+		writeErr := stream.WriteSegment(&buf, tmpPath, 0, 4.0)
+
+		then "returns an error about missing moov" {
+			expect writeErr != nil
+		}
+	}
+
+	given "a negative segment index" {
+		var buf bytes.Buffer
+		err := stream.WriteSegment(&buf, "/dev/null", -1, 4.0)
+
+		then "returns an error" {
+			expect err != nil
+		}
+	}
+}
+
+unit "CalculateSegments" {
+	each "duration scenario" {
+		defaults { durationMs: int64(0), segDur: 4.0, expected: 1 }
+		{ name: "zero duration",     durationMs: int64(0),      segDur: 4.0,  expected: 1 }
+		{ name: "exactly 4 seconds", durationMs: int64(4000),   segDur: 4.0,  expected: 1 }
+		{ name: "4.001 seconds",     durationMs: int64(4001),   segDur: 4.0,  expected: 2 }
+		{ name: "120 seconds",       durationMs: int64(120000), segDur: 4.0,  expected: 30 }
+		{ name: "1 second",          durationMs: int64(1000),   segDur: 4.0,  expected: 1 }
+	} do {
+		then "segment count is correct" {
+			expect stream.CalculateSegments(scenario.durationMs.(int64), scenario.segDur.(float64)) == scenario.expected.(int)
+		}
+	}
+}
+
+unit "TS packet integrity for real segment output" {
+	given "a synthetic video payload written as TS" {
+		var buf bytes.Buffer
+		tw := stream.NewTSWriter(&buf)
+		_ = tw.WritePAT()
+		_ = tw.WritePMT("h264", false)
+
+		sizes := []int{1, 50, 100, 150, 183, 184, 200, 500, 1000}
+		for _, sz := range sizes {
+			payload := make([]byte, sz)
+			_ = tw.WriteVideoPacket(payload, 90000, sz == 1)
+		}
+
+		then "all output is aligned to 188-byte boundaries" {
+			expect buf.Len() % 188 == 0
+		}
+		then "every packet has sync byte 0x47" {
+			data := buf.Bytes()
+			packetCount := len(data) / 188
+			for i := 0; i < packetCount; i++ {
+				offset := i * 188
+				expect data[offset] == 0x47
+			}
+		}
+		then "no adaptation field length overflow" {
+			data := buf.Bytes()
+			packetCount := len(data) / 188
+			for i := 0; i < packetCount; i++ {
+				offset := i * 188
+				afc := (data[offset+3] >> 4) & 0x03
+				if afc == 2 || afc == 3 {
+					afLen := int(data[offset+4])
+					expect afLen + 5 <= 188
+				}
+			}
+		}
+	}
+}

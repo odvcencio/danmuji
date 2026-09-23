@@ -1,0 +1,131 @@
+package api
+
+import (
+	"context"
+	"net/url"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/randomchannel"
+)
+
+type recoveryScopeChannelAdmin struct {
+	summary *randomchannel.Summary
+}
+
+func (s recoveryScopeChannelAdmin) Summary(context.Context) (*randomchannel.Summary, error) {
+	return s.summary, nil
+}
+
+func (s recoveryScopeChannelAdmin) AdvanceNext(context.Context) error { return nil }
+func (s recoveryScopeChannelAdmin) ForceReroll(context.Context) error { return nil }
+func (s recoveryScopeChannelAdmin) SetActiveTranscodeGroup(string)     {}
+
+type recoveryScopeChannelRegistry struct {
+	summaries []*randomchannel.Summary
+}
+
+func (s recoveryScopeChannelRegistry) Summaries(context.Context) ([]*randomchannel.Summary, error) {
+	return s.summaries, nil
+}
+
+func (s recoveryScopeChannelRegistry) Summary(_ context.Context, alias string) (*randomchannel.Summary, bool, error) {
+	for _, summary := range s.summaries {
+		if summary != nil && summary.Alias == alias {
+			return summary, true, nil
+		}
+	}
+	return nil, false, nil
+}
+
+func recoveryScopeTargetPath(handler *streamHandler) string {
+	location := recoveryScopeTargetLocation(handler)
+	if location == nil {
+		return ""
+	}
+	return location.Path
+}
+
+func recoveryScopeTargetPosition(handler *streamHandler) string {
+	location := recoveryScopeTargetLocation(handler)
+	if location == nil {
+		return ""
+	}
+	return location.Query().Get("position")
+}
+
+func recoveryScopeTargetLocation(handler *streamHandler) *url.URL {
+	generatedURL, ok := handler.generatedMediaRecoveryURL(context.Background(), nil)
+	if !ok {
+		return nil
+	}
+	location, err := url.Parse(generatedURL)
+	if err != nil {
+		return nil
+	}
+	return location
+}
+
+unit "Generated-media recovery channel scope" {
+	then "the legacy movie admin remains the recovery target with a show-first registry" {
+		showSummary := &randomchannel.Summary{
+			Alias:            randomchannel.DefaultShowAlias,
+			CurrentItemIndex: 0,
+			CurrentPosition:  90,
+			Playing:          true,
+			Playlist: []randomchannel.PlaylistEntry{
+				{MediaItemID: 7},
+			},
+		}
+		movieSummary := &randomchannel.Summary{
+			Alias:            randomchannel.DefaultMovieAlias,
+			CurrentItemIndex: 0,
+			CurrentPosition:  15,
+			Playing:          true,
+			Playlist: []randomchannel.PlaylistEntry{
+				{MediaItemID: 42},
+			},
+		}
+		handler := &streamHandler{
+			channelAdmin: recoveryScopeChannelAdmin{summary: movieSummary},
+			channelRegistry: recoveryScopeChannelRegistry{
+				summaries: []*randomchannel.Summary{showSummary, movieSummary},
+			},
+		}
+		targetPath := recoveryScopeTargetPath(handler)
+		targetPosition := recoveryScopeTargetPosition(handler)
+
+		expect targetPath == "/stream/42/master.m3u8"
+		expect targetPosition == "15.000"
+	}
+
+	then "registry-only recovery falls back to the first current channel" {
+		showSummary := &randomchannel.Summary{
+			Alias:            randomchannel.DefaultShowAlias,
+			CurrentItemIndex: 0,
+			CurrentPosition:  90,
+			Playing:          true,
+			Playlist: []randomchannel.PlaylistEntry{
+				{MediaItemID: 7},
+			},
+		}
+		movieSummary := &randomchannel.Summary{
+			Alias:            randomchannel.DefaultMovieAlias,
+			CurrentItemIndex: 0,
+			CurrentPosition:  15,
+			Playing:          true,
+			Playlist: []randomchannel.PlaylistEntry{
+				{MediaItemID: 42},
+			},
+		}
+		handler := &streamHandler{
+			channelRegistry: recoveryScopeChannelRegistry{
+				summaries: []*randomchannel.Summary{showSummary, movieSummary},
+			},
+		}
+		targetPath := recoveryScopeTargetPath(handler)
+		targetPosition := recoveryScopeTargetPosition(handler)
+
+		expect targetPath == "/stream/7/master.m3u8"
+		expect targetPosition == "90.000"
+	}
+}

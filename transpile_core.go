@@ -5,7 +5,9 @@ package danmuji
 import (
 	"fmt"
 	gotreesitter "github.com/odvcencio/gotreesitter"
+	"go/format"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -58,6 +60,14 @@ func TranspileDanmuji(source []byte, opts TranspileOptions) (string, error) {
 	if root.HasError() {
 		return "", fmt.Errorf("%s", FormatParseError(source, root, lang, opts.SourceFile, danmujiExpectationsCached))
 	}
+	// A clean HasError() is not proof the whole file made it into the tree:
+	// some inputs (an unbalanced brace, for example) make the parser
+	// silently resync a few tokens later, dropping everything in between
+	// with no ERROR/MISSING node to show for it. Verify byte coverage
+	// explicitly rather than trusting HasError() alone.
+	if err := CheckTreeCoversSource(source, root, lang, opts.SourceFile); err != nil {
+		return "", err
+	}
 
 	tr := &dmjTranspiler{
 		src:                      source,
@@ -77,13 +87,31 @@ func TranspileDanmuji(source []byte, opts TranspileOptions) (string, error) {
 	}
 	// Second pass: emit the code
 	output := tr.emit(root)
+	if err := tr.semanticError(); err != nil {
+		return "", err
+	}
 	output = tr.injectBuildConstraints(output)
 
 	// Inject all collected imports
 	output = tr.injectImports(output)
 
-	// Replace DMJLINE placeholders with real //line directives (must happen
-	// after injectImports so go/format doesn't reposition them).
+	// Run the output through go/format before real //line directives exist
+	// in it. At this point every DMJLINE marker is still an ordinary block
+	// comment (see lineDirective's doc comment), so gofmt is free to
+	// reindent/reflow the file however it likes — including that comment —
+	// without breaking anything. Doing this here, rather than never (the
+	// previous behavior), is what makes danmuji's own generated _test.go
+	// files gofmt-clean.
+	formatted, fmtErr := format.Source([]byte(output))
+	if fmtErr != nil {
+		return "", fmt.Errorf("generated invalid Go source (this is a danmuji bug, not a problem with your .dmj file): %w\n\n%s", fmtErr, output)
+	}
+	output = string(formatted)
+
+	// Replace DMJLINE placeholders with real //line directives now that
+	// formatting is done, so nothing downstream can reindent them away
+	// from column 1 — the Go toolchain only honors a //line directive
+	// that starts at the beginning of its line.
 	if tr.emitLineDirectives {
 		output = resolveLineDirectives(output)
 	}
@@ -213,9 +241,16 @@ func (t *dmjTranspiler) lineDirective(n *gotreesitter.Node) string {
 }
 
 // resolveLineDirectives replaces all DMJLINE placeholder markers with real
-// //line directives. Called after injectImports so go/format cannot reposition them.
+// //line directives. Called after gofmt formatting so nothing downstream
+// can reindent the result: the Go toolchain only honors a //line directive
+// that starts at column 1 of its line (an indented "//line foo:N" is
+// silently ignored, and failures report the generated file's own location
+// instead). The regex anchors on ^ and consumes any leading horizontal
+// whitespace along with the marker so the replacement always lands at the
+// true start of the line, regardless of how deeply the marker itself was
+// indented by the emitter or by gofmt.
 func resolveLineDirectives(code string) string {
-	re := regexp.MustCompile(`/\*DMJLINE ([^*]+)\*/`)
+	re := regexp.MustCompile(`(?m)^[ \t]*/\*DMJLINE ([^*]+)\*/`)
 	return re.ReplaceAllString(code, "//line $1")
 }
 
@@ -247,6 +282,29 @@ func (t *dmjTranspiler) addSemanticError(n *gotreesitter.Node, message, hint str
 		message: message,
 		hint:    hint,
 	})
+}
+
+// rejectMisplacedNode reports a semantic error for a DSL-only construct
+// that only has emitter support when its owning emitter (e.g. emitBenchmark,
+// emitLoad, emitProcess) walks its own children directly. The grammar
+// accepts these node types as general statements (see grammar.go's
+// dslStatement wiring into _statement) so they can be parsed anywhere a
+// statement is valid, but every owning emitter consumes its children by
+// hand instead of recursing through emit() — so a legitimately placed
+// instance of one of these nodes NEVER reaches this generic emit()
+// dispatch. Reaching it here always means the construct escaped its valid
+// parent, and it must fail the build with file:line instead of silently
+// vanishing (V1: `expect` inside `setup{}` used to compile clean and pass).
+func (t *dmjTranspiler) rejectMisplacedNode(n *gotreesitter.Node, validParent, example string) string {
+	nodeText := strings.TrimSpace(t.text(n))
+	if len(nodeText) > 60 {
+		nodeText = nodeText[:60] + "..."
+	}
+	t.addSemanticError(n,
+		fmt.Sprintf("%q is only valid inside a %s block, not here: %q", t.nodeType(n), validParent, nodeText),
+		example,
+	)
+	return ""
 }
 
 func (t *dmjTranspiler) semanticError() error {
@@ -451,8 +509,8 @@ func (c *fakeClock) SetLocation(loc *time.Location) {
 		// Don't return — continue recursion to find nested mocks
 	}
 	if (nt == "eventually_block" || nt == "consistently_block" || nt == "property_block" ||
-		(nt == "verify_statement" && strings.Contains(t.text(n), "called") && strings.Contains(t.text(n), "with")) ||
-		(nt == "expect_statement" && (strings.Contains(t.text(n), " matches ") || strings.Contains(t.text(n), "unordered_equal")))) && !t.pollingHelpersEmitted {
+		(nt == "verify_statement" && t.verifyStatementCallsWithArgs(n)) ||
+		(nt == "expect_statement" && t.expectStatementNeedsPollingHelpers(n))) && !t.pollingHelpersEmitted {
 		t.pollingHelpersEmitted = true
 		t.addImport("fmt")
 		t.addImport("reflect")
@@ -524,23 +582,23 @@ func (t *dmjTranspiler) emit(n *gotreesitter.Node) string {
 	case "load_block":
 		return t.emitLoad(n)
 	case "load_config":
-		return "" // handled by emitLoad
+		return t.rejectMisplacedNode(n, "load", `load "name" { config { rate: 10 } target { GET "http://localhost" } }`)
 	case "target_block":
-		return "" // handled by emitLoad
+		return t.rejectMisplacedNode(n, "load", `load "name" { config { rate: 10 } target { GET "http://localhost" } }`)
 	case "benchmark_block":
 		return t.emitBenchmark(n)
 	case "setup_block":
-		return "" // handled by emitBenchmark
+		return t.rejectMisplacedNode(n, "benchmark", `benchmark "name" { setup { ... } measure { ... } }`)
 	case "measure_block":
-		return "" // handled by emitBenchmark
+		return t.rejectMisplacedNode(n, "benchmark", `benchmark "name" { setup { ... } measure { ... } }`)
 	case "parallel_measure_block":
-		return "" // handled by emitBenchmark
+		return t.rejectMisplacedNode(n, "benchmark", `benchmark "name" { parallel_measure { ... } }`)
 	case "report_directive":
-		return "" // handled by emitBenchmark
+		return t.rejectMisplacedNode(n, "benchmark", `benchmark "name" { report_allocs measure { ... } }`)
 	case "exec_block":
 		return t.emitExec(n)
 	case "run_command":
-		return "" // handled by emitExec
+		return t.rejectMisplacedNode(n, "exec", `exec "name" { run "echo hi" }`)
 	case "profile_block":
 		return t.emitProfile(n)
 	case "fake_declaration":
@@ -572,13 +630,13 @@ func (t *dmjTranspiler) emit(n *gotreesitter.Node) string {
 	case "matrix_block":
 		return t.emitMatrix(n)
 	case "defaults_block":
-		return "" // handled by emitEachDo
+		return t.rejectMisplacedNode(n, "each ... do or factory", `each "name" { defaults { field: value } { ... } } do { ... }`)
 	case "scenario_entry":
-		return "" // handled by emitEachDo
+		return t.rejectMisplacedNode(n, "each ... do", `each "name" { { field: value } } do { ... }`)
 	case "scenario_field":
-		return "" // handled by emitEachDo / emitMatrix
+		return t.rejectMisplacedNode(n, "each ... do, matrix, or factory", `field: value`)
 	case "matrix_field":
-		return "" // handled by emitMatrix
+		return t.rejectMisplacedNode(n, "matrix", `matrix "name" { axis field { value1, value2 } } do { ... }`)
 	case "table_declaration":
 		return t.emitTable(n)
 	case "each_row_block":
@@ -592,15 +650,15 @@ func (t *dmjTranspiler) emit(n *gotreesitter.Node) string {
 	case "stop_block":
 		return t.emitStop(n)
 	case "process_args":
-		return "" // handled by emitProcess
+		return t.rejectMisplacedNode(n, "process", `process "name" { run "./server" args { "-port", "8080" } }`)
 	case "process_env":
-		return "" // handled by emitProcess
+		return t.rejectMisplacedNode(n, "process", `process "name" { run "./server" env { KEY: "value" } }`)
 	case "ready_clause":
-		return "" // handled by emitProcess
+		return t.rejectMisplacedNode(n, "process", `process "name" { run "./server" ready tcp ":8080" }`)
 	case "signal_directive":
-		return "" // handled by emitStop (Task 5)
+		return t.rejectMisplacedNode(n, "stop", `stop server { signal SIGTERM }`)
 	case "timeout_directive":
-		return "" // handled by emitStop (Task 5)
+		return t.rejectMisplacedNode(n, "stop", `stop server { timeout 10s }`)
 	default:
 		return t.emitDefault(n)
 	}
@@ -666,7 +724,9 @@ func (t *dmjTranspiler) emitTestBlock(n *gotreesitter.Node) string {
 		for i := 0; i < int(tagsNode.NamedChildCount()); i++ {
 			tc := tagsNode.NamedChild(i)
 			if t.nodeType(tc) == "tag" {
-				tags = append(tags, strings.TrimSpace(t.text(tc)))
+				tagText := strings.TrimSpace(t.text(tc))
+				tags = append(tags, tagText)
+				t.validateTag(tc, tagText)
 			}
 		}
 	}
@@ -748,6 +808,39 @@ func (t *dmjTranspiler) shouldParallelizeTest(n *gotreesitter.Node, tags []strin
 		return false
 	}
 	return true
+}
+
+// knownTestTags is the safety-default allowlist for `@tag` on a test
+// block: exactly the tags that actually change transpiled behavior today
+// (emitTagDirectives, shouldParallelizeTest). Accepting arbitrary
+// `@identifier` tags (as danmuji used to, and as the README used to claim
+// was intentional) means a typo like `@skipp` or an aspirational tag like
+// `@focus` compiles clean and silently does nothing — the test author
+// believes the tag took effect and it never did.
+var knownTestTags = map[string]bool{
+	"skip":       true,
+	"slow":       true,
+	"serial":     true,
+	"sequential": true,
+	"parallel":   true, // accepted for readability; parallel is the default
+}
+
+// validateTag rejects any @tag that isn't in knownTestTags, so a typo or an
+// unimplemented tag fails the build instead of compiling clean and quietly
+// doing nothing.
+func (t *dmjTranspiler) validateTag(tagNode *gotreesitter.Node, tagText string) {
+	label := strings.TrimSpace(strings.TrimPrefix(tagText, "@"))
+	if knownTestTags[label] {
+		return
+	}
+	known := make([]string, 0, len(knownTestTags))
+	for k := range knownTestTags {
+		known = append(known, "@"+k)
+	}
+	sort.Strings(known)
+	t.addSemanticError(tagNode,
+		fmt.Sprintf("unknown tag %q — danmuji only recognizes: %s", tagText, strings.Join(known, ", ")),
+		"remove the tag, or use one of the recognized tags above")
 }
 
 func (t *dmjTranspiler) hasTag(tags []string, target string) bool {

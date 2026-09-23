@@ -1,0 +1,206 @@
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/odvcencio/goetrope/pkg/config"
+	"github.com/odvcencio/goetrope/pkg/worker"
+	"github.com/spf13/cobra"
+)
+
+func workerTrustedConfigSpec() config.Config {
+	cfg := config.Defaults()
+	cfg.Worker.CredentialSource = "env:GOETROPE_WORKER_CONFIG_CREDENTIAL"
+	cfg.Worker.TLS.CASource = "env:GOETROPE_WORKER_CONFIG_CA"
+	cfg.Worker.TLS.ServerName = "worker.example.test"
+	return cfg
+}
+
+func workerConfigCAPEM(t *testing.T) []byte {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "worker.example.test"},
+		DNSNames:     []string{"worker.example.test"},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+		IsCA:         true,
+		BasicConstraintsValid: true,
+		KeyUsage:     x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+@serial
+unit "trusted worker client config preflight" {
+	then "runWorker accepts trusted config with the embedded topology default" {
+		originalRun := workerRun
+		originalResolver := workerResolveSecretSource
+		defer func() {
+			workerRun = originalRun
+			workerResolveSecretSource = originalResolver
+		}()
+		mediaRoot := t.TempDir()
+		t.Setenv("GOETROPE_WORKER_SERVER", "worker.example.test:9090")
+		t.Setenv("GOETROPE_WORKER_MEDIA_ROOT", mediaRoot)
+		t.Setenv("GOETROPE_WORKER_MEDIA_CANARY", "stable.canary")
+		t.Setenv("GOETROPE_CACHE_ROOT", filepath.Join(t.TempDir(), "cache"))
+		expect os.WriteFile(filepath.Join(mediaRoot, "stable.canary"), []byte("stable"), 0o400) == nil
+		t.Setenv("GOETROPE_WORKER_CREDENTIAL_SOURCE", "env:GOETROPE_WORKER_CONFIG_CREDENTIAL")
+		t.Setenv("GOETROPE_WORKER_TLS_CA_SOURCE", "env:GOETROPE_WORKER_CONFIG_CA")
+		t.Setenv("GOETROPE_WORKER_TLS_SERVER_NAME", "worker.example.test")
+		caBytes := workerConfigCAPEM(t)
+		var credentialBytes []byte
+		var got worker.Config
+		workerResolveSecretSource = func(ref config.SecretSourceRef) ([]byte, error) {
+			if ref.String() == "env:GOETROPE_WORKER_CONFIG_CREDENTIAL" {
+				credentialBytes = []byte("run-worker-secret-marker")
+				return credentialBytes, nil
+			}
+			return append([]byte(nil), caBytes...), nil
+		}
+		workerRun = func(_ context.Context, cfg worker.Config) error {
+			got = cfg
+			return nil
+		}
+		err := runWorker(&cobra.Command{}, nil)
+		expect err == nil
+		expect got.TrustedTLS not_nil
+		expect got.TrustedTLS.ServerName == "worker.example.test"
+		expect got.Protocol == worker.CurrentWorkerProtocol()
+		for _, value := range credentialBytes {
+			expect value == 0
+		}
+	}
+
+	then "worker command trusted config uses internal remote validation" {
+		cfg := workerTrustedConfigSpec()
+		expect cfg.Worker.Mode == config.WorkerEmbedded
+		serveMode := cfg.Worker.Mode
+		serveMinimum := cfg.Worker.RemoteMinReady
+		normalized := prepareWorkerCommandConfig(cfg)
+		expect normalized.Worker.Mode == config.WorkerRemote
+		expect normalized.Worker.RemoteMinReady not_nil
+		expect cfg.Worker.Mode == serveMode
+		expect cfg.Worker.RemoteMinReady == serveMinimum
+		expect config.ValidateCommand(normalized, config.CommandWorker) == nil
+		expect config.Validate(cfg) != nil
+	}
+
+	then "requires a scoped credential source" {
+		cfg := workerTrustedConfigSpec()
+		cfg.Worker.CredentialSource = ""
+		transport, cleanup, err := prepareTrustedWorkerClientConfig(cfg)
+		expect err != nil
+		expect strings.Contains(err.Error(), "worker.credential_source")
+		expect transport.TrustedTLS is_nil
+		expect cleanup is_nil
+	}
+
+	then "requires a CA source and server name" {
+		cfg := workerTrustedConfigSpec()
+		cfg.Worker.TLS.CASource = ""
+		transport, cleanup, err := prepareTrustedWorkerClientConfig(cfg)
+		expect err != nil
+		expect strings.Contains(err.Error(), "worker.tls.ca_source")
+		expect transport.TrustedTLS is_nil
+		expect cleanup is_nil
+
+		cfg = workerTrustedConfigSpec()
+		cfg.Worker.TLS.ServerName = "  "
+		transport, cleanup, err = prepareTrustedWorkerClientConfig(cfg)
+		expect err != nil
+		expect strings.Contains(err.Error(), "worker.tls.server_name")
+		expect transport.TrustedTLS is_nil
+		expect cleanup is_nil
+	}
+
+	then "rejects empty credentials and invalid CA without leaking or retaining bytes" {
+		cfg := workerTrustedConfigSpec()
+		var credentialBytes, caBytes []byte
+		originalResolver := workerResolveSecretSource
+		defer func() { workerResolveSecretSource = originalResolver }()
+		workerResolveSecretSource = func(ref config.SecretSourceRef) ([]byte, error) {
+			if ref == cfg.Worker.CredentialSource {
+				credentialBytes = []byte("credential-secret-marker")
+				return credentialBytes, nil
+			}
+			caBytes = []byte("ca-secret-marker")
+			return caBytes, nil
+		}
+		transport, cleanup, err := prepareTrustedWorkerClientConfig(cfg)
+		expect err != nil
+		expect strings.Contains(err.Error(), "valid CA certificate")
+		reject strings.Contains(err.Error(), "credential-secret-marker")
+		reject strings.Contains(err.Error(), "ca-secret-marker")
+		expect transport.TrustedTLS is_nil
+		expect cleanup is_nil
+		for _, value := range credentialBytes {
+			expect value == 0
+		}
+		for _, value := range caBytes {
+			expect value == 0
+		}
+
+		cfg = workerTrustedConfigSpec()
+		credentialBytes = []byte{}
+		caBytes = workerConfigCAPEM(t)
+		workerResolveSecretSource = func(ref config.SecretSourceRef) ([]byte, error) {
+			if ref == cfg.Worker.CredentialSource {
+				credentialBytes = []byte{}
+				return credentialBytes, nil
+			}
+			return caBytes, nil
+		}
+		transport, cleanup, err = prepareTrustedWorkerClientConfig(cfg)
+		expect err != nil
+		expect strings.Contains(err.Error(), "secret source resolved empty")
+		expect transport.TrustedTLS is_nil
+		expect cleanup is_nil
+	}
+
+	then "builds verified TLS and exposes an idempotent credential cleanup" {
+		cfg := workerTrustedConfigSpec()
+		var credentialBytes []byte
+		caBytes := workerConfigCAPEM(t)
+		originalResolver := workerResolveSecretSource
+		defer func() { workerResolveSecretSource = originalResolver }()
+		workerResolveSecretSource = func(ref config.SecretSourceRef) ([]byte, error) {
+			if ref == cfg.Worker.CredentialSource {
+				credentialBytes = []byte("credential-secret-marker")
+				return credentialBytes, nil
+			}
+			return append([]byte(nil), caBytes...), nil
+		}
+		transport, cleanup, err := prepareTrustedWorkerClientConfig(cfg)
+		expect err == nil
+		expect transport.TrustedTLS not_nil
+		expect transport.TrustedTLS.RootCAs not_nil
+		expect transport.TrustedTLS.ServerName == cfg.Worker.TLS.ServerName
+		expect transport.Protocol == worker.CurrentWorkerProtocol()
+		cleanup()
+		cleanup()
+		for _, value := range credentialBytes {
+			expect value == 0
+		}
+	}
+}

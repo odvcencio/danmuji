@@ -1,0 +1,195 @@
+package mp4_test
+
+import (
+	"bytes"
+	"encoding/binary"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/container/mp4"
+)
+
+unit "ConvertToAnnexB" {
+	given "a single 4-byte length-prefixed NAL unit" {
+		data := make([]byte, 4+5)
+		binary.BigEndian.PutUint32(data[0:4], 5)
+		copy(data[4:], []byte{0x65, 0x01, 0x02, 0x03, 0x04})
+
+		when "converting with lengthSize 4" {
+			result := mp4.ConvertToAnnexB(data, 4)
+
+			then "starts with Annex B start code" {
+				expect result[0] == byte(0x00)
+				expect result[1] == 0x00
+				expect result[2] == 0x00
+				expect result[3] == byte(0x01)
+			}
+			then "NAL data follows start code" {
+				expect result[4] == byte(0x65)
+				expect len(result) == 9
+			}
+		}
+	}
+
+	given "two consecutive NAL units" {
+		data := make([]byte, 4+3+4+2)
+		binary.BigEndian.PutUint32(data[0:4], 3)
+		copy(data[4:7], []byte{0x67, 0xAA, 0xBB})
+		binary.BigEndian.PutUint32(data[7:11], 2)
+		copy(data[11:13], []byte{0x68, 0xCC})
+
+		when "converting" {
+			result := mp4.ConvertToAnnexB(data, 4)
+
+			then "produces two Annex B NAL units" {
+				// First: 00 00 00 01 67 AA BB
+				// Second: 00 00 00 01 68 CC
+				expect len(result) == 4+3+4+2
+			}
+			then "both start codes are present" {
+				expect bytes.Contains(result, []byte{0x00, 0x00, 0x00, 0x01, 0x67})
+				expect bytes.Contains(result, []byte{0x00, 0x00, 0x00, 0x01, 0x68})
+			}
+		}
+	}
+
+	given "2-byte length prefix" {
+		data := make([]byte, 2+3)
+		binary.BigEndian.PutUint16(data[0:2], 3)
+		copy(data[2:5], []byte{0x41, 0x42, 0x43})
+
+		when "converting with lengthSize 2" {
+			result := mp4.ConvertToAnnexB(data, 2)
+
+			then "produces correct Annex B output" {
+				expect len(result) == 4+3
+				expect result[4] == byte(0x41)
+			}
+		}
+	}
+
+	given "1-byte length prefix" {
+		data := make([]byte, 1+2)
+		data[0] = 2
+		data[1] = 0xAA
+		data[2] = 0xBB
+
+		when "converting with lengthSize 1" {
+			result := mp4.ConvertToAnnexB(data, 1)
+
+			then "produces correct output" {
+				expect len(result) == 4+2
+				expect result[4] == byte(0xAA)
+				expect result[5] == byte(0xBB)
+			}
+		}
+	}
+
+	given "empty input" {
+		when "converting" {
+			result := mp4.ConvertToAnnexB(nil, 4)
+
+			then "returns nil or empty" {
+				expect len(result) == 0
+			}
+		}
+	}
+
+	given "truncated length prefix" {
+		// Only 2 bytes available but lengthSize is 4
+		data := []byte{0x00, 0x05}
+
+		when "converting with lengthSize 4" {
+			result := mp4.ConvertToAnnexB(data, 4)
+
+			then "returns empty without panic" {
+				expect len(result) == 0
+			}
+		}
+	}
+
+	given "NAL length exceeds remaining data" {
+		data := make([]byte, 4+2)
+		binary.BigEndian.PutUint32(data[0:4], 100) // claims 100 bytes but only 2 follow
+
+		when "converting" {
+			result := mp4.ConvertToAnnexB(data, 4)
+
+			then "stops without panic" {
+				expect len(result) == 0
+			}
+		}
+	}
+
+	given "zero-length NAL unit" {
+		data := make([]byte, 4)
+		binary.BigEndian.PutUint32(data[0:4], 0)
+
+		when "converting" {
+			result := mp4.ConvertToAnnexB(data, 4)
+
+			then "emits start code with empty body" {
+				expect len(result) == 4
+				expect result[0] == byte(0x00)
+				expect result[3] == byte(0x01)
+			}
+		}
+	}
+}
+
+unit "PrependParamSets" {
+	given "SPS and PPS parameter sets" {
+		ps := &mp4.ParamSets{
+			SPS: [][]byte{{0x67, 0x01, 0x02}},
+			PPS: [][]byte{{0x68, 0x03}},
+		}
+		naluData := []byte{0x00, 0x00, 0x00, 0x01, 0x65, 0xFF}
+
+		when "prepending" {
+			result := mp4.PrependParamSets(ps, naluData)
+
+			then "SPS comes before PPS" {
+				spsIdx := bytes.Index(result, []byte{0x67, 0x01, 0x02})
+				ppsIdx := bytes.Index(result, []byte{0x68, 0x03})
+				expect spsIdx >= 0
+				expect ppsIdx >= 0
+				expect spsIdx < ppsIdx
+			}
+			then "original NALU data is at the end" {
+				expect bytes.HasSuffix(result, naluData)
+			}
+		}
+	}
+
+	given "HEVC with VPS + SPS + PPS" {
+		ps := &mp4.ParamSets{
+			VPS: [][]byte{{0x40, 0x01}},
+			SPS: [][]byte{{0x42, 0x01}},
+			PPS: [][]byte{{0x44, 0x01}},
+		}
+		naluData := []byte{0x00, 0x00, 0x00, 0x01, 0x26, 0xFF}
+
+		when "prepending" {
+			result := mp4.PrependParamSets(ps, naluData)
+
+			then "VPS comes before SPS which comes before PPS" {
+				vpsIdx := bytes.Index(result, []byte{0x40, 0x01})
+				spsIdx := bytes.Index(result, []byte{0x42, 0x01})
+				ppsIdx := bytes.Index(result, []byte{0x44, 0x01})
+				expect vpsIdx < spsIdx
+				expect spsIdx < ppsIdx
+			}
+		}
+	}
+
+	given "nil param sets" {
+		naluData := []byte{0x00, 0x00, 0x00, 0x01, 0x65}
+
+		when "prepending nil" {
+			result := mp4.PrependParamSets(nil, naluData)
+
+			then "returns original data unchanged" {
+				expect bytes.Equal(result, naluData)
+			}
+		}
+	}
+}

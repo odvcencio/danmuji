@@ -1,0 +1,28 @@
+package maintenance_test
+
+import (
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/maintenance"
+)
+
+unit "VolumeStats" {
+	given "a volume with known usage" {
+		then "100% usage" {
+			vs := maintenance.VolumeStats{TotalBytes: 1000, UsedBytes: 1000}
+			expect vs.UsagePct() == 100
+		}
+		then "50% usage" {
+			vs := maintenance.VolumeStats{TotalBytes: 1000, UsedBytes: 500}
+			expect vs.UsagePct() == 50
+		}
+		then "0% usage" {
+			vs := maintenance.VolumeStats{TotalBytes: 1000, UsedBytes: 0}
+			expect vs.UsagePct() == 0
+		}
+		then "zero total returns 0" {
+			vs := maintenance.VolumeStats{TotalBytes: 0, UsedBytes: 0}
+			expect vs.UsagePct() == 0
+		}
+	}
+}

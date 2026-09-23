@@ -1,0 +1,24 @@
+package db
+
+import (
+	"strings"
+	"testing"
+)
+
+unit "random channel scope migration contract" {
+	then "history stays backwards-compatible while series progress is channel scoped" {
+		source, err := migrationFS.ReadFile("migrations/014_random_channel_scope.sql")
+		expect err == nil
+		sql := string(source)
+		expect strings.Contains(sql, "ADD COLUMN IF NOT EXISTS channel_alias TEXT NOT NULL DEFAULT '1'")
+		expect strings.Contains(sql, "UPDATE random_channel_play_history")
+		expect strings.Contains(sql, "idx_random_channel_play_history_channel_played_at")
+		expect strings.Contains(sql, "idx_random_channel_play_history_channel_media_played_at")
+		expect strings.Contains(sql, "CREATE TABLE IF NOT EXISTS random_channel_series_state")
+		expect strings.Contains(sql, "PRIMARY KEY (channel_alias, series_id)")
+		expect strings.Contains(sql, "REFERENCES series(id) ON DELETE CASCADE")
+		expect strings.Contains(sql, "REFERENCES media_items(id) ON DELETE SET NULL")
+		reject strings.Contains(strings.ToUpper(sql), "DROP TABLE")
+		reject strings.Contains(strings.ToUpper(sql), "DROP COLUMN")
+	}
+}

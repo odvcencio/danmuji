@@ -1,0 +1,97 @@
+package worker_test
+
+import (
+	"context"
+	"os"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/transcode"
+	"github.com/odvcencio/goetrope/pkg/worker"
+)
+
+unit "Executor source validation" {
+	given "an executor with a media root" {
+		tmpDir, err := os.MkdirTemp("", "executor-test-*")
+		expect err == nil
+		defer os.RemoveAll(tmpDir)
+
+		exec, activationErr := worker.NewExecutorForRootsWithUploaderContextAndProbe(context.Background(), []string{tmpDir}, "", "", nil, worker.StaticCapabilityProbe(transcode.Capabilities{}))
+		expect activationErr == nil
+
+		when "executing a job with empty source" {
+			comp, err := exec.Execute(context.Background(), transcode.Job{
+				ID:         "test-1",
+				SourcePath: "",
+				Quality:    "original",
+			}, nil)
+
+			then "fails with error" {
+				expect err != nil
+				reject comp.Success
+			}
+		}
+
+		when "executing a job outside media root" {
+			comp, err := exec.Execute(context.Background(), transcode.Job{
+				ID:         "test-2",
+				SourcePath: "/etc/passwd",
+				Quality:    "original",
+			}, nil)
+
+			then "rejects path traversal" {
+				expect err != nil
+				reject comp.Success
+			}
+		}
+
+		when "executing a job with nonexistent file" {
+			comp, err := exec.Execute(context.Background(), transcode.Job{
+				ID:         "test-3",
+				SourcePath: tmpDir + "/nonexistent.mp4",
+				Quality:    "original",
+			}, nil)
+
+			then "fails" {
+				expect err != nil
+				reject comp.Success
+			}
+		}
+	}
+}
+
+unit "Executor cancellation" {
+	given "an executor" {
+		exec, activationErr := worker.NewExecutorForRootsWithUploaderContextAndProbe(context.Background(), []string{""}, "", "", nil, worker.StaticCapabilityProbe(transcode.Capabilities{}))
+		expect activationErr == nil
+
+		when "executing with cancelled context" {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+
+			comp, err := exec.Execute(ctx, transcode.Job{
+				ID:         "cancel-1",
+				SourcePath: "/dev/null",
+				Quality:    "original",
+			}, nil)
+
+			then "returns cancellation" {
+				expect err != nil
+				reject comp.Success
+			}
+		}
+	}
+}
+
+@serial
+unit "Executor capabilities" {
+	given "an executor with no ffmpeg" {
+		exec, activationErr := worker.NewExecutorForRootsWithUploaderContextAndProbe(context.Background(), []string{""}, "", "", nil, worker.StaticCapabilityProbe(transcode.Capabilities{}))
+		expect activationErr == nil
+
+		then "reports no GPU capabilities" {
+			caps := exec.Capabilities()
+			reject caps.NVENCAvailable
+			reject caps.VAAPIAvailable
+		}
+	}
+}

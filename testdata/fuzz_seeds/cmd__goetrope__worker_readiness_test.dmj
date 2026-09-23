@@ -1,0 +1,36 @@
+package main
+
+import (
+	"testing"
+	"time"
+
+	"github.com/odvcencio/goetrope/pkg/config"
+	"github.com/odvcencio/goetrope/pkg/transcode"
+)
+
+unit "worker minimum readiness" {
+	then "keeps embedded capability readiness backward compatible" {
+		state := transcode.WorkerState{HasFFmpeg: true, CPUAvailable: true}
+		expect workerMinimumReady(config.WorkerEmbedded, 1, []transcode.WorkerState{state})
+	}
+
+	then "requires trusted protocol and admission facts for remote capacity" {
+		now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+		state := transcode.WorkerState{HasFFmpeg: true, CPUAvailable: true, LastSeen: now}
+		reject workerMinimumReadyAt(config.WorkerBoth, 1, []transcode.WorkerState{state}, now, time.Minute)
+		state.TrustedTransport = true
+		state.TrustedProtocolMajor = 2
+		state.TrustedProtocolMinor = 1
+		state.CanaryPassed = true
+		state.CachePushReady = true
+		reject workerMinimumReadyAt(config.WorkerBoth, 1, []transcode.WorkerState{state}, now, time.Minute)
+		state.Subscribed = true
+		expect workerMinimumReadyAt(config.WorkerBoth, 1, []transcode.WorkerState{state}, now, time.Minute)
+		state.LastSeen = now.Add(-2 * time.Minute)
+		reject workerMinimumReadyAt(config.WorkerBoth, 1, []transcode.WorkerState{state}, now, time.Minute)
+	}
+
+	then "allows an explicitly optional remote quorum" {
+		expect workerMinimumReady(config.WorkerBoth, 0, nil)
+	}
+}

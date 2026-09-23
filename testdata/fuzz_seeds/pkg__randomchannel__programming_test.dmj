@@ -1,0 +1,336 @@
+package randomchannel
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/library"
+	"github.com/odvcencio/goetrope/pkg/theatre"
+)
+
+unit "Random channel programming configuration" {
+	then "keeps movie and show defaults as a usable immutable snapshot" {
+		snapshot := DefaultProgrammingSnapshot()
+		channels := snapshot.Channels()
+		channels[0].Alias = "mutated"
+		fresh := snapshot.Channels()
+		movie, movieOK := snapshot.Channel(DefaultMovieAlias)
+		show, showOK := snapshot.Channel(DefaultShowAlias)
+		movieProgram, movieProgramOK := snapshot.Program(movie.ProgramID)
+		showProgram, showProgramOK := snapshot.Program(show.ProgramID)
+
+		expect fresh[0].Alias == DefaultMovieAlias
+		expect movieOK
+		expect showOK
+		expect movie.ProgramID == DefaultMovieProgramID
+		expect show.ProgramID == DefaultShowProgramID
+		expect movieProgramOK
+		expect showProgramOK
+		expect movieProgram.Kind == ProgramKindRandomMovies
+		expect showProgram.Kind == ProgramKindRandomShows
+	}
+
+	then "parses themed marathon TOML for later command integration" {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "channels.toml")
+		writeErr := os.WriteFile(path, []byte(`
+timezone = "America/Los_Angeles"
+
+[[themes]]
+id = "kung-fu"
+name = "Kung Fu Theatre"
+css_class = "theme-kung-fu night"
+poster_asset = "themes/kung-fu/poster.webp"
+
+[[programs]]
+id = "avatar-marathon"
+name = "Avatar Marathon"
+kind = "series_marathon"
+content_kind = "shows"
+series_id = 123
+series_title = "Avatar: The Last Airbender"
+theme_id = "kung-fu"
+queue_size = 6
+
+[[channels]]
+alias = "2"
+room_code = "SHOW01"
+name = "Random Shows"
+content_kind = "shows"
+program_id = "avatar-marathon"
+`), 0o600)
+
+		snapshot, err := LoadProgrammingConfigFile(path)
+		channel, channelOK := snapshot.Channel("2")
+		program, programOK := snapshot.Program(channel.ProgramID)
+		theme, themeOK := snapshot.Theme(channel.ThemeID)
+
+		expect writeErr == nil
+		expect err == nil
+		expect snapshot.Timezone() == "America/Los_Angeles"
+		expect channelOK
+		expect programOK
+		expect themeOK
+		expect channel.ProgramID == "avatar-marathon"
+		expect program.Kind == ProgramKindSeriesMarathon
+		expect program.SeriesID == int64(123)
+		expect program.QueueSize == 6
+		expect theme.CSSClass == "theme-kung-fu night"
+		expect theme.PosterAsset == "themes/kung-fu/poster.webp"
+	}
+
+	then "keeps default channels when a config only adds programs" {
+		snapshot, err := NewProgrammingSnapshot(ProgrammingConfig{
+			Programs: []ProgramConfig{{
+				ID: "avatar-marathon", Name: "Avatar Marathon", Kind: ProgramKindSeriesMarathon, SeriesID: 123,
+			}},
+		})
+		movie, movieOK := snapshot.Channel(DefaultMovieAlias)
+		show, showOK := snapshot.Channel(DefaultShowAlias)
+		movieProgram, movieProgramOK := snapshot.Program(DefaultMovieProgramID)
+		showProgram, showProgramOK := snapshot.Program(DefaultShowProgramID)
+		customProgram, customProgramOK := snapshot.Program("avatar-marathon")
+
+		expect err == nil
+		expect movieOK
+		expect showOK
+		expect movie.ProgramID == DefaultMovieProgramID
+		expect show.ProgramID == DefaultShowProgramID
+		expect movieProgramOK
+		expect showProgramOK
+		expect customProgramOK
+		expect movieProgram.Kind == ProgramKindRandomMovies
+		expect showProgram.Kind == ProgramKindRandomShows
+		expect customProgram.Kind == ProgramKindSeriesMarathon
+	}
+
+	then "lets programs-only config override default program ids without losing default channels" {
+		snapshot, err := NewProgrammingSnapshot(ProgrammingConfig{
+			Programs: []ProgramConfig{{
+				ID: DefaultShowProgramID, Name: "Curated Shows", Kind: ProgramKindSeriesMarathon, SeriesID: 456, QueueSize: 4,
+			}},
+		})
+		show, showOK := snapshot.Channel(DefaultShowAlias)
+		movie, movieOK := snapshot.Channel(DefaultMovieAlias)
+		showProgram, showProgramOK := snapshot.Program(show.ProgramID)
+		movieProgram, movieProgramOK := snapshot.Program(movie.ProgramID)
+
+		expect err == nil
+		expect showOK
+		expect movieOK
+		expect show.ProgramID == DefaultShowProgramID
+		expect movie.ProgramID == DefaultMovieProgramID
+		expect showProgramOK
+		expect movieProgramOK
+		expect showProgram.Name == "Curated Shows"
+		expect showProgram.Kind == ProgramKindSeriesMarathon
+		expect showProgram.SeriesID == int64(456)
+		expect showProgram.QueueSize == 4
+		expect movieProgram.Kind == ProgramKindRandomMovies
+	}
+
+	then "rejects duplicate addresses and unknown references before runtime" {
+		_, duplicateErr := NewProgrammingSnapshot(ProgrammingConfig{
+			Programs: []ProgramConfig{{
+				ID: "movies", Kind: ProgramKindRandomMovies,
+			}},
+			Channels: []ChannelProgramConfig{{
+				Alias: "1", RoomCode: "CHAN01", Name: "A", ProgramID: "movies",
+			}, {
+				Alias: "1", RoomCode: "CHAN02", Name: "B", ProgramID: "movies",
+			}},
+		})
+		_, missingErr := NewProgrammingSnapshot(ProgrammingConfig{
+			Channels: []ChannelProgramConfig{{
+				Alias: "1", RoomCode: "CHAN01", Name: "A", ProgramID: "missing",
+			}},
+		})
+
+		expect duplicateErr != nil
+		expect missingErr != nil
+		expect duplicateErr.Error() contains "duplicate random channel alias"
+		expect missingErr.Error() contains "unknown program"
+	}
+
+	then "rejects unsafe theme controls" {
+		_, cssErr := NewProgrammingSnapshot(ProgrammingConfig{
+			Themes: []ThemeConfig{{ID: "bad", CSSClass: "9bad"}},
+			Programs: []ProgramConfig{{ID: "movies", Kind: ProgramKindRandomMovies}},
+			Channels: []ChannelProgramConfig{{Alias: "1", RoomCode: "CHAN01", Name: "A", ProgramID: "movies"}},
+		})
+		_, assetErr := NewProgrammingSnapshot(ProgrammingConfig{
+			Themes: []ThemeConfig{{ID: "bad", PosterAsset: "../secret.png"}},
+			Programs: []ProgramConfig{{ID: "movies", Kind: ProgramKindRandomMovies, ThemeID: "bad"}},
+			Channels: []ChannelProgramConfig{{Alias: "1", RoomCode: "CHAN01", Name: "A", ProgramID: "movies"}},
+		})
+		_, zoneErr := NewProgrammingSnapshot(ProgrammingConfig{Timezone: "Mars/Olympus"})
+
+		expect cssErr != nil
+		expect assetErr != nil
+		expect zoneErr != nil
+		expect cssErr.Error() contains "css class"
+		expect assetErr.Error() contains "path traversal"
+		expect zoneErr.Error() contains "timezone"
+	}
+
+	then "surfaces active program and theme in channel summaries" {
+		snapshot, snapshotErr := NewProgrammingSnapshot(ProgrammingConfig{
+			Themes: []ThemeConfig{{ID: "retro", Name: "Retro", CSSClass: "theme-retro"}},
+			Programs: []ProgramConfig{{ID: "retro-shows", Name: "Retro Shows", Kind: ProgramKindRandomShows, ThemeID: "retro"}},
+			Channels: []ChannelProgramConfig{{Alias: "2", RoomCode: DefaultShowRoomCode, Name: DefaultShowChannelName, ProgramID: "retro-shows"}},
+		})
+		manager := &recoveryRoomManager{room: &theatre.Room{RoomCode: DefaultShowRoomCode}}
+		playback := theatre.NewPlaybackStateManager()
+		playback.Set(DefaultShowRoomCode, theatre.PlaybackState{})
+		svc := NewWithConfig(ShowChannelConfig(), nil, nil, nil, playback, nil)
+		svc.manager = manager
+		setErr := svc.SetProgrammingSource(snapshot)
+
+		summary, err := svc.Summary(context.Background())
+
+		expect snapshotErr == nil
+		expect setErr == nil
+		expect err == nil
+		expect summary.ContentKind == "shows"
+		expect summary.Program.ID == "retro-shows"
+		expect summary.Program.Kind == ProgramKindRandomShows
+		expect summary.Theme.ID == "retro"
+		expect summary.Theme.CSSClass == "theme-retro"
+	}
+}
+
+unit "Random channel programmed marathons" {
+	then "queues a single-show marathon in wrapped episode order with subtitles required" {
+		snapshot, snapshotErr := NewProgrammingSnapshot(ProgrammingConfig{
+			Programs: []ProgramConfig{{
+				ID: "show-9", Name: "Show 9 Marathon", Kind: ProgramKindSeriesMarathon, SeriesID: 9,
+			}},
+			Channels: []ChannelProgramConfig{{
+				Alias: DefaultShowAlias, RoomCode: DefaultShowRoomCode, Name: DefaultShowChannelName, ProgramID: "show-9",
+			}},
+		})
+		svc := NewWithConfig(ShowChannelConfig(), nil, nil, nil, nil, nil)
+		setErr := svc.SetProgrammingSource(snapshot)
+		svc.getSeriesState = func(context.Context, string, int64) (*library.RandomChannelSeriesState, error) {
+			return &library.RandomChannelSeriesState{ChannelAlias: DefaultShowAlias, SeriesID: 9, LastMediaItemID: 102}, nil
+		}
+		svc.listEpisodesForSeries = func(context.Context, int64) ([]*library.MediaItem, error) {
+			return []*library.MediaItem{{ID: 101}, {ID: 102}, {ID: 103}, {ID: 104}}, nil
+		}
+		svc.loadItem = func(_ context.Context, id int64) (*library.MediaItem, error) {
+			item := &library.MediaItem{ID: id, Metadata: &library.Metadata{SeriesID: 9}}
+			if id != 104 {
+				item.Streams = []library.Stream{{StreamIndex: 2, StreamType: "subtitle", Codec: "subrip", Language: "eng", IsDefault: true}}
+			}
+			return item, nil
+		}
+
+		picked, err := svc.pickItems(context.Background(), nil, 3)
+
+		expect snapshotErr == nil
+		expect setErr == nil
+		expect err == nil
+		expect len(picked) == 3
+		expect picked[0] == int64(103)
+		expect picked[1] == int64(101)
+		expect picked[2] == int64(102)
+	}
+
+	then "resolves a title-based marathon through an exact case-insensitive series match" {
+		snapshot, snapshotErr := NewProgrammingSnapshot(ProgrammingConfig{
+			Programs: []ProgramConfig{{
+				ID: "avatar", Name: "Avatar Marathon", Kind: ProgramKindSeriesMarathon, SeriesTitle: "Avatar: The Last Airbender",
+			}},
+			Channels: []ChannelProgramConfig{{
+				Alias: DefaultShowAlias, RoomCode: DefaultShowRoomCode, Name: DefaultShowChannelName, ProgramID: "avatar",
+			}},
+		})
+		svc := NewWithConfig(ShowChannelConfig(), nil, nil, nil, nil, nil)
+		setErr := svc.SetProgrammingSource(snapshot)
+		var query string
+		svc.listSeries = func(_ context.Context, opts library.ListSeriesOptions) ([]library.Series, int, error) {
+			query = opts.Query
+			return []library.Series{{ID: 44, Title: "avatar: the last airbender"}}, 1, nil
+		}
+		svc.getSeriesState = func(context.Context, string, int64) (*library.RandomChannelSeriesState, error) {
+			return nil, nil
+		}
+		svc.listEpisodesForSeries = func(_ context.Context, seriesID int64) ([]*library.MediaItem, error) {
+			expect seriesID == int64(44)
+			return []*library.MediaItem{{ID: 441}}, nil
+		}
+		svc.loadItem = func(context.Context, int64) (*library.MediaItem, error) {
+			return &library.MediaItem{ID: 441, Metadata: &library.Metadata{SeriesID: 44}, Streams: []library.Stream{{StreamIndex: 2, StreamType: "subtitle", Codec: "subrip"}}}, nil
+		}
+
+		picked, err := svc.pickItems(context.Background(), nil, 1)
+
+		expect snapshotErr == nil
+		expect setErr == nil
+		expect err == nil
+		expect query == "Avatar: The Last Airbender"
+		expect len(picked) == 1
+		expect picked[0] == int64(441)
+	}
+
+	then "fails title-based marathons with ambiguous exact matches" {
+		snapshot, snapshotErr := NewProgrammingSnapshot(ProgrammingConfig{
+			Programs: []ProgramConfig{{
+				ID: "avatar", Name: "Avatar Marathon", Kind: ProgramKindSeriesMarathon, SeriesTitle: "Avatar",
+			}},
+			Channels: []ChannelProgramConfig{{
+				Alias: DefaultShowAlias, RoomCode: DefaultShowRoomCode, Name: DefaultShowChannelName, ProgramID: "avatar",
+			}},
+		})
+		svc := NewWithConfig(ShowChannelConfig(), nil, nil, nil, nil, nil)
+		setErr := svc.SetProgrammingSource(snapshot)
+		svc.listSeries = func(context.Context, library.ListSeriesOptions) ([]library.Series, int, error) {
+			return []library.Series{{ID: 1, Title: "Avatar"}, {ID: 2, Title: "avatar"}}, 2, nil
+		}
+
+		picked, err := svc.pickItems(context.Background(), nil, 1)
+
+		expect snapshotErr == nil
+		expect setErr == nil
+		expect picked == nil
+		expect err != nil
+		expect err.Error() contains "ambiguous"
+	}
+
+	then "uses programmed queue size for replacement and refill targets" {
+		snapshot, snapshotErr := NewProgrammingSnapshot(ProgrammingConfig{
+			Programs: []ProgramConfig{{
+				ID: "show-9", Kind: ProgramKindSeriesMarathon, SeriesID: 9, QueueSize: 3,
+			}},
+			Channels: []ChannelProgramConfig{{
+				Alias: DefaultShowAlias, RoomCode: DefaultShowRoomCode, Name: DefaultShowChannelName, ProgramID: "show-9",
+			}},
+		})
+		manager := &recoveryRoomManager{room: &theatre.Room{RoomCode: DefaultShowRoomCode, Playlist: []int64{101}}}
+		svc := NewWithConfig(ShowChannelConfig(), nil, nil, nil, nil, nil)
+		svc.manager = manager
+		setErr := svc.SetProgrammingSource(snapshot)
+		svc.getSeriesState = func(context.Context, string, int64) (*library.RandomChannelSeriesState, error) {
+			return nil, nil
+		}
+		svc.listEpisodesForSeries = func(context.Context, int64) ([]*library.MediaItem, error) {
+			return []*library.MediaItem{{ID: 101}, {ID: 102}, {ID: 103}, {ID: 104}}, nil
+		}
+		svc.loadItem = func(_ context.Context, id int64) (*library.MediaItem, error) {
+			return &library.MediaItem{ID: id, Metadata: &library.Metadata{SeriesID: 9}, Streams: []library.Stream{{StreamIndex: 2, StreamType: "subtitle", Codec: "subrip"}}}, nil
+		}
+
+		replaced, replaceErr := svc.replaceRandomPlaylist(context.Background(), manager.room)
+		manager.room = &theatre.Room{RoomCode: DefaultShowRoomCode, Playlist: []int64{101}, CurrentItemIndex: 0}
+		refilled, refillErr := svc.refill(context.Background(), manager.room, queueTargetSize)
+
+		expect snapshotErr == nil
+		expect setErr == nil
+		expect replaceErr == nil
+		expect refillErr == nil
+		expect len(replaced.Playlist) == 3
+		expect len(refilled.Playlist) == 3
+	}
+}

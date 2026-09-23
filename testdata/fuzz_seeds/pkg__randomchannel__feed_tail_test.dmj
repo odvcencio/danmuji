@@ -1,0 +1,125 @@
+package randomchannel
+
+import (
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/stream"
+	"github.com/odvcencio/goetrope/pkg/theatre"
+)
+
+unit "Feed model content tail release" {
+	given "the exact July 7 fully produced fractional tail" {
+		svc := feedModelTestService(t, true)
+		room := &theatre.Room{
+			RoomCode:         RoomCode,
+			Playlist:         []int64{77, 78},
+			CurrentItemIndex: 0,
+		}
+		svc.setFeedPlaylist(PlayoutPlaylist{
+			ItemIDs:      []int64{77, 78},
+			ItemDuration: []float64{5584.352, 7200},
+		})
+		svc.setFeedCurrentItem(77)
+		for idx := 0; idx < 5585; idx++ {
+			svc.feedManifest().OnSegmentReceived(77, "h264-720p", idx, stream.LowLatencySegmentDuration)
+		}
+		svc.playback.Set(RoomCode, theatre.PlaybackState{
+			Position:  5584.1,
+			Playing:   true,
+			Timestamp: svc.now().UnixMilli(),
+		})
+
+		when "projecting past the former 5572 second guard hold" {
+			position, playing := svc.currentPosition(room)
+			ceiling, ok := svc.EdgeSeconds(RoomCode)
+			svc.feedAdvanceTick(room)
+			diagnostic := svc.feed.diagnosticSnapshot()
+
+			then "releases the full content tail into the intermission boundary" {
+				expect position > 5584
+				expect position <= 5584.352
+				expect ceiling == 5584.352
+				expect ok
+				expect playing
+				expect diagnostic.State == feedStateTailComplete
+			}
+		}
+
+		when "the final fractional content segment is not produced" {
+			ceiling, tail := ContentAwareEdgeCeiling(5_584_352, 5583, 5584, 12)
+
+			then "preserves the guard band rather than declaring a false tail" {
+				reject tail
+				expect ceiling == 5572
+			}
+		}
+	}
+
+	given "fully produced items across fractional duration boundaries" {
+		for _, duration := range []float64{9.001, 9.5, 9.999, 10.001, 10.5, 10.999, 5584.352} {
+			svc := feedModelTestService(t, true)
+			svc.setFeedPlaylist(PlayoutPlaylist{ItemIDs: []int64{42}, ItemDuration: []float64{duration}})
+			svc.setFeedCurrentItem(42)
+			last := stream.LastContentSegmentIndexForDuration(int64(duration*1000+0.5), stream.LowLatencySegmentDuration)
+			for idx := 0; idx <= last; idx++ {
+				svc.feedManifest().OnSegmentReceived(42, "h264-720p", idx, stream.LowLatencySegmentDuration)
+			}
+
+			when "computing the terminal ceiling" {
+				ceiling, ok := svc.EdgeSeconds(RoomCode)
+
+				then "has no fractional guard-band dead zone" {
+					expect ok
+					expect ceiling == duration
+				}
+			}
+		}
+	}
+
+	given "a fully produced current item near its tail" {
+		svc := feedModelTestService(t, true)
+		room := &theatre.Room{
+			RoomCode:         RoomCode,
+			Playlist:         []int64{42},
+			CurrentItemIndex: 0,
+		}
+		svc.setFeedPlaylist(PlayoutPlaylist{
+			ItemIDs:      []int64{42},
+			ItemDuration: []float64{10.5},
+		})
+		svc.setFeedCurrentItem(42)
+		for idx := 0; idx <= 10; idx++ {
+			svc.feedManifest().OnSegmentReceived(42, "h264-720p", idx, stream.LowLatencySegmentDuration)
+		}
+		svc.playback.Set(RoomCode, theatre.PlaybackState{
+			Position:  10.4,
+			Playing:   true,
+			Timestamp: svc.now().UnixMilli(),
+		})
+
+		when "reading the current position" {
+			position, playing := svc.currentPosition(room)
+
+			then "does not hold at duration minus the guard band" {
+				expect position > 10
+			}
+
+			then "does not advance past the item duration" {
+				expect position <= 10.5
+			}
+
+			then "stays playing" {
+				expect playing
+			}
+		}
+
+		when "providing the theatre edge ceiling" {
+			ceiling, ok := svc.EdgeSeconds(RoomCode)
+
+			then "returns the item duration as the ceiling" {
+				expect ok
+				expect ceiling == 10.5
+			}
+		}
+	}
+}

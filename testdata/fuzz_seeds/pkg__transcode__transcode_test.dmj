@@ -1,0 +1,639 @@
+package transcode_test
+
+import (
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/odvcencio/goetrope/pkg/container/mp4"
+	"github.com/odvcencio/goetrope/pkg/transcode"
+)
+
+unit "Capabilities" {
+	given "no ffmpeg available" {
+		caps := transcode.DetectCapabilities("", "")
+
+		then "has no encoders" {
+			reject caps.HasFFmpeg
+			reject caps.NVENCAvailable
+			reject caps.VAAPIAvailable
+			reject caps.CPUAvailable
+		}
+		then "preferred backend is empty" {
+			expect caps.PreferredBackend == ""
+		}
+		then "available backends is empty" {
+			expect len(caps.AvailableBackends()) == 0
+		}
+	}
+
+	given "a capabilities struct with all backends" {
+		caps := makeAllCaps()
+
+		then "supports all backends" {
+			expect caps.SupportsBackend("nvenc")
+			expect caps.SupportsBackend("vaapi")
+			expect caps.SupportsBackend("cpu")
+			reject caps.SupportsBackend("unknown")
+			reject caps.SupportsBackend("")
+		}
+		then "lists all available backends" {
+			backends := caps.AvailableBackends()
+			expect len(backends) == 3
+		}
+	}
+}
+
+unit "VideoProfile resolution" {
+	given "CPU backend" {
+		when "resolving 1080p" {
+			p := transcode.ResolveVideoProfileForCapabilities("h264-1080p", makeCPUCaps())
+
+			then "correct height and bitrate" {
+				expect p.Height == 1080
+				expect p.VideoBitrate == "6000k"
+				expect p.VideoEncoder == "libx264"
+			}
+		}
+		when "resolving 720p" {
+			p := transcode.ResolveVideoProfileForCapabilities("h264-720p", makeCPUCaps())
+
+			then "correct" {
+				expect p.Height == 720
+				expect p.VideoBitrate == "3500k"
+			}
+		}
+		when "resolving 2160p" {
+			p := transcode.ResolveVideoProfileForCapabilities("h264-2160p", makeCPUCaps())
+
+			then "correct" {
+				expect p.Height == 2160
+				expect p.VideoBitrate == "12000k"
+			}
+		}
+		when "resolving av1 1080p" {
+			p := transcode.ResolveVideoProfileForCapabilities("av1-1080p", makeCPUCaps())
+
+			then "selects av1 cpu encode defaults" {
+				expect p.Height == 1080
+				expect p.VideoBitrate == "3200k"
+				expect p.VideoEncoder == "libsvtav1"
+			}
+		}
+	}
+
+	given "NVENC backend" {
+		when "resolving 1080p" {
+			profile := transcode.ResolveVideoProfileForCapabilities("h264-1080p", makeNVENCCaps())
+
+			then "selects NVENC" {
+				expect profile.VideoEncoder == "h264_nvenc"
+				expect profile.Backend == "nvenc"
+			}
+		}
+		when "building a low-latency live-cache profile" {
+			profile := transcode.BuildVideoProfile(transcode.Job{
+				Type:    transcode.JobTypeLiveCache,
+				Quality: "h264-480p",
+			}, &mp4.MediaInfo{
+				Streams: []mp4.StreamInfo{{
+					Type:   "video",
+					Codec:  "av1",
+					Width:  1920,
+					Height: 1080,
+				}},
+			}, makeNVENCCaps(), nil)
+
+			then "uses CUDA decode and scale with a software decode fallback" {
+				expect profile.HardwareDecode
+				expect profile.VideoFilter == "scale_cuda=w=-2:h=480:format=yuv420p"
+				args := transcode.DecoderArgs(profile)
+				foundCUDA := false
+				for i, a := range args {
+					if a == "-hwaccel" && i+1 < len(args) && args[i+1] == "cuda" {
+						foundCUDA = true
+					}
+				}
+				expect foundCUDA
+
+				fallback := transcode.SoftwareDecodeFallbackProfile(profile)
+				reject fallback.HardwareDecode
+				expect fallback.VideoFilter == "scale=-2:480,format=yuv420p"
+				fallbackArgs := transcode.DecoderArgs(fallback)
+				foundFallbackCUDA := false
+				for i, a := range fallbackArgs {
+					if a == "-hwaccel" && i+1 < len(fallbackArgs) && fallbackArgs[i+1] == "cuda" {
+						foundFallbackCUDA = true
+					}
+				}
+				reject foundFallbackCUDA
+			}
+		}
+		when "building a low-latency HDR H264 profile" {
+			profile := transcode.BuildVideoProfile(transcode.Job{
+				Type:    transcode.JobTypeLiveCache,
+				Quality: "h264-480p",
+			}, &mp4.MediaInfo{
+				Streams: []mp4.StreamInfo{{
+					Type:          "video",
+					Codec:         "hevc",
+					Width:         1920,
+					Height:        1080,
+					ColorTransfer: "smpte2084",
+				}},
+			}, makeNVENCCaps(), nil)
+
+			then "keeps the software tonemap path instead of CUDA decode" {
+				reject profile.HardwareDecode
+				expect strings.Contains(profile.VideoFilter, "tonemap")
+				expect strings.Contains(profile.VideoFilter, "scale=-2:480")
+				args := transcode.DecoderArgs(profile)
+				foundCUDA := false
+				for i, a := range args {
+					if a == "-hwaccel" && i+1 < len(args) && args[i+1] == "cuda" {
+						foundCUDA = true
+					}
+				}
+				reject foundCUDA
+				fallback := transcode.SoftwareDecodeFallbackProfile(profile)
+				expect fallback.VideoFilter == profile.VideoFilter
+			}
+		}
+		when "building a high-rung live-cache software fallback profile" {
+			profile := transcode.BuildVideoProfile(transcode.Job{
+				Type:    transcode.JobTypeLiveCache,
+				Quality: "h264-720p__audio4",
+			}, &mp4.MediaInfo{
+				Streams: []mp4.StreamInfo{{
+					Type:          "video",
+					Codec:         "hevc",
+					Width:         1920,
+					Height:        1080,
+					ColorTransfer: "smpte2084",
+				}},
+			}, transcode.Capabilities{
+				CPUAvailable:     true,
+				NVENCAvailable:   true,
+				PreferredBackend: transcode.BackendNVENC,
+				GPUDevice:        "0",
+				VideoEncoders:    []string{"h264_nvenc", "libx264"},
+				ZScaleAvailable:  true,
+			}, nil)
+
+			then "normalizes cache quality to the bounded rung and preserves tonemap" {
+				reject profile.HardwareDecode
+				expect profile.Height == 480
+				expect profile.Quality == "h264-480p__audio4"
+				expect strings.Contains(profile.VideoFilter, "scale=-2:480")
+				expect strings.Contains(profile.VideoFilter, "tonemap")
+			}
+		}
+
+		when "building a high-rung on-demand H264 profile for an AV1 source without hardware decode" {
+			profile := transcode.BuildVideoProfile(transcode.Job{
+				Type:    transcode.JobTypeOnDemand,
+				Quality: "h264-720p__audio4",
+			}, &mp4.MediaInfo{
+				Streams: []mp4.StreamInfo{{
+					Type:   "video",
+					Codec:  "av1",
+					Width:  1920,
+					Height: 1080,
+				}},
+			}, transcode.Capabilities{
+				CPUAvailable:     true,
+				NVENCAvailable:   true,
+				PreferredBackend: transcode.BackendNVENC,
+				GPUDevice:        "0",
+				VideoEncoders:    []string{"h264_nvenc", "libx264"},
+			}, nil)
+
+			then "normalizes cache quality to the base rung and uses one decoder thread" {
+				reject profile.HardwareDecode
+				expect profile.Height == 480
+				expect profile.Quality == "h264-480p__audio4"
+				expect profile.DecoderThreads == 1
+				expect profile.EncoderThreads == 1
+				expect profile.FilterThreads == 1
+				expect strings.Contains(profile.VideoFilter, "scale=-2:480")
+			}
+		}
+
+		when "building a high-rung on-demand AV1 profile for an AV1 source without hardware decode" {
+			profile := transcode.BuildVideoProfile(transcode.Job{
+				Type:    transcode.JobTypeOnDemand,
+				Quality: "av1-1080p",
+			}, &mp4.MediaInfo{
+				Streams: []mp4.StreamInfo{{
+					Type:   "video",
+					Codec:  "av1",
+					Width:  1920,
+					Height: 1080,
+				}},
+			}, transcode.Capabilities{
+				CPUAvailable:     true,
+				PreferredBackend: transcode.BackendCPU,
+				VideoEncoders:    []string{"libsvtav1"},
+			}, nil)
+
+			then "keeps the AV1 target but normalizes it to the base rung" {
+				expect profile.Codec == transcode.CodecAV1
+				expect profile.Height == 480
+				expect profile.Quality == "av1-480p"
+				expect profile.DecoderThreads == 1
+				expect profile.EncoderThreads == 1
+				expect profile.FilterThreads == 1
+				expect strings.Contains(profile.VideoFilter, "scale=-2:480")
+			}
+		}
+	}
+
+	given "VAAPI backend" {
+		when "resolving 1080p" {
+			profile := transcode.ResolveVideoProfileForCapabilities("h264-1080p", makeVAAPICaps())
+
+			then "selects VAAPI" {
+				expect profile.VideoEncoder == "h264_vaapi"
+				expect profile.Backend == "vaapi"
+			}
+		}
+	}
+}
+
+unit "EncoderArgs" {
+	given "CPU thread parsing" {
+		then "defaults to two threads" {
+			expect transcode.ParseFFmpegCPUThreads("") == 2
+		}
+		then "accepts positive overrides" {
+			expect transcode.ParseFFmpegCPUThreads("4") == 4
+		}
+		then "ignores invalid and nonpositive overrides" {
+			expect transcode.ParseFFmpegCPUThreads("nope") == 2
+			expect transcode.ParseFFmpegCPUThreads("0") == 2
+			expect transcode.ParseFFmpegCPUThreads("-1") == 2
+		}
+	}
+
+	given "an NVENC profile" {
+		profile := transcode.ResolveVideoProfileForCapabilities("h264-1080p", makeNVENCCaps())
+
+		when "building args" {
+			args := transcode.EncoderArgs(profile)
+
+			then "includes nvenc codec" {
+				found := false
+				for i, a := range args {
+					if a == "-c:v" && i+1 < len(args) && args[i+1] == "h264_nvenc" {
+						found = true
+					}
+				}
+				expect found
+			}
+		}
+	}
+
+	given "a CPU profile" {
+		profile := transcode.ResolveVideoProfileForCapabilities("h264-1080p", makeCPUCaps())
+
+		when "building args" {
+			args := transcode.EncoderArgs(profile)
+
+			then "includes libx264" {
+				found := false
+				for i, a := range args {
+					if a == "-c:v" && i+1 < len(args) && args[i+1] == "libx264" {
+						found = true
+					}
+				}
+				expect found
+			}
+		}
+	}
+}
+
+unit "Coordinator lifecycle" {
+	given "a new coordinator" {
+		coord := transcode.NewCoordinator()
+
+		when "enqueueing a job" {
+			job := makeJob("job-1", "/media/movie.mp4", "h264-1080p", transcode.JobTypeOnDemand)
+			record, isNew := coord.Enqueue(job)
+
+			then "returns new" {
+				expect isNew
+				expect record.Job.ID == "job-1"
+			}
+			then "job is retrievable" {
+				got, ok := coord.GetJob("job-1")
+				expect ok
+				expect got.Job.SourcePath == "/media/movie.mp4"
+			}
+		}
+
+		when "enqueueing a duplicate" {
+			job1 := makeJob("dup-1", "/media/same.mp4", "h264-1080p", transcode.JobTypeOnDemand)
+			_, first := coord.Enqueue(job1)
+			job2 := makeJob("dup-2", "/media/same.mp4", "h264-1080p", transcode.JobTypeOnDemand)
+			_, second := coord.Enqueue(job2)
+
+			then "first is new, second deduped" {
+				expect first
+				reject second
+			}
+		}
+
+		when "enqueueing jobs with incompatible negotiated audio capabilities" {
+			stereo := makeJob("audio-stereo", "/media/audio-same.mp4", "h264-1080p", transcode.JobTypeOnDemand)
+			stereo.AudioCodecs = []string{"aac"}
+			stereo.MaxAudioChannels = 2
+			_, stereoInserted := coord.Enqueue(stereo)
+			surround := makeJob("audio-surround", "/media/audio-same.mp4", "h264-1080p", transcode.JobTypeOnDemand)
+			surround.AudioCodecs = []string{"aac"}
+			surround.MaxAudioChannels = 6
+			_, surroundInserted := coord.Enqueue(surround)
+			passthrough := makeJob("audio-passthrough", "/media/audio-same.mp4", "h264-1080p", transcode.JobTypeOnDemand)
+			passthrough.AudioCodecs = []string{"aac", "ac3"}
+			passthrough.MaxAudioChannels = 6
+			_, passthroughInserted := coord.Enqueue(passthrough)
+
+			then "each audio plan gets a distinct queued job" {
+				expect stereoInserted
+				expect surroundInserted
+				expect passthroughInserted
+			}
+		}
+
+		when "enqueueing equivalent negotiated audio capability sets" {
+			firstJob := makeJob("audio-canon-1", "/media/audio-canon.mp4", "h264-1080p", transcode.JobTypeOnDemand)
+			firstJob.AudioCodecs = []string{" EAC3 ", "aac", "eac3"}
+			firstJob.MaxAudioChannels = 8
+			firstRecord, firstInserted := coord.Enqueue(firstJob)
+			secondJob := makeJob("audio-canon-2", "/media/audio-canon.mp4", "h264-1080p", transcode.JobTypeOnDemand)
+			secondJob.AudioCodecs = []string{"aac", "EAC3"}
+			secondJob.MaxAudioChannels = 6
+			secondRecord, secondInserted := coord.Enqueue(secondJob)
+
+			then "the second job dedupes to the canonical existing job" {
+				expect firstInserted
+				reject secondInserted
+				expect secondRecord.Job.ID == firstRecord.Job.ID
+			}
+		}
+
+		when "registering a worker" {
+			workerID := coord.RegisterWorker(makeWorkerState("gpu-host", "/media", makeNVENCCaps()))
+
+			then "returns ID and appears in list" {
+				expect workerID != ""
+				workers := coord.ListWorkers()
+				expect len(workers) >= 1
+			}
+		}
+
+		when "cancelling a job" {
+			coord.Enqueue(makeJob("cancel-1", "/media/cancel.mp4", "h264-720p", transcode.JobTypeOnDemand))
+			err := coord.Cancel("cancel-1")
+
+			then "succeeds" {
+				expect err == nil
+			}
+			then "job is cancelled" {
+				got, ok := coord.GetJob("cancel-1")
+				expect ok
+				expect got.Status == transcode.JobStatusCancelled
+			}
+		}
+	}
+
+	given "a coordinator with worker" {
+		coord := transcode.NewCoordinator()
+		workerID := coord.RegisterWorker(makeWorkerState("w1", "/media", makeCPUCaps()))
+
+		when "subscribing" {
+			ch, unsub, err := coord.Subscribe(workerID)
+			defer unsub()
+
+			then "subscribe succeeds" {
+				expect err == nil
+				expect ch not_nil
+			}
+		}
+
+		when "deregistering" {
+			coord.DeregisterWorker(workerID)
+			workers := coord.ListWorkers()
+
+			then "worker count decreases" {
+				foundAny := false
+				for _, w := range workers {
+					if w.Label == "w1" {
+						foundAny = true
+					}
+				}
+				reject foundAny
+			}
+		}
+	}
+}
+
+unit "QueueSummary" {
+	given "a coordinator with mixed jobs" {
+		coord := transcode.NewCoordinator()
+		coord.Enqueue(makeJob("t1", "/a.mp4", "h264-1080p", transcode.JobTypeTheatre))
+		coord.Enqueue(makeJob("t2", "/b.mp4", "h264-720p", transcode.JobTypeOnDemand))
+		coord.Enqueue(makeJob("t3", "/c.mp4", "h264-720p", transcode.JobTypeCacheWarmup))
+
+		when "getting summary" {
+			summary := coord.QueueSummary()
+
+			then "counts by priority" {
+				expect summary.Urgent >= 1
+				expect summary.Normal >= 1
+				expect summary.Low >= 1
+			}
+		}
+	}
+
+	given "a coordinator with admission caps" {
+		coord, err := transcode.NewCoordinatorWithOptions(transcode.CoordinatorOptions{
+			MaxQueuedJobs:    2,
+			MaxLowQueuedJobs: 2,
+			MaxQueuedJobsByType: map[transcode.JobType]int{
+				transcode.JobTypeCacheWarmup: 2,
+			},
+		})
+
+		when "the queue is full of speculative warmup work" {
+			first, firstInserted := coord.Enqueue(makeJob("warm-1", "/warm-1.mp4", "h264-720p", transcode.JobTypeCacheWarmup))
+			_, secondInserted := coord.Enqueue(makeJob("warm-2", "/warm-2.mp4", "h264-480p", transcode.JobTypeCacheWarmup))
+			_, thirdInserted := coord.Enqueue(makeJob("warm-3", "/warm-3.mp4", "h264-360p", transcode.JobTypeCacheWarmup))
+			interactive, interactiveInserted := coord.Enqueue(makeJob("watch-now", "/watch.mp4", "h264-720p", transcode.JobTypeOnDemand))
+
+			then "constructs the bounded coordinator" {
+				expect err == nil
+				expect coord != nil
+			}
+			then "rejects excess background work" {
+				expect firstInserted
+				expect secondInserted
+				reject thirdInserted
+			}
+			then "admits the interactive job by shedding old background work" {
+				expect interactiveInserted
+				gotInteractive, ok := coord.GetJob(interactive.Job.ID)
+				expect ok
+				expect gotInteractive.Status == transcode.JobStatusQueued
+				gotFirst, ok := coord.GetJob(first.Job.ID)
+				expect ok
+				expect gotFirst.Status == transcode.JobStatusCancelled
+			}
+			then "reports deterministic pressure counters" {
+				snapshot := coord.QueueAdmissionSnapshot()
+				expect snapshot.QueuedTotal == 2
+				expect snapshot.MaxQueued == 2
+				expect snapshot.RejectedCapacity == 1
+				expect snapshot.ShedLowPriority == 1
+			}
+		}
+	}
+
+	given "a coordinator with OCR and warmup work" {
+		coord := transcode.NewCoordinator()
+		coord.Enqueue(makeJob("warm-low", "/warm.mp4", "h264-720p", transcode.JobTypeCacheWarmup))
+		coord.Enqueue(makeJob("ocr-low", "/ocr.mkv", "ocr", transcode.JobTypeSubtitleOCR))
+
+		when "summarizing the queue" {
+			summary := coord.QueueSummary()
+
+			then "subtitle OCR follows background policy priority" {
+				expect summary.Low >= 2
+			}
+		}
+	}
+}
+
+unit "Low latency hardware-only routing" {
+	given "hardware-only low latency routing is enabled" {
+		when "only a CPU worker is connected" {
+			coord := transcode.NewCoordinator()
+			coord.SetLowLatencyHardwareOnly(true)
+			cpu := makeWorkerState("cpu", "/media", makeCPUCaps())
+			cpu.HasFFmpeg = true
+			cpu.VideoEncoders = []string{"libx264", "h264_nvenc"}
+			workerID := coord.RegisterWorker(cpu)
+			jobs, stop, err := coord.Subscribe(workerID)
+			defer stop()
+			record, inserted := coord.Enqueue(makeJob("theatre-cpu", "/media/movie.mp4", "h264-720p", transcode.JobTypeTheatre))
+
+			then "subscribe succeeds" {
+				expect err == nil
+			}
+			then "queues the theatre job without dispatching to CPU" {
+				expect inserted
+				select {
+				case job := <-jobs:
+					t.Fatalf("CPU worker received low-latency job %q", job.ID)
+				case <-time.After(20 * time.Millisecond):
+				}
+				got, ok := coord.GetJob(record.Job.ID)
+				expect ok
+				expect got.Status == transcode.JobStatusQueued
+			}
+		}
+
+		when "an NVENC worker is connected" {
+			coord := transcode.NewCoordinator()
+			coord.SetLowLatencyHardwareOnly(true)
+			gpu := makeWorkerState("gpu", "/media", makeNVENCCaps())
+			gpu.HasFFmpeg = true
+			gpu.VideoEncoders = []string{"h264_nvenc", "libx264"}
+			workerID := coord.RegisterWorker(gpu)
+			jobs, stop, err := coord.Subscribe(workerID)
+			defer stop()
+			record, inserted := coord.Enqueue(makeJob("theatre-gpu", "/media/movie.mp4", "h264-720p", transcode.JobTypeTheatre))
+
+			then "dispatches the theatre job to hardware" {
+				expect err == nil
+				expect inserted
+				select {
+				case job := <-jobs:
+					expect job.ID == record.Job.ID
+				case <-time.After(500 * time.Millisecond):
+					t.Fatal("expected theatre dispatch to NVENC worker")
+				}
+			}
+		}
+	}
+}
+
+unit "Pod-style worker routing" {
+	given "a pod worker with OCR but no ffmpeg transcode capability" {
+		coord := transcode.NewCoordinator()
+		workerID := coord.RegisterWorker(transcode.WorkerState{
+			WorkerID:     "ocr-pod",
+			MediaRoot:    "/media",
+			HasTesseract: true,
+		})
+		jobs, stop, err := coord.Subscribe(workerID)
+		defer stop()
+
+		thumb, thumbInserted := coord.Enqueue(transcode.Job{
+			ID:         "thumb-pod",
+			Type:       transcode.JobTypeThumbnail,
+			SourcePath: "/media/movie.mp4",
+		})
+		video, videoInserted := coord.Enqueue(transcode.Job{
+			ID:         "video-pod",
+			Type:       transcode.JobTypeOnDemand,
+			SourcePath: "/media/movie.mp4",
+			Quality:    "h264-720p",
+		})
+		ocr, ocrInserted := coord.Enqueue(transcode.Job{
+			ID:         "ocr-pod",
+			Type:       transcode.JobTypeSubtitleOCR,
+			SourcePath: "/media/movie.mp4",
+			Quality:    "ocr:0",
+		})
+
+		then "subscribe succeeds" {
+			expect err == nil
+		}
+		then "queues ffmpeg work without dispatching it to the pod" {
+			expect thumbInserted
+			expect videoInserted
+			gotThumb, ok := coord.GetJob(thumb.Job.ID)
+			expect ok
+			expect gotThumb.Status == transcode.JobStatusQueued
+			gotVideo, ok := coord.GetJob(video.Job.ID)
+			expect ok
+			expect gotVideo.Status == transcode.JobStatusQueued
+		}
+		then "still dispatches OCR work to the pod" {
+			expect ocrInserted
+			select {
+			case job := <-jobs:
+				expect job.ID == ocr.Job.ID
+			case <-time.After(500 * time.Millisecond):
+				t.Fatal("expected OCR dispatch to pod worker")
+			}
+		}
+	}
+}
+
+unit "ReapStaleWorkers" {
+	given "a coordinator with a worker" {
+		coord := transcode.NewCoordinator()
+		coord.RegisterWorker(makeWorkerState("stale", "/media", makeCPUCaps()))
+
+		when "reaping with generous max age" {
+			// Sleep briefly so the worker's registration time is in the past
+			time.Sleep(10 * time.Millisecond)
+			reaped := coord.ReapStaleWorkers(time.Millisecond)
+
+			then "removes the stale worker" {
+				expect len(reaped) >= 1
+			}
+		}
+	}
+}

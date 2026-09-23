@@ -8566,11 +8566,11 @@
             {
               "members": [
                 {
-                  "name": "_expression",
+                  "name": "duration_literal",
                   "type": "SYMBOL"
                 },
                 {
-                  "name": "duration_literal",
+                  "name": "_expression",
                   "type": "SYMBOL"
                 }
               ],
@@ -8588,11 +8588,11 @@
             {
               "members": [
                 {
-                  "name": "_expression",
+                  "name": "duration_literal",
                   "type": "SYMBOL"
                 },
                 {
-                  "name": "duration_literal",
+                  "name": "_expression",
                   "type": "SYMBOL"
                 }
               ],
@@ -9508,11 +9508,11 @@
                   "content": {
                     "members": [
                       {
-                        "name": "_expression",
+                        "name": "duration_literal",
                         "type": "SYMBOL"
                       },
                       {
-                        "name": "duration_literal",
+                        "name": "_expression",
                         "type": "SYMBOL"
                       }
                     ],
@@ -9567,11 +9567,11 @@
                   "content": {
                     "members": [
                       {
-                        "name": "_expression",
+                        "name": "duration_literal",
                         "type": "SYMBOL"
                       },
                       {
-                        "name": "duration_literal",
+                        "name": "_expression",
                         "type": "SYMBOL"
                       }
                     ],
@@ -9789,11 +9789,11 @@
           "content": {
             "members": [
               {
-                "name": "_expression",
+                "name": "duration_literal",
                 "type": "SYMBOL"
               },
               {
-                "name": "duration_literal",
+                "name": "_expression",
                 "type": "SYMBOL"
               }
             ],

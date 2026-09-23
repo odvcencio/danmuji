@@ -1,0 +1,118 @@
+package mp4_test
+
+import (
+	"bytes"
+	"encoding/binary"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/container/mp4"
+)
+
+unit "ConvertToAnnexB all length sizes" {
+	each "length size" {
+		defaults { ls: 4 }
+		{ name: "1 byte prefix", ls: 1 }
+		{ name: "2 byte prefix", ls: 2 }
+		{ name: "3 byte prefix", ls: 3 }
+		{ name: "4 byte prefix", ls: 4 }
+	} do {
+		given "a sample with one NAL unit" {
+			ls := scenario.ls.(int)
+			naluBody := []byte{0x65, 0xAA, 0xBB, 0xCC, 0xDD}
+			data := make([]byte, ls+len(naluBody))
+			switch ls {
+			case 1:
+				data[0] = byte(len(naluBody))
+			case 2:
+				binary.BigEndian.PutUint16(data[0:2], uint16(len(naluBody)))
+			case 3:
+				data[0] = 0
+				data[1] = 0
+				data[2] = byte(len(naluBody))
+			case 4:
+				binary.BigEndian.PutUint32(data[0:4], uint32(len(naluBody)))
+			}
+			copy(data[ls:], naluBody)
+
+			when "converting" {
+				result := mp4.ConvertToAnnexB(data, ls)
+
+				then "output starts with Annex B start code" {
+					expect len(result) >= 4
+					expect bytes.HasPrefix(result, []byte{0x00, 0x00, 0x00, 0x01})
+				}
+				then "NAL body is preserved" {
+					expect bytes.Contains(result, naluBody)
+				}
+				then "output length is start code + body" {
+					expect len(result) == 4+len(naluBody)
+				}
+			}
+		}
+	}
+}
+
+unit "Sample table with composition time offsets" {
+	given "a sample table with ctts entries" {
+		st := &mp4.SampleTable{
+			Timescale: 90000,
+			Sizes:     []uint32{100, 100, 100, 100},
+			Offsets:   []int64{0},
+			Stts:      []mp4.SttsEntry{{Count: 4, Delta: 3000}},
+			Stsc:      []mp4.StscEntry{{FirstChunk: 1, SamplesPerChunk: 4}},
+			Ctts:      [][2]int32{{4, 6000}, {2, 3000}},
+		}
+
+		when "building sample index" {
+			idx := mp4.BuildSampleIndex(st)
+
+			then "CTS includes composition offset" {
+				expect len(idx) == 4
+				// DTS: 0, 3000, 6000, 9000
+				// ctts: first 4 samples get +6000 (count=4, but we only have 4 samples)
+				// Wait - ctts format is [count, offset]
+				// Entry 0: count=4, offset=6000 → samples 0-3 get +6000
+				// But we also have entry 1: count=2, offset=3000
+				// Since we only have 4 samples, only first entry applies
+				expect idx[0].CTS == idx[0].DTS + 6000
+			}
+		}
+	}
+}
+
+unit "Box parser handles many children" {
+	given "a container box with 100 children" {
+		var children bytes.Buffer
+		for i := 0; i < 100; i++ {
+			body := make([]byte, 20)
+			binary.BigEndian.PutUint32(body[0:4], uint32(i))
+			childBox := buildTestBox("free", body)
+			children.Write(childBox)
+		}
+		containerData := buildTestContainerBox("moov", children.Bytes())
+		reader := bytes.NewReader(containerData)
+
+		when "parsing" {
+			boxes, err := mp4.ReadBoxes(reader, int64(len(containerData)))
+
+			then "succeeds" {
+				expect err == nil
+				expect len(boxes) == 1
+			}
+			then "moov has 100 children" {
+				expect len(boxes[0].Children) == 100
+			}
+		}
+	}
+}
+
+func buildTestBox(boxType string, data []byte) []byte {
+	hdr := make([]byte, 8)
+	binary.BigEndian.PutUint32(hdr[0:4], uint32(8+len(data)))
+	copy(hdr[4:8], boxType)
+	return append(hdr, data...)
+}
+
+func buildTestContainerBox(boxType string, children []byte) []byte {
+	return buildTestBox(boxType, children)
+}

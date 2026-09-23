@@ -1,0 +1,48 @@
+package api_test
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/api"
+)
+
+type staticHandler struct {
+	status int
+	body   string
+}
+
+func (h staticHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(h.status)
+	_, _ = io.WriteString(w, h.body)
+}
+
+unit "WithDiscordInteractions" {
+	given "a base router and discord handler" {
+		handler := api.WithDiscordInteractions(staticHandler{status: 200, body: "base"}, staticHandler{status: 202, body: "discord"})
+
+		when "requesting the discord interactions route" {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest("POST", "/api/discord/interactions", nil)
+			handler.ServeHTTP(rec, req)
+
+			then "dispatches to the discord handler" {
+				expect rec.Code == 202
+				expect rec.Body.String() == "discord"
+			}
+		}
+
+		when "requesting any other route" {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest("GET", "/health", nil)
+			handler.ServeHTTP(rec, req)
+
+			then "dispatches to the base router" {
+				expect rec.Code == 200
+				expect rec.Body.String() == "base"
+			}
+		}
+	}
+}

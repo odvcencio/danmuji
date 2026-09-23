@@ -1,0 +1,30 @@
+package theatre_test
+
+import (
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/theatre"
+)
+
+fuzz "DecodeMessage does not panic on arbitrary input" with (data []byte) {
+	theatre.DecodeMessage(data)
+	expect true
+}
+
+fuzz "EncodeSyncHeartbeat round trips" with (serverTime uint64, viewerCount uint16, playing bool) {
+	pos := float32(serverTime % 100000000)
+	hb := theatre.SyncHeartbeat{
+		ServerTime:  serverTime,
+		Position:    pos,
+		Playing:     playing,
+		ViewerCount: viewerCount,
+	}
+	encoded := theatre.EncodeSyncHeartbeat(hb)
+	msg, ok := theatre.DecodeMessage(encoded[:])
+	if ok && msg.SyncHeartbeat != nil {
+		expect msg.SyncHeartbeat.ServerTime == serverTime
+		expect msg.SyncHeartbeat.ViewerCount == viewerCount
+		expect msg.SyncHeartbeat.Playing == playing
+	}
+	expect true
+}

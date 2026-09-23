@@ -1,0 +1,113 @@
+package auth
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+unit "owner password verifier" {
+	then "the accepted Argon2id envelope uses the fixed v1 parameters and verifies without case folding" {
+		password := []byte("Correct Horse Battery 7")
+		verifier, err := HashOwnerPassword(password)
+		expect err == nil
+		expect strings.HasPrefix(verifier, "$argon2id$v=19$m=65536,t=3,p=2$")
+		expect VerifyOwnerPassword([]byte("Correct Horse Battery 7"), verifier)
+		reject VerifyOwnerPassword([]byte("correct horse battery 7"), verifier)
+	}
+
+	then "short oversized and surrounding-whitespace passwords are rejected" {
+		_, shortErr := HashOwnerPassword([]byte("too short"))
+		_, longErr := HashOwnerPassword(bytes.Repeat([]byte{'a'}, 257))
+		_, whitespaceErr := HashOwnerPassword([]byte(" Correct Horse Battery 7"))
+		expect shortErr is ErrPasswordPolicy
+		expect longErr is ErrPasswordPolicy
+		expect whitespaceErr is ErrPasswordPolicy
+	}
+}
+
+unit "owner one-time credential" {
+	then "credentials are 256-bit redacted values with a fixed fifteen-minute lifetime" {
+		now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+		credential, err := newOwnerCredential(OwnerTokenBootstrap, 0, now, bytes.NewReader(bytes.Repeat([]byte{0x2a}, ownerTokenBytes)))
+		expect err == nil
+		defer credential.Close()
+		expect credential.ExpiresAt().Equal(now.Add(OwnerTokenTTL))
+		expect len(credential.Bytes()) == ownerTokenBytes
+		rendered := fmt.Sprintf("%v %+v %#v", credential, credential, credential)
+		encoded, jsonErr := json.Marshal(credential)
+		expect jsonErr == nil
+		expect strings.Contains(rendered, "[redacted]")
+		expect strings.Contains(string(encoded), "[redacted]")
+		wire := credential.EncodedBytes()
+		defer eraseOwnerBytes(wire)
+		reject bytes.Contains([]byte(rendered), wire)
+		reject bytes.Contains(encoded, wire)
+	}
+
+	then "closing a credential erases its owned secret" {
+		credential, err := newOwnerCredential(OwnerTokenRecovery, 7, time.Now(), bytes.NewReader(bytes.Repeat([]byte{0x5b}, ownerTokenBytes)))
+		expect err == nil
+		credential.Close()
+		expect len(credential.Bytes()) == 0
+		expect len(credential.EncodedBytes()) == 0
+	}
+
+	then "only the exact unpadded base64url wire value decodes" {
+		credential, err := newOwnerCredential(OwnerTokenBootstrap, 0, time.Now(), bytes.NewReader(bytes.Repeat([]byte{0x4c}, ownerTokenBytes)))
+		expect err == nil
+		defer credential.Close()
+		wire := credential.EncodedBytes()
+		defer eraseOwnerBytes(wire)
+		decoded, decodeErr := DecodeOwnerCredential(wire)
+		expect decodeErr == nil
+		expect len(decoded) == ownerTokenBytes
+		_, paddedErr := DecodeOwnerCredential(append(append([]byte(nil), wire...), '='))
+		_, shortErr := DecodeOwnerCredential([]byte("c2hvcnQ"))
+		_, newlineErr := DecodeOwnerCredential(append(append([]byte(nil), wire...), '\n'))
+		_, carriageReturnErr := DecodeOwnerCredential(append(append([]byte(nil), wire...), '\r'))
+		_, leadingNewlineErr := DecodeOwnerCredential(append([]byte{'\n'}, wire...))
+		expect paddedErr is ErrOwnerCredentialInvalid
+		expect shortErr is ErrOwnerCredentialInvalid
+		expect newlineErr is ErrOwnerCredentialInvalid
+		expect carriageReturnErr is ErrOwnerCredentialInvalid
+		expect leadingNewlineErr is ErrOwnerCredentialInvalid
+	}
+}
+
+unit "owner credential delivery" {
+	then "non-interactive delivery requires a newly-created owner-only file" {
+		credential, err := newOwnerCredential(OwnerTokenRecovery, 7, time.Now(), bytes.NewReader(bytes.Repeat([]byte{0x6c}, ownerTokenBytes)))
+		expect err == nil
+		defer credential.Close()
+		path := filepath.Join(t.TempDir(), "owner-token")
+		err = deliverOwnerCredential(credential, path, "", nil, func(int) bool { return false })
+		expect err == nil
+		info, statErr := os.Stat(path)
+		expect statErr == nil
+		expect info.Mode().Perm() == 0600
+		body, readErr := os.ReadFile(path)
+		expect readErr == nil
+		wire := credential.EncodedBytes()
+		defer eraseOwnerBytes(wire)
+		expect bytes.Equal(bytes.TrimSpace(body), wire)
+	}
+
+	then "delivery fails closed when a target exists or stdout is not a TTY" {
+		credential, err := newOwnerCredential(OwnerTokenBootstrap, 0, time.Now(), bytes.NewReader(bytes.Repeat([]byte{0x7d}, ownerTokenBytes)))
+		expect err == nil
+		defer credential.Close()
+		path := filepath.Join(t.TempDir(), "existing")
+		expect os.WriteFile(path, []byte("keep"), 0600) == nil
+		expect deliverOwnerCredential(credential, path, "http://127.0.0.1:3000/setup", nil, func(int) bool { return false }) != nil
+		expect deliverOwnerCredential(credential, "", "http://127.0.0.1:3000/setup", os.Stdout, func(int) bool { return false }) is ErrCredentialDelivery
+		body, readErr := os.ReadFile(path)
+		expect readErr == nil
+		expect string(body) == "keep"
+	}
+}

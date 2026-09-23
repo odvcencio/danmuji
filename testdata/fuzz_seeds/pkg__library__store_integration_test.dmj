@@ -1,0 +1,647 @@
+package library_test
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/docker/go-connections/nat"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
+
+	"github.com/odvcencio/goetrope/pkg/artifacts"
+	"github.com/odvcencio/goetrope/pkg/db"
+	"github.com/odvcencio/goetrope/pkg/library"
+)
+
+integration "Store upsert and retrieve" {
+	before all {
+		ctx := context.Background()
+		pgReq := testcontainers.ContainerRequest{
+			Image:        "postgres:15",
+			ExposedPorts: []string{"5432/tcp"},
+			Env: map[string]string{
+				"POSTGRES_USER":     "test",
+				"POSTGRES_PASSWORD": "test",
+				"POSTGRES_DB":       "goetrope_test",
+			},
+			WaitingFor: wait.ForAll(
+				wait.ForListeningPort(nat.Port("5432/tcp")),
+				wait.ForLog("database system is ready to accept connections").WithOccurrence(2),
+			).WithDeadline(2 * time.Minute),
+		}
+		pgContainer, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+			ContainerRequest: pgReq,
+			Started:          true,
+		})
+		if err != nil {
+			t.Fatalf("start postgres: %v", err)
+		}
+		t.Cleanup(func() { _ = pgContainer.Terminate(ctx) })
+
+		pgHost, err := pgContainer.Host(ctx)
+		if err != nil {
+			t.Fatalf("get host: %v", err)
+		}
+		pgPort, err := pgContainer.MappedPort(ctx, "5432/tcp")
+		if err != nil {
+			t.Fatalf("get port: %v", err)
+		}
+
+		connStr := fmt.Sprintf("postgres://test:test@%s:%s/goetrope_test?sslmode=disable", pgHost, pgPort.Port())
+		pool, err := pgxpool.New(ctx, connStr)
+		if err != nil {
+			t.Fatalf("connect: %v", err)
+		}
+		t.Cleanup(func() { pool.Close() })
+
+		if migErr := db.Migrate(ctx, pool); migErr != nil {
+			t.Fatalf("migrate: %v", migErr)
+		}
+
+		store := library.NewStore(pool)
+		_, _ = pool.Exec(ctx, `
+			INSERT INTO media_items (id, path, title, duration_ms, container)
+			VALUES
+				(10, '/media/movies/zulu.mkv', 'Zulu Movie', 3600000, 'mkv'),
+				(6001, '/media/movies/alpha-far.mkv', 'Alpha Far Movie', 3600000, 'mkv'),
+				(6002, '/media/shows/show-s01e01.mkv', 'Show Episode', 1800000, 'mkv'),
+				(6003, '/media/movies/audio-only.m4a', 'Audio Only', 1800000, 'm4a')
+		`)
+		_, _ = pool.Exec(ctx, `
+			INSERT INTO metadata (media_item_id, source, raw_title, resolved_title, season, episode)
+			VALUES
+				(10, 'manual', 'Zulu Movie', 'Zulu Movie', 0, 0),
+				(6001, 'manual', 'Alpha Far Movie', 'Alpha Far Movie', 0, 0),
+				(6002, 'manual', 'Show Episode', 'Show Episode', 1, 1),
+				(6003, 'manual', 'Audio Only', 'Audio Only', 0, 0)
+		`)
+		_, _ = pool.Exec(ctx, `
+			INSERT INTO streams (media_item_id, stream_index, stream_type, codec)
+			VALUES
+				(10, 0, 'video', 'h264'),
+				(6001, 0, 'video', 'h264'),
+				(6002, 0, 'video', 'h264'),
+				(6003, 0, 'audio', 'aac')
+		`)
+	}
+
+	given "an empty database" {
+		when "upserting a media item with streams" {
+			item := &library.MediaItem{
+				Path:       "/media/movies/The.Matrix.1999.mp4",
+				Title:      "The Matrix",
+				Year:       1999,
+				DurationMs: 8160000,
+				FileSize:   4000000000,
+				Container:  "mp4",
+				Streams: []library.Stream{
+					{StreamIndex: 0, StreamType: "video", Codec: "h264", Width: 1920, Height: 1080, Bitrate: 5000000},
+					{StreamIndex: 1, StreamType: "audio", Codec: "aac", SampleRate: 48000, Channels: 6, Language: "eng", IsDefault: true},
+				},
+			}
+			upsertErr := store.UpsertItem(ctx, item)
+
+			then "succeeds" {
+				expect upsertErr == nil
+			}
+			then "assigns an ID" {
+				expect item.ID > 0
+			}
+		}
+
+		when "upserting then retrieving" {
+			item := &library.MediaItem{
+				Path:       "/media/movies/Blade.Runner.2049.mp4",
+				Title:      "Blade Runner 2049",
+				Year:       2017,
+				DurationMs: 9900000,
+				FileSize:   5000000000,
+				Container:  "mp4",
+				Streams: []library.Stream{
+					{StreamIndex: 0, StreamType: "video", Codec: "hevc", Width: 3840, Height: 2160, Bitrate: 20000000},
+					{StreamIndex: 1, StreamType: "audio", Codec: "aac", SampleRate: 48000, Channels: 2, Language: "eng", IsDefault: true},
+				},
+			}
+			_ = store.UpsertItem(ctx, item)
+			got, getErr := store.GetItem(ctx, item.ID)
+
+			then "retrieves the item" {
+				expect getErr == nil
+				expect got.Title == "Blade Runner 2049"
+				expect got.Year == 2017
+			}
+			then "retrieves streams" {
+				expect len(got.Streams) == 2
+			}
+		}
+	}
+
+	given "an existing item" {
+		when "upserting again replaces streams" {
+			item := &library.MediaItem{
+				Path:       "/media/movies/Upsert.Test.mp4",
+				Title:      "Upsert Test",
+				Year:       2020,
+				DurationMs: 3600000,
+				FileSize:   1000000000,
+				Container:  "mp4",
+				Streams: []library.Stream{
+					{StreamIndex: 0, StreamType: "video", Codec: "h264", Width: 1920, Height: 1080},
+					{StreamIndex: 1, StreamType: "audio", Codec: "aac", SampleRate: 44100, Channels: 2},
+				},
+			}
+			_ = store.UpsertItem(ctx, item)
+			firstID := item.ID
+
+			item.Year = 1980
+			item.Streams = []library.Stream{
+				{StreamIndex: 0, StreamType: "video", Codec: "hevc", Width: 3840, Height: 2160},
+			}
+			replaceErr := store.UpsertItem(ctx, item)
+
+			then "succeeds" {
+				expect replaceErr == nil
+			}
+			then "keeps the same ID" {
+				expect item.ID == firstID
+			}
+			then "old streams are gone" {
+				got, _ := store.GetItem(ctx, item.ID)
+				expect len(got.Streams) == 1
+				expect got.Streams[0].Codec == "hevc"
+			}
+			then "year is updated on conflict" {
+				got, _ := store.GetItem(ctx, item.ID)
+				expect got.Year == 1980
+			}
+		}
+	}
+
+	given "movie video items beyond the old five-thousand title window" {
+		when "paging after id 5000" {
+			items, err := store.ListVideoItemPage(ctx, library.ListVideoItemPageOptions{AfterID: 5000, Limit: 10})
+
+			then "returns later eligible movie videos only" {
+				expect err == nil
+				expect len(items) == 1
+				expect items[0].ID == int64(6001)
+			}
+		}
+
+		when "sampling a ring near the end of the id space" {
+			items, err := store.ListVideoItemsRing(ctx, 6001, 2)
+
+			then "wraps once in stable id order without exceeding the limit" {
+				expect err == nil
+				expect len(items) == 2
+				expect items[0].ID == int64(6001)
+				expect items[1].ID < int64(6001)
+			}
+		}
+
+		when "calling the legacy list API" {
+			items, err := store.ListVideoItems(ctx, 1)
+
+			then "keeps title-ordered movie-only semantics" {
+				expect err == nil
+				expect len(items) == 1
+				expect items[0].ID == int64(6001)
+			}
+		}
+
+		when "reading the id ceiling for random starts" {
+			maxID, err := store.MaxMediaItemID(ctx)
+
+			then "uses the media item primary key ceiling" {
+				expect err == nil
+				expect maxID == int64(6003)
+			}
+		}
+	}
+
+	given "random channel scoped state" {
+		when "recording plays for two channel aliases" {
+			legacyErr := store.RecordRandomChannelPlay(ctx, 10)
+			showErr := store.RecordRandomChannelPlayForChannel(ctx, "2", 6002)
+			legacyHistory, legacyListErr := store.ListRandomChannelPlayHistory(ctx, 20)
+			showHistory, showListErr := store.ListRandomChannelPlayHistoryForChannel(ctx, "2", 20)
+
+			then "keeps the legacy API in the movie channel bucket" {
+				expect legacyErr == nil
+				expect legacyListErr == nil
+				expect len(legacyHistory) >= 1
+				expect legacyHistory[0].ChannelAlias == "1"
+			}
+			then "keeps the show channel history isolated" {
+				expect showErr == nil
+				expect showListErr == nil
+				expect len(showHistory) == 1
+				expect showHistory[0].ChannelAlias == "2"
+				expect showHistory[0].MediaItemID == int64(6002)
+			}
+		}
+
+		when "upserting per-channel series progress" {
+			var seriesID int64
+			seriesSeedErr := pool.QueryRow(ctx, `
+				INSERT INTO series (title, sort_title, match_key)
+				VALUES ('Scoped Show', 'Scoped Show', 'scoped show')
+				ON CONFLICT (match_key) DO UPDATE SET title = EXCLUDED.title
+				RETURNING id
+			`).Scan(&seriesID)
+			firstErr := store.UpsertRandomChannelSeriesState(ctx, "2", seriesID, 6002)
+			secondErr := store.UpsertRandomChannelSeriesState(ctx, "", seriesID, 10)
+			showState, showStateErr := store.GetRandomChannelSeriesState(ctx, "2", seriesID)
+			legacyState, legacyStateErr := store.GetRandomChannelSeriesState(ctx, "", seriesID)
+
+			then "stores show progress without contaminating the legacy bucket" {
+				expect seriesSeedErr == nil
+				expect firstErr == nil
+				expect secondErr == nil
+				expect showStateErr == nil
+				expect legacyStateErr == nil
+				expect showState.ChannelAlias == "2"
+				expect showState.LastMediaItemID == int64(6002)
+				expect legacyState.ChannelAlias == "1"
+				expect legacyState.LastMediaItemID == int64(10)
+			}
+		}
+	}
+
+	given "derived artifact lifecycle rows" {
+		when "a planned orphan is leased and then fails" {
+			root := filepath.Join(t.TempDir(), ".goetrope-artifacts")
+			top := filepath.Join(root, "movie-sub")
+			_, mediaErr := pool.Exec(ctx, `
+				INSERT INTO media_items (id, path, title, duration_ms, container)
+				VALUES (9201, '/media/movie-sub.mkv', 'Movie Sub', 1000, 'mkv')
+			`)
+			mediaID := int64(9201)
+			autoDelete := true
+			upsert := artifacts.Upsert{
+				MediaItemID:  &mediaID,
+				Kind:         "subtitle_bitmap",
+				Token:        "sub-00",
+				RootPath:     root,
+				TopLevelPath: top,
+				ContentPath:  filepath.Join(top, "subtitles"),
+				AutoDelete:   &autoDelete,
+			}
+			_, upsertErr := store.UpsertDerivedArtifact(ctx, upsert)
+			now := time.Date(2026, time.March, 23, 12, 0, 0, 0, time.UTC)
+			orphanErr := store.MarkDerivedArtifactOrphan(ctx, top, now.Add(-2*time.Hour), now.Add(-time.Hour))
+			_, leaseErr := store.BeginDerivedArtifactLease(ctx, artifacts.Lease{
+				Upsert:    upsert,
+				LeaseID:   "lease-failure",
+				StartedAt: now,
+				Duration:  time.Hour,
+			})
+			failErr := store.FailDerivedArtifact(ctx, artifacts.Failure{
+				TopLevelPath: top,
+				LeaseID:      "lease-failure",
+				FailedAt:     now.Add(time.Minute),
+				Message:      "decode failed",
+			})
+			var rows int
+			queryErr := pool.QueryRow(ctx, `
+				SELECT COUNT(*)
+				FROM derived_artifacts
+				WHERE top_level_path = $1
+					AND state = 'failed'
+					AND delete_state = 'none'
+					AND orphaned_at IS NULL
+					AND delete_after IS NULL
+					AND lease_id = ''
+					AND lease_expires_at IS NULL
+			`, top).Scan(&rows)
+
+			then "clears orphan and lease columns without violating constraints" {
+				expect mediaErr == nil
+				expect upsertErr == nil
+				expect orphanErr == nil
+				expect leaseErr == nil
+				expect failErr == nil
+				expect queryErr == nil
+				expect rows == 1
+			}
+		}
+
+		when "planning cleanup after media deletion and lease expiry" {
+			mediaDir := t.TempDir()
+			now := time.Now().UTC().Truncate(time.Second)
+			grace := time.Hour
+			mediaPaths := map[int64]string{
+				9301: filepath.Join(mediaDir, "deleted.mkv"),
+				9302: filepath.Join(mediaDir, "expired.mkv"),
+				9303: filepath.Join(mediaDir, "active.mkv"),
+				9304: filepath.Join(mediaDir, "sidecar.mkv"),
+			}
+			mediaFileErrs := make([]error, 0, len(mediaPaths))
+			for _, path := range mediaPaths {
+				mediaFileErrs = append(mediaFileErrs, os.WriteFile(path, []byte("media"), 0o644))
+			}
+			insertErrs := make([]error, 0, 4)
+			for _, item := range []struct {
+				id    int64
+				title string
+			}{
+				{9301, "Deleted Media"},
+				{9302, "Expired Lease"},
+				{9303, "Active Media"},
+				{9304, "OCR Sidecar"},
+			} {
+				_, err := pool.Exec(ctx, `
+					INSERT INTO media_items (id, path, title, duration_ms, container)
+					VALUES ($1, $2, $3, 1000, 'mkv')
+				`, item.id, mediaPaths[item.id], item.title)
+				insertErrs = append(insertErrs, err)
+			}
+			deletedSpec, deletedSpecErr := artifacts.SpecForMediaDir(9301, artifacts.KindSubtitleText, "deleted-media", mediaPaths[9301], "subtitles")
+			expiredLeaseSpec, expiredLeaseSpecErr := artifacts.SpecForMediaDir(9302, artifacts.KindSubtitleText, "expired-lease", mediaPaths[9302], "subtitles")
+			activeSpec, activeSpecErr := artifacts.SpecForMediaDir(9303, artifacts.KindSubtitleText, "active-media", mediaPaths[9303], "subtitles")
+			sidecarPath := filepath.Join(mediaDir, "sidecar.en.ocr.srt")
+			sidecarSpec, sidecarSpecErr := artifacts.SpecForExternalFile(9304, artifacts.KindSubtitleSidecar, "subocr-sidecar-00", mediaPaths[9304], sidecarPath)
+			completeArtifact := func(spec artifacts.Spec, body string) error {
+				handle := artifacts.BeginLease(ctx, store, spec)
+				if err := os.MkdirAll(spec.ContentPath, 0o755); err != nil {
+					return err
+				}
+				if err := os.WriteFile(filepath.Join(spec.ContentPath, "artifact.txt"), []byte(body), 0o644); err != nil {
+					return err
+				}
+				handle.Complete(ctx)
+				return nil
+			}
+			completeFileArtifact := func(spec artifacts.Spec, body string) error {
+				handle := artifacts.BeginLease(ctx, store, spec)
+				if err := os.MkdirAll(filepath.Dir(spec.ContentPath), 0o755); err != nil {
+					return err
+				}
+				if err := os.WriteFile(spec.ContentPath, []byte(body), 0o644); err != nil {
+					return err
+				}
+				handle.Complete(ctx)
+				return nil
+			}
+			deletedCompleteErr := completeArtifact(deletedSpec, "deleted")
+			activeCompleteErr := completeArtifact(activeSpec, "active")
+			sidecarCompleteErr := completeFileArtifact(sidecarSpec, "1\n00:00:00,000 --> 00:00:01,000\nocr\n")
+			expiredHandle := artifacts.BeginLease(ctx, store, expiredLeaseSpec)
+			activeLeaseHandle := artifacts.BeginLease(ctx, store, activeSpec)
+			_ = expiredHandle
+			_ = activeLeaseHandle
+			_, expireLeaseErr := pool.Exec(ctx, `UPDATE derived_artifacts SET lease_expires_at = $2 WHERE top_level_path = $1`, expiredLeaseSpec.TopLevelPath, now.Add(-2*time.Hour))
+			_, keepLeaseErr := pool.Exec(ctx, `UPDATE derived_artifacts SET lease_expires_at = $2 WHERE top_level_path = $1`, activeSpec.TopLevelPath, now.Add(3*grace))
+			_, deleteMediaErr := pool.Exec(ctx, `DELETE FROM media_items WHERE id = 9301`)
+			beforeGracePlan, beforeGraceErr := store.PlanArtifactCleanup(ctx, artifacts.CleanupPlanOptions{
+				Roots:          []string{deletedSpec.RootPath},
+				Now:            now,
+				Limit:          10,
+				ReconcileGrace: grace,
+			})
+			afterGracePlan, afterGraceErr := store.PlanArtifactCleanup(ctx, artifacts.CleanupPlanOptions{
+				Roots:          []string{deletedSpec.RootPath},
+				Now:            now.Add(2 * grace),
+				Limit:          10,
+				ReconcileGrace: grace,
+			})
+			got := map[string]bool{}
+			for _, path := range afterGracePlan.OrphanTopLevelPaths {
+				got[path] = true
+			}
+			var sidecarAutoDelete bool
+			sidecarQueryErr := pool.QueryRow(ctx, `SELECT auto_delete FROM derived_artifacts WHERE top_level_path = $1`, sidecarSpec.TopLevelPath).Scan(&sidecarAutoDelete)
+			activeLeasePaths := map[string]bool{}
+			for _, path := range afterGracePlan.ActiveLeasedPaths {
+				activeLeasePaths[path] = true
+			}
+
+			then "returns only definitive orphan candidates after grace" {
+				expect mediaFileErrs[0] == nil
+				expect mediaFileErrs[1] == nil
+				expect mediaFileErrs[2] == nil
+				expect mediaFileErrs[3] == nil
+				expect insertErrs[0] == nil
+				expect insertErrs[1] == nil
+				expect insertErrs[2] == nil
+				expect insertErrs[3] == nil
+				expect deletedSpecErr == nil
+				expect expiredLeaseSpecErr == nil
+				expect activeSpecErr == nil
+				expect sidecarSpecErr == nil
+				expect deletedCompleteErr == nil
+				expect activeCompleteErr == nil
+				expect sidecarCompleteErr == nil
+				expect expireLeaseErr == nil
+				expect keepLeaseErr == nil
+				expect deleteMediaErr == nil
+				expect beforeGraceErr == nil
+				expect len(beforeGracePlan.OrphanTopLevelPaths) == 0
+				expect afterGraceErr == nil
+				expect len(afterGracePlan.OrphanTopLevelPaths) == 2
+				expect got[deletedSpec.TopLevelPath]
+				expect got[expiredLeaseSpec.TopLevelPath]
+				expect !got[activeSpec.TopLevelPath]
+				expect !got[sidecarSpec.TopLevelPath]
+				expect activeLeasePaths[activeSpec.TopLevelPath]
+				expect sidecarQueryErr == nil
+				reject sidecarAutoDelete
+			}
+		}
+	}
+}
+
+integration "Store list and search" {
+	before all {
+		ctx := context.Background()
+		pgReq := testcontainers.ContainerRequest{
+			Image:        "postgres:15",
+			ExposedPorts: []string{"5432/tcp"},
+			Env: map[string]string{
+				"POSTGRES_USER":     "test",
+				"POSTGRES_PASSWORD": "test",
+				"POSTGRES_DB":       "goetrope_test",
+			},
+			WaitingFor: wait.ForAll(
+				wait.ForListeningPort(nat.Port("5432/tcp")),
+				wait.ForLog("database system is ready to accept connections").WithOccurrence(2),
+			).WithDeadline(2 * time.Minute),
+		}
+		pgContainer, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+			ContainerRequest: pgReq,
+			Started:          true,
+		})
+		if err != nil {
+			t.Fatalf("start postgres: %v", err)
+		}
+		t.Cleanup(func() { _ = pgContainer.Terminate(ctx) })
+
+		pgHost, err := pgContainer.Host(ctx)
+		if err != nil {
+			t.Fatalf("get host: %v", err)
+		}
+		pgPort, err := pgContainer.MappedPort(ctx, "5432/tcp")
+		if err != nil {
+			t.Fatalf("get port: %v", err)
+		}
+
+		connStr := fmt.Sprintf("postgres://test:test@%s:%s/goetrope_test?sslmode=disable", pgHost, pgPort.Port())
+		pool, err := pgxpool.New(ctx, connStr)
+		if err != nil {
+			t.Fatalf("connect: %v", err)
+		}
+		t.Cleanup(func() { pool.Close() })
+
+		if migErr := db.Migrate(ctx, pool); migErr != nil {
+			t.Fatalf("migrate: %v", migErr)
+		}
+
+		store := library.NewStore(pool)
+
+		for i := 0; i < 5; i++ {
+			container := "mp4"
+			videoCodec := "h264"
+			meta := &library.Metadata{
+				Source:        "manual",
+				Confidence:    1.0,
+				RawTitle:      fmt.Sprintf("List Movie %d", i),
+				ResolvedTitle: fmt.Sprintf("List Movie %d", i),
+			}
+			switch i {
+			case 0:
+				meta.Overview = "Neo noir mystery with Lead One"
+				meta.Genres = []string{"Sci-Fi"}
+				meta.Cast = []string{"Lead One"}
+			case 1:
+				container = "mkv"
+				videoCodec = "hevc"
+				meta.Overview = "Prestige drama with Lead Two"
+				meta.Genres = []string{"Drama"}
+				meta.Cast = []string{"Lead Two"}
+			case 2:
+				container = "webm"
+				videoCodec = "vp9"
+				meta.Overview = "Animated family story"
+				meta.Genres = []string{"Family"}
+				meta.Cast = []string{"Lead Three"}
+			}
+			_ = store.UpsertItem(ctx, &library.MediaItem{
+				Path:       fmt.Sprintf("/media/list/Movie.%d.%s", i, container),
+				Title:      fmt.Sprintf("List Movie %d", i),
+				Year:       2020 + i,
+				DurationMs: 3600000,
+				Container:  container,
+				Metadata:   meta,
+				Streams: []library.Stream{
+					{StreamIndex: 0, StreamType: "video", Codec: videoCodec, Width: 1920, Height: 1080},
+					{StreamIndex: 1, StreamType: "audio", Codec: "aac", SampleRate: 48000, Channels: 2},
+				},
+			})
+		}
+	}
+
+	given "a populated library" {
+		when "listing all items" {
+			items, total, listErr := store.ListItems(ctx, "", 100, 0)
+
+			then "returns items" {
+				expect listErr == nil
+				expect len(items) == 5
+				expect total == 5
+			}
+		}
+
+		when "listing with limit and offset" {
+			items, total, listErr := store.ListItems(ctx, "", 2, 0)
+
+			then "respects limit" {
+				expect listErr == nil
+				expect len(items) == 2
+				expect total == 5
+			}
+		}
+
+		when "listing with a keyset cursor" {
+			firstPage, firstErr := store.ListItemsFilteredPage(ctx, library.ListItemsOptions{Limit: 2})
+			secondPage, secondErr := store.ListItemsFilteredPage(ctx, library.ListItemsOptions{Limit: 2, Cursor: firstPage.NextCursor})
+
+			then "returns the next stable slice without offset" {
+				expect firstErr == nil
+				expect secondErr == nil
+				expect len(firstPage.Items) == 2
+				expect firstPage.Total == 5
+				expect firstPage.NextCursor != nil
+				expect len(secondPage.Items) == 2
+				expect secondPage.Total == 5
+				expect secondPage.Items[0].ID != firstPage.Items[0].ID
+				expect secondPage.Items[0].ID != firstPage.Items[1].ID
+			}
+		}
+
+		when "listing with excessive compatibility bounds" {
+			longQuery := strings.Repeat("List Movie ", 100)
+			items, total, listErr := store.ListItemsFiltered(ctx, library.ListItemsOptions{Query: longQuery, Limit: 9999, Offset: 999999})
+
+			then "clamps the work instead of rejecting or using unbounded offset" {
+				expect listErr == nil
+				expect len(items) == 0
+				expect total == 0
+			}
+		}
+
+		when "searching by title" {
+			items, _, searchErr := store.ListItems(ctx, "List Movie", 100, 0)
+
+			then "finds matching items" {
+				expect searchErr == nil
+				expect len(items) >= 1
+			}
+		}
+
+		when "searching for nonexistent title" {
+			items, total, searchErr := store.ListItems(ctx, "ZZZZZ_NONEXISTENT", 100, 0)
+
+			then "returns empty" {
+				expect searchErr == nil
+				expect len(items) == 0
+				expect total == 0
+			}
+		}
+
+		when "searching by cast and overview" {
+			items, _, searchErr := store.ListItemsFiltered(ctx, library.ListItemsOptions{Query: "Lead One", Limit: 100})
+
+			then "finds metadata-backed matches" {
+				expect searchErr == nil
+				expect len(items) >= 1
+			}
+		}
+
+		when "filtering by genre" {
+			items, total, filterErr := store.ListItemsFiltered(ctx, library.ListItemsOptions{Genre: "Sci-Fi", Limit: 100})
+
+			then "returns only genre matches" {
+				expect filterErr == nil
+				expect len(items) == 1
+				expect total == 1
+			}
+		}
+
+		when "filtering by codec and container" {
+			items, total, filterErr := store.ListItemsFiltered(ctx, library.ListItemsOptions{Codec: "hevc", Container: "mkv", Limit: 100})
+
+			then "returns the matching remux candidate" {
+				expect filterErr == nil
+				expect len(items) == 1
+				expect total == 1
+				expect items[0].Container == "mkv"
+			}
+		}
+	}
+}

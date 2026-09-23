@@ -37,13 +37,20 @@ func TestMetaDanmujiSpecsCompileAndRun(t *testing.T) {
 	}
 
 	tmpDir := t.TempDir()
+	// Every dependency the generated meta specs can pull in (including the
+	// testcontainers stack behind `needs`) is pinned to an exact version.
+	// `go mod tidy` must never be free to float onto whatever is newest on
+	// the day CI runs: a floating testcontainers-go release previously
+	// broke the build out from under this test (CI red since 2026-05-26).
 	goMod := fmt.Sprintf(`module danmuji_meta
 
 go 1.24.0
 
 require (
 	github.com/odvcencio/danmuji v0.0.0
+	github.com/docker/go-connections v0.6.0
 	github.com/stretchr/testify v1.9.0
+	github.com/testcontainers/testcontainers-go v0.41.0
 )
 
 replace github.com/odvcencio/danmuji => %s
@@ -83,14 +90,28 @@ replace github.com/odvcencio/danmuji => %s
 
 	tidy := exec.Command("go", "mod", "tidy")
 	tidy.Dir = tmpDir
+	tidy.Env = goEnv()
 	if out, err := tidy.CombinedOutput(); err != nil {
 		t.Fatalf("go mod tidy: %v\n%s", err, out)
 	}
 
 	testCmd := exec.Command("go", "test", "-tags=integration,e2e", "-run", ".", "-bench", ".", "-benchtime=1x", "-v", "./...")
 	testCmd.Dir = tmpDir
+	testCmd.Env = goEnv()
 	if out, err := testCmd.CombinedOutput(); err != nil {
 		t.Fatalf("go test meta specs: %v\n%s", err, out)
+	}
+
+	// go test already runs a curated subset of vet (including printf
+	// format-string checks) automatically, but the full `go vet` battery
+	// also catches things that subset doesn't, e.g. unreachable code. Run
+	// it explicitly so every generated meta spec is provably vet-clean,
+	// not just test-clean.
+	vetCmd := exec.Command("go", "vet", "-tags=integration,e2e", "./...")
+	vetCmd.Dir = tmpDir
+	vetCmd.Env = goEnv()
+	if out, err := vetCmd.CombinedOutput(); err != nil {
+		t.Fatalf("go vet meta specs: %v\n%s", err, out)
 	}
 }
 

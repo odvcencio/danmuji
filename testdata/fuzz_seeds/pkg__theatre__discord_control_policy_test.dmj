@@ -1,0 +1,93 @@
+package theatre_test
+
+import (
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/theatre"
+)
+
+unit "Discord control authorization" {
+	given "a policy with queue and playback roles" {
+		policy := theatre.DiscordRoomControlPolicy{
+			RoomID:  12,
+			GuildID: "123456789",
+			Roles: []theatre.DiscordRoleControl{
+				{RoleID: "111", Queue: true},
+				{RoleID: "222", Playback: true},
+				{RoleID: "333", Queue: true, Playback: true},
+			},
+			Revision: 4,
+		}
+
+		then "queue scope allows a matching queue role" {
+			expect theatre.Allows(policy, "123456789", []string{"111"}, theatre.DiscordControlScopeQueue)
+		}
+		then "queue scope rejects a playback-only role" {
+			reject theatre.Allows(policy, "123456789", []string{"222"}, theatre.DiscordControlScopeQueue)
+		}
+		then "playback scope allows a playback role" {
+			expect theatre.Allows(policy, "123456789", []string{"222"}, theatre.DiscordControlScopePlayback)
+		}
+		then "a role with both controls allows both scopes" {
+			expect theatre.Allows(policy, "123456789", []string{"333"}, theatre.DiscordControlScopeQueue)
+			expect theatre.Allows(policy, "123456789", []string{"333"}, theatre.DiscordControlScopePlayback)
+		}
+		then "a different guild denies" {
+			reject theatre.Allows(policy, "987654321", []string{"111"}, theatre.DiscordControlScopeQueue)
+		}
+		then "an unknown scope denies" {
+			reject theatre.Allows(policy, "123456789", []string{"111"}, theatre.DiscordControlScope("admin"))
+		}
+	}
+
+	given "an absent policy" {
+		policy := theatre.DiscordRoomControlPolicy{}
+
+		then "default denies" {
+			reject theatre.Allows(policy, "123456789", []string{"111"}, theatre.DiscordControlScopeQueue)
+		}
+	}
+
+	given "a policy with no roles" {
+		policy := theatre.DiscordRoomControlPolicy{
+			RoomID:  12,
+			GuildID: "123456789",
+		}
+
+		then "no control permission is granted" {
+			reject theatre.Allows(policy, "123456789", []string{"111"}, theatre.DiscordControlScopePlayback)
+		}
+	}
+
+	given "a snapshot with noisy roles" {
+		policy := theatre.DiscordRoomControlPolicy{
+			RoomID:  12,
+			GuildID: "123456789",
+			Roles: []theatre.DiscordRoleControl{
+				{RoleID: "111", Queue: true},
+			},
+		}
+
+		then "invalid role ids are ignored while later matches still allow" {
+			expect theatre.Allows(policy, "123456789", []string{"role-a", "111"}, theatre.DiscordControlScopeQueue)
+		}
+		then "overlong snowflakes deny" {
+			reject theatre.Allows(policy, "123456789012345678901", []string{"111"}, theatre.DiscordControlScopeQueue)
+		}
+	}
+
+	given "a manually constructed policy with duplicate role entries" {
+		policy := theatre.DiscordRoomControlPolicy{
+			RoomID:  12,
+			GuildID: "123456789",
+			Roles: []theatre.DiscordRoleControl{
+				{RoleID: "111", Playback: true},
+				{RoleID: "111", Queue: true},
+			},
+		}
+
+		then "a later matching grant still allows the requested scope" {
+			expect theatre.Allows(policy, "123456789", []string{"111"}, theatre.DiscordControlScopeQueue)
+		}
+	}
+}

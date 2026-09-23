@@ -1,0 +1,432 @@
+package worker
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/odvcencio/goetrope/pkg/transcode"
+)
+
+type embeddedSpecExecutor struct {
+	mu         sync.Mutex
+	caps       transcode.Capabilities
+	completion transcode.Completion
+	err        error
+	beforeReturn func()
+	block      bool
+	started    chan struct{}
+	cancelled  chan struct{}
+	onceStart  sync.Once
+	onceCancel sync.Once
+	executed   int
+}
+
+func (e *embeddedSpecExecutor) Capabilities() transcode.Capabilities {
+	return e.caps
+}
+
+func (e *embeddedSpecExecutor) Execute(ctx context.Context, job transcode.Job, report ProgressSink) (transcode.Completion, error) {
+	e.mu.Lock()
+	e.executed++
+	e.mu.Unlock()
+	e.onceStart.Do(func() {
+		if e.started != nil {
+			close(e.started)
+		}
+	})
+	if report != nil {
+		if err := report(transcode.Progress{JobID: job.ID, Percent: 47, SegmentsFinished: 2}); err != nil {
+			return transcode.Completion{JobID: job.ID, Success: false, Message: err.Error()}, err
+		}
+	}
+	if e.block {
+		<-ctx.Done()
+		e.onceCancel.Do(func() {
+			if e.cancelled != nil {
+				close(e.cancelled)
+			}
+		})
+		return transcode.Completion{JobID: job.ID, Success: false, Message: "cancelled"}, ctx.Err()
+	}
+	if e.beforeReturn != nil {
+		e.beforeReturn()
+	}
+	completion := e.completion
+	if completion.JobID == "" {
+		completion.JobID = job.ID
+	}
+	return completion, e.err
+}
+
+func (e *embeddedSpecExecutor) executeCount() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.executed
+}
+
+func embeddedSpecCaps() transcode.Capabilities {
+	return transcode.Capabilities{
+		HasFFmpeg:        true,
+		CPUAvailable:     true,
+		PreferredBackend: transcode.BackendCPU,
+		VideoEncoders:    []string{"libx264"},
+	}
+}
+
+func waitForEmbeddedSpec(t *testing.T, predicate func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if predicate() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for embedded worker state")
+}
+
+func embeddedSpecMedia(t *testing.T) (string, string) {
+	t.Helper()
+	root := t.TempDir()
+	source := filepath.Join(root, "movie.mp4")
+	if err := os.WriteFile(source, []byte("synthetic"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return root, source
+}
+
+unit "embedded worker direct lifecycle" {
+	given "a healthy in-process executor and coordinator" {
+		root, source := embeddedSpecMedia(t)
+		coord := transcode.NewCoordinator()
+		executor := &embeddedSpecExecutor{
+			caps:       embeddedSpecCaps(),
+			completion: transcode.Completion{Success: true, Message: "done"},
+		}
+		runner, err := StartEmbedded(context.Background(), coord, EmbeddedConfig{
+			Label:      "embedded-spec",
+			MediaRoots: []string{root},
+			Executor:   executor,
+		})
+		expect err == nil
+		defer runner.Close()
+		encodedSnapshot, encodeErr := json.Marshal(runner.Snapshot())
+		expect encodeErr == nil
+		reject strings.Contains(string(encodedSnapshot), root)
+		reject strings.Contains(string(encodedSnapshot), runner.workerID)
+
+		when "a job is enqueued" {
+			record, inserted := coord.Enqueue(transcode.Job{
+				ID:         "embedded-success",
+				Type:       transcode.JobTypeOnDemand,
+				SourcePath: source,
+				Quality:    "h264-720p",
+			})
+			expect inserted
+			waitForEmbeddedSpec(t, func() bool {
+				got, ok := coord.GetJob(record.Job.ID)
+				return ok && got.Status == transcode.JobStatusCompleted
+			})
+
+			then "progress and completion are reported without gRPC" {
+				got, ok := coord.GetJob(record.Job.ID)
+				expect ok
+				expect got.Progress.Percent == 47
+				expect got.Progress.SegmentsFinished == 2
+				expect got.Completion not_nil
+				expect got.Completion.Success
+				expect executor.executeCount() == 1
+			}
+		}
+	}
+
+	given "an executor that fails a job" {
+		root, source := embeddedSpecMedia(t)
+		coord := transcode.NewCoordinator()
+		executor := &embeddedSpecExecutor{
+			caps: embeddedSpecCaps(),
+			err:  errors.New("synthetic execution failure"),
+		}
+		runner, err := StartEmbedded(context.Background(), coord, EmbeddedConfig{
+			MediaRoots: []string{root},
+			Executor:   executor,
+		})
+		expect err == nil
+		defer runner.Close()
+		record, inserted := coord.Enqueue(transcode.Job{
+			ID:         "embedded-failure",
+			Type:       transcode.JobTypeOnDemand,
+			SourcePath: source,
+			Quality:    "h264-720p",
+		})
+		expect inserted
+		waitForEmbeddedSpec(t, func() bool {
+			got, ok := coord.GetJob(record.Job.ID)
+			return ok && got.Status == transcode.JobStatusFailed
+		})
+
+		then "the failed completion is retained while the runner stays ready" {
+			got, ok := coord.GetJob(record.Job.ID)
+			expect ok
+			expect got.Completion not_nil
+			reject got.Completion.Success
+		expect got.Completion.Message == "execution_failed"
+			expect runner.Snapshot().Ready
+		}
+	}
+
+	given "a job cancelled immediately before fenced completion" {
+		root, source := embeddedSpecMedia(t)
+		coord := transcode.NewCoordinator()
+		var record transcode.JobRecord
+		executor := &embeddedSpecExecutor{
+			caps:       embeddedSpecCaps(),
+			completion: transcode.Completion{Success: true, Message: "done"},
+			beforeReturn: func() {
+				_ = coord.Cancel(record.Job.ID)
+			},
+		}
+		runner, err := StartEmbedded(context.Background(), coord, EmbeddedConfig{
+			MediaRoots: []string{root},
+			Executor:   executor,
+		})
+		expect err == nil
+		defer runner.Close()
+		var inserted bool
+		record, inserted = coord.Enqueue(transcode.Job{
+			ID:         "embedded-completion-cancelled",
+			Type:       transcode.JobTypeOnDemand,
+			SourcePath: source,
+			Quality:    "h264-720p",
+		})
+		expect inserted
+		waitForEmbeddedSpec(t, func() bool {
+			got, ok := coord.GetJob(record.Job.ID)
+			return ok && got.Status == transcode.JobStatusCancelled
+		})
+
+		then "the stale completion does not deregister the embedded runner" {
+			expect runner.Snapshot().Ready
+			expect len(coord.ListWorkers()) == 1
+		}
+	}
+}
+
+unit "embedded worker cancellation and shutdown" {
+	given "an active blocking job" {
+		root, source := embeddedSpecMedia(t)
+		coord := transcode.NewCoordinator()
+		executor := &embeddedSpecExecutor{
+			caps:      embeddedSpecCaps(),
+			block:     true,
+			started:   make(chan struct{}),
+			cancelled: make(chan struct{}),
+		}
+		runner, err := StartEmbedded(context.Background(), coord, EmbeddedConfig{
+			MediaRoots: []string{root},
+			Executor:   executor,
+		})
+		expect err == nil
+		record, inserted := coord.Enqueue(transcode.Job{
+			ID:         "embedded-cancel",
+			Type:       transcode.JobTypeOnDemand,
+			SourcePath: source,
+			Quality:    "h264-720p",
+		})
+		expect inserted
+		select {
+		case <-executor.started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("embedded executor did not start")
+		}
+
+		then "a long-running job keeps the embedded worker fresh for readiness" {
+			time.Sleep(450 * time.Millisecond)
+			reaped := coord.ReapStaleWorkers(200 * time.Millisecond)
+			expect len(reaped) == 0
+			expect runner.Snapshot().Ready
+		}
+
+		when "the coordinator cancels the job" {
+			expect coord.Cancel(record.Job.ID) == nil
+			select {
+			case <-executor.cancelled:
+			case <-time.After(2 * time.Second):
+				t.Fatal("embedded executor did not observe cancellation")
+			}
+
+			then "the job remains cancelled" {
+				waitForEmbeddedSpec(t, func() bool {
+					got, ok := coord.GetJob(record.Job.ID)
+					return ok && got.Status == transcode.JobStatusCancelled
+				})
+			}
+		}
+		expect runner.Close() == nil
+		expect len(coord.ListWorkers()) == 0
+	}
+
+	given "a runner with an active job" {
+		root, source := embeddedSpecMedia(t)
+		coord := transcode.NewCoordinator()
+		executor := &embeddedSpecExecutor{
+			caps:      embeddedSpecCaps(),
+			block:     true,
+			started:   make(chan struct{}),
+			cancelled: make(chan struct{}),
+		}
+		runner, err := StartEmbedded(context.Background(), coord, EmbeddedConfig{
+			MediaRoots: []string{root},
+			Executor:   executor,
+		})
+		expect err == nil
+		_, inserted := coord.Enqueue(transcode.Job{
+			ID:         "embedded-shutdown",
+			Type:       transcode.JobTypeOnDemand,
+			SourcePath: source,
+			Quality:    "h264-720p",
+		})
+		expect inserted
+		select {
+		case <-executor.started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("embedded executor did not start")
+		}
+
+		when "the runner is closed" {
+			expect runner.Close() == nil
+
+			then "execution is cancelled and the worker deregisters" {
+				select {
+				case <-executor.cancelled:
+				case <-time.After(2 * time.Second):
+					t.Fatal("embedded executor survived shutdown")
+				}
+				expect len(coord.ListWorkers()) == 0
+				snapshot := runner.Snapshot()
+				reject snapshot.Ready
+				expect snapshot.Status == EmbeddedStatusStopped
+			}
+		}
+	}
+}
+
+unit "embedded worker authorization and readiness" {
+	given "a media-root symlink that resolves outside its configured root" {
+		root := t.TempDir()
+		outsideRoot := t.TempDir()
+		outside := filepath.Join(outsideRoot, "outside.mp4")
+		expect os.WriteFile(outside, []byte("synthetic"), 0o600) == nil
+		link := filepath.Join(root, "escape.mp4")
+		expect os.Symlink(outside, link) == nil
+		executor := mustTestExecutor(t, root)
+
+		then "the executor rejects the resolved escape" {
+			completion, err := executor.Execute(context.Background(), transcode.Job{
+				ID:         "embedded-symlink-escape",
+				Type:       transcode.JobTypeCacheWarmup,
+				SourcePath: link,
+				Quality:    "original",
+			}, nil)
+			expect err != nil
+			reject completion.Success
+		}
+	}
+
+	given "a healthy executor with no media roots" {
+		coord := transcode.NewCoordinator()
+		executor := &embeddedSpecExecutor{caps: embeddedSpecCaps(), completion: transcode.Completion{Success: true}}
+		runner, err := StartEmbedded(context.Background(), coord, EmbeddedConfig{Executor: executor})
+		expect err == nil
+		defer runner.Close()
+
+		then "it is degraded-ready and authorizes no jobs" {
+			snapshot := runner.Snapshot()
+			expect snapshot.Ready
+			expect snapshot.Degraded
+			expect snapshot.Status == EmbeddedStatusDegraded
+			expect snapshot.Reason == EmbeddedReasonNoMediaRoots
+			_, inserted := coord.Enqueue(transcode.Job{
+				ID:         "embedded-no-roots",
+				Type:       transcode.JobTypeCacheWarmup,
+				SourcePath: "/outside/movie.mp4",
+			})
+			expect inserted
+			time.Sleep(25 * time.Millisecond)
+			expect executor.executeCount() == 0
+		}
+	}
+
+	given "a worker configured for one media root" {
+		root, _ := embeddedSpecMedia(t)
+		outside := filepath.Join(t.TempDir(), "outside.mp4")
+		expect os.WriteFile(outside, []byte("synthetic"), 0o600) == nil
+		coord := transcode.NewCoordinator()
+		executor := &embeddedSpecExecutor{caps: embeddedSpecCaps(), completion: transcode.Completion{Success: true}}
+		runner, err := StartEmbedded(context.Background(), coord, EmbeddedConfig{
+			MediaRoots: []string{root},
+			Executor:   executor,
+		})
+		expect err == nil
+		defer runner.Close()
+
+		then "an outside-root job is never dispatched" {
+			_, inserted := coord.Enqueue(transcode.Job{
+				ID:         "embedded-outside-root",
+				Type:       transcode.JobTypeCacheWarmup,
+				SourcePath: outside,
+			})
+			expect inserted
+			time.Sleep(25 * time.Millisecond)
+			expect executor.executeCount() == 0
+		}
+	}
+
+	given "an executor without the required FFmpeg CPU baseline" {
+		root, _ := embeddedSpecMedia(t)
+		coord := transcode.NewCoordinator()
+		runner, err := StartEmbedded(context.Background(), coord, EmbeddedConfig{
+			MediaRoots: []string{root},
+			Executor:   &embeddedSpecExecutor{},
+		})
+		expect err == nil
+		defer runner.Close()
+
+		then "the runner is unready" {
+			snapshot := runner.Snapshot()
+			reject snapshot.Ready
+			reject snapshot.Degraded
+			expect snapshot.Status == EmbeddedStatusUnready
+			expect snapshot.Reason == EmbeddedReasonBaselineUnavailable
+		}
+	}
+
+	given "a healthy runner whose coordinator registration is lost" {
+		root, _ := embeddedSpecMedia(t)
+		coord := transcode.NewCoordinator()
+		runner, err := StartEmbedded(context.Background(), coord, EmbeddedConfig{
+			MediaRoots: []string{root},
+			Executor:   &embeddedSpecExecutor{caps: embeddedSpecCaps()},
+		})
+		expect err == nil
+
+		when "the coordinator deregisters it unexpectedly" {
+			coord.DeregisterWorker(runner.workerID)
+			waitForEmbeddedSpec(t, func() bool { return !runner.Snapshot().Ready })
+
+			then "the lost loop is unready and safe to close" {
+				snapshot := runner.Snapshot()
+				expect snapshot.Status == EmbeddedStatusUnready
+				expect snapshot.Reason == EmbeddedReasonLoopLost
+				expect runner.Close() == nil
+			}
+		}
+	}
+}

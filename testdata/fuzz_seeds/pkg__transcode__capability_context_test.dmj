@@ -1,0 +1,144 @@
+package transcode
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"runtime"
+	"testing"
+	"time"
+)
+
+unit "context-bound capability discovery" {
+	then "a blocked ffmpeg encoder probe exits at the activation deadline" {
+		probe := filepath.Join(t.TempDir(), "blocked-ffmpeg")
+		expect os.WriteFile(probe, []byte("#!/bin/sh\nwhile :; do :; done\n"), 0700) == nil
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		defer cancel()
+		started := time.Now()
+		caps, err := DetectCapabilitiesContext(ctx, probe, "")
+		expect errors.Is(err, context.DeadlineExceeded)
+		expect time.Since(started) < capabilityProbeMaxDuration
+		reject caps.HasFFmpeg
+	}
+
+	then "an already-cancelled activation launches no capability probe" {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		caps, err := DetectCapabilitiesContext(ctx, "/path/that/must/not/run", "")
+		expect errors.Is(err, context.Canceled)
+		reject caps.HasFFmpeg
+	}
+
+	then "a blocked native driver probe exits at the activation deadline" {
+		if runtime.GOOS != "linux" {
+			return
+		}
+		nativeProbeTestMode = "block"
+		defer func() { nativeProbeTestMode = "" }()
+		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+		defer cancel()
+		started := time.Now()
+		caps, err := DetectCapabilitiesContext(ctx, "", "")
+		expect errors.Is(err, context.DeadlineExceeded)
+		expect time.Since(started) < capabilityProbeHardBound
+		reject caps.NativeCUDA
+		reject caps.NativeNVENC
+		reject caps.NativeVAAPI
+	}
+
+	then "a flooding FFmpeg probe is rejected at the output boundary" {
+		if runtime.GOOS != "linux" {
+			return
+		}
+		ctx := context.WithValue(context.Background(), capabilityFloodTargetKey{}, true)
+		started := time.Now()
+		caps, err := DetectCapabilitiesContext(ctx, "/injected/contained/flood", "")
+		expect errors.Is(err, errCapabilityProbeOutputLimit)
+		expect time.Since(started) < capabilityProbeHardBound
+		reject caps.HasFFmpeg
+	}
+
+	then "a CUDA graph is admitted only after an executable bounded proof" {
+		probe := filepath.Join(t.TempDir(), "cuda-graph-ffmpeg")
+		script := "#!/bin/sh\ncase \" $* \" in\n  *\" -f lavfi \"*\"hwupload_cuda=device=2\"*\"scale_cuda\"*\"h264_nvenc\"*\" -gpu 2 \"*) exit 0 ;;\n  *) exit 1 ;;\nesac\n"
+		expect os.WriteFile(probe, []byte(script), 0700) == nil
+
+		available, err := probeCUDAScaleGraphContext(context.Background(), probe, "2")
+		expect err == nil
+		expect available
+	}
+
+	then "a cold CUDA graph may outlive metadata probes without losing bounded admission" {
+		if runtime.GOOS != "linux" {
+			return
+		}
+		probe := filepath.Join(t.TempDir(), "cold-cuda-graph-ffmpeg")
+		script := "#!/bin/sh\ncase \" $* \" in\n  *\" -f lavfi \"*\"hwupload_cuda=device=0\"*\"scale_cuda\"*\"h264_nvenc\"*\" -gpu 0 \"*) sleep 6; exit 0 ;;\n  *) exit 1 ;;\nesac\n"
+		expect os.WriteFile(probe, []byte(script), 0700) == nil
+		expect capabilityCUDAGraphProbeMaxDuration == 10*time.Second
+		expect capabilityCUDAGraphProbeMaxDuration > capabilityProbeMaxDuration
+
+		started := time.Now()
+		available, err := probeCUDAScaleGraphContext(context.Background(), probe, "0")
+		expect err == nil
+		expect available
+		expect time.Since(started) >= capabilityProbeMaxDuration
+		expect time.Since(started) < capabilityCUDAGraphProbeHardBound
+	}
+
+	then "the longer CUDA window keeps the same output containment" {
+		if runtime.GOOS != "linux" {
+			return
+		}
+		ctx := context.WithValue(context.Background(), capabilityFloodTargetKey{}, true)
+		available, err := probeCUDAScaleGraphContext(ctx, "/injected/contained/flood", "0")
+		expect errors.Is(err, errCapabilityProbeOutputLimit)
+		reject available
+	}
+
+	then "probe-specific child windows cannot exceed the CUDA bound" {
+		output, err := runBoundedCapabilityProbeWithin(
+			context.Background(),
+			capabilityCUDAGraphProbeMaxDuration+time.Nanosecond,
+			"/path/that/must/not/run",
+		)
+		expect err != nil
+		expect output == nil
+	}
+
+	then "an advertised but unexecutable CUDA graph is unavailable" {
+		probe := filepath.Join(t.TempDir(), "rejected-cuda-graph-ffmpeg")
+		expect os.WriteFile(probe, []byte("#!/bin/sh\nexit 1\n"), 0700) == nil
+
+		available, err := probeCUDAScaleGraphContext(context.Background(), probe, "0")
+		expect err == nil
+		reject available
+	}
+
+	then "a rejected CUDA graph degrades capability without failing activation" {
+		probe := filepath.Join(t.TempDir(), "advertised-only-ffmpeg")
+		script := "#!/bin/sh\ncase \" $* \" in\n  *\" -encoders \"*) printf '%s\\n' ' V....D libx264 fake' ' V....D h264_nvenc fake' ;;\n  *\" -filters \"*) printf '%s\\n' ' ... hwupload_cuda V->V fake' ' ... scale_cuda V->V fake' ;;\n  *) exit 1 ;;\nesac\n"
+		expect os.WriteFile(probe, []byte(script), 0700) == nil
+
+		caps, err := DetectCapabilitiesContext(context.Background(), probe, "0")
+		expect err == nil
+		expect caps.HasFFmpeg
+		expect caps.CPUAvailable
+		reject caps.CUDAScaleAvailable
+	}
+
+	then "a blocked CUDA graph remains activation bounded" {
+		probe := filepath.Join(t.TempDir(), "blocked-cuda-graph-ffmpeg")
+		expect os.WriteFile(probe, []byte("#!/bin/sh\nwhile :; do :; done\n"), 0700) == nil
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		defer cancel()
+
+		started := time.Now()
+		available, err := probeCUDAScaleGraphContext(ctx, probe, "0")
+		expect errors.Is(err, context.DeadlineExceeded)
+		reject available
+		expect time.Since(started) < capabilityProbeMaxDuration
+	}
+}

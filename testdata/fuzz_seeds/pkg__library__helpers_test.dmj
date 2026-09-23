@@ -1,0 +1,504 @@
+package library
+
+import (
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/container/mp4"
+)
+
+unit "normalizedTitle" {
+	then "lowercases and trims" {
+		expect normalizedTitle("  The Matrix  ") == "the matrix"
+	}
+	then "removes colons" {
+		expect normalizedTitle("Star Wars: A New Hope") == "star wars a new hope"
+	}
+	then "removes apostrophes" {
+		expect normalizedTitle("Schindler's List") == "schindlers list"
+	}
+	then "converts dots to spaces" {
+		expect normalizedTitle("The.Dark.Knight") == "the dark knight"
+	}
+	then "converts hyphens to spaces" {
+		expect normalizedTitle("Spider-Man") == "spider man"
+	}
+	then "converts underscores to spaces" {
+		expect normalizedTitle("blade_runner") == "blade runner"
+	}
+	then "collapses multiple spaces" {
+		expect normalizedTitle("The  Dark   Knight") == "the dark knight"
+	}
+	then "empty string remains empty" {
+		expect normalizedTitle("") == ""
+	}
+	then "same title normalizes equal" {
+		expect normalizedTitle("The Matrix") == normalizedTitle("the matrix")
+	}
+	then "removes quotes" {
+		expect normalizedTitle(`"Inception"`) == "inception"
+	}
+}
+
+unit "parseYear" {
+	then "parses 4-digit year from date string" {
+		expect parseYear("1999-03-31") == 1999
+	}
+	then "parses year from year-only string" {
+		expect parseYear("2017") == 2017
+	}
+	then "returns 0 for short string" {
+		expect parseYear("199") == 0
+	}
+	then "returns 0 for empty string" {
+		expect parseYear("") == 0
+	}
+	then "returns 0 for non-numeric year" {
+		expect parseYear("abcd-01-01") == 0
+	}
+	then "handles 2000s year" {
+		expect parseYear("2024-12-01") == 2024
+	}
+}
+
+unit "firstNonEmpty" {
+	then "returns first non-empty value" {
+		expect firstNonEmpty("", "hello", "world") == "hello"
+	}
+	then "returns second when first is empty" {
+		expect firstNonEmpty("", "second") == "second"
+	}
+	then "returns empty when all empty" {
+		expect firstNonEmpty("", "", "") == ""
+	}
+	then "trims whitespace" {
+		expect firstNonEmpty("  ", "value") == "value"
+	}
+	then "returns single non-empty value" {
+		expect firstNonEmpty("only") == "only"
+	}
+	then "returns empty for no arguments" {
+		expect firstNonEmpty() == ""
+	}
+}
+
+unit "metadataHasArtwork" {
+	then "returns true when PosterURL is set" {
+		meta := &Metadata{PosterURL: "https://example.com/poster.jpg"}
+		expect metadataHasArtwork(meta)
+	}
+	then "returns true when BackdropURL is set" {
+		meta := &Metadata{BackdropURL: "https://example.com/backdrop.jpg"}
+		expect metadataHasArtwork(meta)
+	}
+	then "returns true when both URLs are set" {
+		meta := &Metadata{
+			PosterURL:   "https://example.com/poster.jpg",
+			BackdropURL: "https://example.com/backdrop.jpg",
+		}
+		expect metadataHasArtwork(meta)
+	}
+	then "returns false when both URLs are empty" {
+		meta := &Metadata{}
+		reject metadataHasArtwork(meta)
+	}
+	then "returns false for nil metadata" {
+		reject metadataHasArtwork(nil)
+	}
+	then "returns false when URLs are whitespace only" {
+		meta := &Metadata{PosterURL: "   ", BackdropURL: "  "}
+		reject metadataHasArtwork(meta)
+	}
+}
+
+unit "mergeMetadata" {
+	then "does nothing for nil destination" {
+		src := &Metadata{Source: "tmdb", ResolvedTitle: "Test"}
+		mergeMetadata(nil, src)
+		expect true
+	}
+	then "does nothing for nil source" {
+		dst := &Metadata{Source: "filename", ResolvedTitle: "Test"}
+		mergeMetadata(dst, nil)
+		expect dst.Source == "filename"
+	}
+	given "dst with partial fields and src with fuller data" {
+		dst := &Metadata{
+			Source:        "filename",
+			ResolvedTitle: "The Matrix",
+			Year:          1999,
+		}
+		src := &Metadata{
+			Source:        "tmdb",
+			ResolvedTitle: "The Matrix",
+			Year:          1999,
+			Overview:      "Neo learns the truth.",
+			PosterURL:     "https://example.com/poster.jpg",
+			Genres:        []string{"Action", "Science Fiction"},
+			Cast:          []string{"Keanu Reeves"},
+			Rating:        8.7,
+			Confidence:    0.97,
+		}
+
+		when "merging" {
+			mergeMetadata(dst, src)
+
+			then "source is updated" {
+				expect dst.Source == "tmdb"
+			}
+			then "overview is merged" {
+				expect dst.Overview == "Neo learns the truth."
+			}
+			then "poster URL is merged" {
+				expect dst.PosterURL == "https://example.com/poster.jpg"
+			}
+			then "genres are merged" {
+				expect len(dst.Genres) == 2
+			}
+			then "cast is merged" {
+				expect len(dst.Cast) == 1
+			}
+			then "rating is merged" {
+				expect dst.Rating == 8.7
+			}
+			then "confidence is merged" {
+				expect dst.Confidence == 0.97
+			}
+		}
+	}
+	given "src with empty fields" {
+		dst := &Metadata{
+			Source:      "tmdb",
+			PosterURL:   "https://example.com/poster.jpg",
+			BackdropURL: "https://example.com/backdrop.jpg",
+		}
+		src := &Metadata{
+			Source:    "",
+			PosterURL: "",
+		}
+
+		when "merging empty fields" {
+			mergeMetadata(dst, src)
+
+			then "empty source does not overwrite existing source" {
+				expect dst.Source == "tmdb"
+			}
+			then "empty PosterURL does not overwrite existing URL" {
+				expect dst.PosterURL == "https://example.com/poster.jpg"
+			}
+		}
+	}
+}
+
+unit "preferMetadata" {
+	then "provider metadata beats filename metadata even when confidence is lower" {
+		current := &Metadata{
+			Source:        "filename",
+			ResolvedTitle: "Casino Open Matte Hybrid DTS",
+			Year:          1995,
+			Confidence:    0.96,
+		}
+		candidate := &Metadata{
+			Source:        "jellyfin",
+			ResolvedTitle: "Casino",
+			Year:          1995,
+			Overview:      "Ace Rothstein runs the Tangiers.",
+			Genres:        []string{"Crime", "Drama"},
+			Confidence:    0.91,
+		}
+
+		preferred := preferMetadata(current, candidate)
+
+		expect preferred != nil
+		expect preferred.Source == "jellyfin"
+		expect preferred.ResolvedTitle == "Casino"
+		expect preferred.Overview == "Ace Rothstein runs the Tangiers."
+	}
+	then "keeps richer remote metadata when candidate is not clearly better" {
+		current := &Metadata{
+			Source:        "tmdb",
+			ResolvedTitle: "The Matrix",
+			Year:          1999,
+			Overview:      "Neo learns the truth.",
+			Genres:        []string{"Action"},
+			Confidence:    0.99,
+		}
+		candidate := &Metadata{
+			Source:        "tvdb",
+			ResolvedTitle: "The Matrix",
+			Year:          1999,
+			Confidence:    0.9,
+		}
+
+		preferred := preferMetadata(current, candidate)
+
+		expect preferred != nil
+		expect preferred.Source == "tmdb"
+		expect preferred.Overview == "Neo learns the truth."
+	}
+}
+
+unit "PreferredTitle filename source cleanup" {
+	then "cleans filename-derived movie titles for display" {
+		item := &MediaItem{
+			Title: "Casino Open Matte Hybrid DTS",
+			Path:  "/media/windows/Movies/scorsese/Casino.1995.Open.Matte.Hybrid.1080p.BluRay.DTS.x264.mkv",
+			Metadata: &Metadata{
+				Source:        "filename",
+				ResolvedTitle: "Casino Open Matte Hybrid DTS",
+				RawTitle:      "Casino.1995.Open.Matte.Hybrid.1080p.BluRay.DTS.x264",
+			},
+		}
+
+		expect PreferredTitle(item) == "Casino"
+	}
+	then "keeps leading numeric titles when cleaning filenames" {
+		item := &MediaItem{
+			Title: "2001.A.Space.Odyssey.1968.576p.BluRay.x264-HANDJOB",
+			Path:  "/media/windows/media/originals/Movies/2001.A.Space.Odyssey.1968.576p.BluRay.x264-HANDJOB.mkv",
+			Metadata: &Metadata{
+				Source:        "filename",
+				ResolvedTitle: "A Space Odyssey 1968 HANDJOB",
+				RawTitle:      "2001.A.Space.Odyssey.1968.576p.BluRay.x264-HANDJOB",
+			},
+		}
+
+		expect PreferredTitle(item) == "2001 A Space Odyssey"
+	}
+	then "drops split codec and rip tokens from cleaned titles" {
+		item := &MediaItem{
+			Title: "After Hours BDRip DD1 0",
+			Path:  "/media/windows/Movies/scorsese/After.Hours.1985.REPACK.BDRip.DD1.0.x264-playSD.mkv",
+			Metadata: &Metadata{
+				Source:        "filename",
+				ResolvedTitle: "After Hours BDRip DD1 0",
+				RawTitle:      "After.Hours.1985.REPACK.BDRip.DD1.0.x264-playSD",
+			},
+		}
+
+		expect PreferredTitle(item) == "After Hours"
+	}
+	then "does not trust stale promoted filename titles" {
+		item := &MediaItem{
+			Title: "A Space Odyssey 1968",
+			Path:  "/media/windows/media/originals/Movies/2001.A.Space.Odyssey.1968.576p.BluRay.x264-HANDJOB.mkv",
+			Metadata: &Metadata{
+				Source:        "filename",
+				ResolvedTitle: "A Space Odyssey 1968 HANDJOB",
+				RawTitle:      "2001.A.Space.Odyssey.1968.576p.BluRay.x264-HANDJOB",
+			},
+		}
+
+		expect PreferredTitle(item) == "2001 A Space Odyssey"
+	}
+	then "normalizes technical parenthetical suffixes from filename metadata paths" {
+		item := &MediaItem{
+			Title: "Aliens SE (1080p Tigole)",
+			Path:  "/media/windows/media/originals/Movies/Aliens 1986 SE (1080p x265 10bit Tigole).mkv",
+			Metadata: &Metadata{
+				Source:        "filename",
+				ResolvedTitle: "Aliens SE (1080p Tigole)",
+				RawTitle:      "Aliens 1986 SE (1080p x265 10bit Tigole)",
+			},
+		}
+
+		expect PreferredTitle(item) == "Aliens SE"
+	}
+	then "drops trailing release groups once technical tokens begin" {
+		item := &MediaItem{
+			Title: "Bio Dome x0r",
+			Path:  "/media/windows/media/originals/Movies/Bio-Dome.1996.720p.BluRay.x264-x0r/Bio-Dome.1996.720p.BluRay.x264-x0r.mkv",
+			Metadata: &Metadata{
+				Source:        "filename",
+				ResolvedTitle: "Bio Dome DVDRip x0r",
+				RawTitle:      "Bio-Dome.1996.720p.BluRay.x264-x0r",
+			},
+		}
+
+		expect PreferredTitle(item) == "Bio Dome"
+	}
+	then "drops audio channel fragments and trailing release groups from filename metadata paths" {
+		item := &MediaItem{
+			Title: "Deus e o Diabo na Terra do Sol AAC1 0 nosferato",
+			Path:  "/media/windows/media/originals/Movies/Deus.e.o.Diabo.na.Terra.do.Sol.1964.720p.Bluray.AAC1.0.x264-nosferato.mkv",
+			Metadata: &Metadata{
+				Source:        "filename",
+				ResolvedTitle: "Deus e o Diabo na Terra do Sol AAC1 0 nosferato",
+				RawTitle:      "Deus.e.o.Diabo.na.Terra.do.Sol.1964.720p.Bluray.AAC1.0.x264-nosferato",
+			},
+		}
+
+		expect PreferredTitle(item) == "Deus e o Diabo na Terra do Sol"
+	}
+	then "prefers remote provider metadata when present" {
+		item := &MediaItem{
+			Title: "Casino",
+			Path:  "/media/windows/Movies/scorsese/Casino.1995.Open.Matte.Hybrid.1080p.BluRay.DTS.x264.mkv",
+			Metadata: &Metadata{
+				Source:        "jellyfin",
+				ResolvedTitle: "Casino",
+				RawTitle:      "Casino.1995.Open.Matte.Hybrid.1080p.BluRay.DTS.x264",
+			},
+		}
+
+		expect PreferredTitle(item) == "Casino"
+	}
+}
+
+unit "MediaItemFromInfo additional cases" {
+	then "extracts title from path" {
+		info := &mp4.MediaInfo{Container: "mp4", DurationMs: 120000}
+		item := MediaItemFromInfo("/media/movies/The.Matrix.mp4", info)
+		expect item.Title == "The.Matrix"
+	}
+	then "strips extension from title" {
+		info := &mp4.MediaInfo{Container: "mp4", DurationMs: 60000}
+		item := MediaItemFromInfo("/media/clip.m4v", info)
+		expect item.Title == "clip"
+	}
+	then "sets path correctly" {
+		info := &mp4.MediaInfo{Container: "mp4", DurationMs: 0}
+		item := MediaItemFromInfo("/media/movie.mp4", info)
+		expect item.Path == "/media/movie.mp4"
+	}
+	then "sets container from info" {
+		info := &mp4.MediaInfo{Container: "mkv", DurationMs: 0}
+		item := MediaItemFromInfo("/media/movie.mkv", info)
+		expect item.Container == "mkv"
+	}
+	then "sets duration from info" {
+		info := &mp4.MediaInfo{Container: "mp4", DurationMs: 7200000}
+		item := MediaItemFromInfo("/media/movie.mp4", info)
+		expect item.DurationMs == int64(7200000)
+	}
+	then "maps streams from info" {
+		info := &mp4.MediaInfo{
+			Container:  "mp4",
+			DurationMs: 0,
+			Streams: []mp4.StreamInfo{
+				{Index: 0, Type: "video", Codec: "h264", Width: 1920, Height: 1080, IsDefault: true},
+				{Index: 1, Type: "audio", Codec: "aac", SampleRate: 48000, Channels: 2, Language: "eng"},
+			},
+		}
+		item := MediaItemFromInfo("/media/movie.mp4", info)
+		expect len(item.Streams) == 2
+	}
+	then "first stream is video" {
+		info := &mp4.MediaInfo{
+			Container:  "mp4",
+			DurationMs: 0,
+			Streams: []mp4.StreamInfo{
+				{Index: 0, Type: "video", Codec: "h264", Width: 1920, Height: 1080, IsDefault: true},
+			},
+		}
+		item := MediaItemFromInfo("/media/movie.mp4", info)
+		expect item.Streams[0].StreamType == "video"
+		expect item.Streams[0].Codec == "h264"
+		expect item.Streams[0].Width == 1920
+		expect item.Streams[0].Height == 1080
+		expect item.Streams[0].IsDefault
+	}
+	then "second stream is audio with language" {
+		info := &mp4.MediaInfo{
+			Container:  "mp4",
+			DurationMs: 0,
+			Streams: []mp4.StreamInfo{
+				{Index: 0, Type: "video", Codec: "h264"},
+				{Index: 1, Type: "audio", Codec: "aac", SampleRate: 48000, Channels: 2, Language: "eng"},
+			},
+		}
+		item := MediaItemFromInfo("/media/movie.mp4", info)
+		expect item.Streams[1].StreamType == "audio"
+		expect item.Streams[1].Language == "eng"
+		expect item.Streams[1].SampleRate == 48000
+	}
+	then "empty streams produces nil Streams slice" {
+		info := &mp4.MediaInfo{Container: "mp4", DurationMs: 0}
+		item := MediaItemFromInfo("/media/movie.mp4", info)
+		expect len(item.Streams) == 0
+	}
+}
+
+unit "PreferredTitle" {
+	then "prefers resolved metadata title" {
+		item := &MediaItem{
+			Title: "The.Matrix.1999.1080p.BluRay.x264",
+			Path:  "/media/movies/The.Matrix.1999.1080p.BluRay.x264.mkv",
+			Metadata: &Metadata{
+				ResolvedTitle: "The Matrix",
+			},
+		}
+		expect PreferredTitle(item) == "The Matrix"
+	}
+	then "normalizes filename-looking stored titles" {
+		item := &MediaItem{
+			Title: "2001.A.Space.Odyssey.1968.576p.BluRay.x264-HANDJOB",
+			Path:  "/media/movies/2001.A.Space.Odyssey.1968.576p.BluRay.x264-HANDJOB.mkv",
+		}
+		expect PreferredTitle(item) == "2001 A Space Odyssey"
+	}
+	then "keeps already clean stored titles" {
+		item := &MediaItem{
+			Title: "Alice Doesn't Live Here Anymore",
+			Path:  "/media/movies/Alice.Doesnt.Live.Here.Anymore.1974.mkv",
+		}
+		expect PreferredTitle(item) == "Alice Doesn't Live Here Anymore"
+	}
+	then "drops technical parenthetical suffixes while keeping edition labels" {
+		item := &MediaItem{
+			Title: "Aliens SE (1080p Tigole)",
+			Path:  "/media/movies/Aliens.SE.1986.1080p.BluRay.x264-Tigole.mkv",
+		}
+		expect PreferredTitle(item) == "Aliens SE"
+	}
+	then "keeps meaningful nontechnical parenthetical editions" {
+		item := &MediaItem{
+			Title: "Alien 3 (Special Assembly Cut)",
+			Path:  "/media/movies/Alien.3.Special.Assembly.Cut.1992.mkv",
+		}
+		expect PreferredTitle(item) == "Alien 3 (Special Assembly Cut)"
+	}
+	then "drops release-group tails from stored filename-like titles" {
+		item := &MediaItem{
+			Title: "Entertainment VietHD",
+			Path:  "/media/movies/Entertainment.2015.1080p.BluRay.x264-VietHD.mkv",
+		}
+		expect PreferredTitle(item) == "Entertainment"
+	}
+}
+
+unit "NormalizeArtworkReference" {
+	then "extracts path from file URL" {
+		result := NormalizeArtworkReference("file:///tmp/poster.jpg")
+		expect result == "/tmp/poster.jpg"
+	}
+	then "returns plain path unchanged" {
+		result := NormalizeArtworkReference("/media/movies/poster.jpg")
+		expect result == "/media/movies/poster.jpg"
+	}
+	then "trims whitespace" {
+		result := NormalizeArtworkReference("  /media/poster.jpg  ")
+		expect result == "/media/poster.jpg"
+	}
+	then "returns http URL unchanged" {
+		result := NormalizeArtworkReference("https://example.com/poster.jpg")
+		expect result == "https://example.com/poster.jpg"
+	}
+}
+
+unit "IsRemoteArtworkReference" {
+	then "returns true for http URL" {
+		expect IsRemoteArtworkReference("http://example.com/poster.jpg")
+	}
+	then "returns true for https URL" {
+		expect IsRemoteArtworkReference("https://example.com/poster.jpg")
+	}
+	then "returns false for local path" {
+		reject IsRemoteArtworkReference("/media/poster.jpg")
+	}
+	then "returns false for empty string" {
+		reject IsRemoteArtworkReference("")
+	}
+	then "returns false for file URL" {
+		reject IsRemoteArtworkReference("file:///tmp/poster.jpg")
+	}
+}

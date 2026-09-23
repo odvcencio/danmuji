@@ -1,0 +1,302 @@
+package randomchannel
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/odvcencio/goetrope/pkg/library"
+	"github.com/odvcencio/goetrope/pkg/theatre"
+	"github.com/stretchr/testify/require"
+)
+
+unit "Random channel bounded recovery failures" {
+	given "sensitive transition refresh and activation backend errors" {
+		room := &theatre.Room{RoomCode: RoomCode, Playlist: []int64{10, 20}, CurrentItemIndex: 0}
+		manager := &recoveryRoomManager{room: room, advanceErr: errors.New("password=hunter2 /srv/private/movie.mkv"), ensureErr: errors.New("secret.internal refresh")}
+		svc := feedModelTestService(t, true)
+		svc.manager = manager
+		svc.SetController(&failingRecoveryController{playErr: errors.New("secret.internal activation password=hunter2")})
+		svc.loadItem = func(context.Context, int64) (*library.MediaItem, error) { return nil, nil }
+		svc.warmItem = func(context.Context, *library.MediaItem) {}
+
+		when "recovery logs and summarizes failures" {
+			var halted bool
+			var recoveryErr error
+			logs := captureRecoveryLogs(func() {
+				halted, recoveryErr = svc.handleFeedSignal(context.Background(), room, PlayoutStepResult{Signal: PlayoutSkipToNextItem})
+			})
+			diagnostic := svc.summaryFeedDiagnostic(runtimeState{})
+			publicJSON, marshalErr := json.Marshal(Summary{FeedState: diagnostic.State, FeedReasonCode: diagnostic.ReasonCode, FeedReason: diagnostic.Reason})
+
+			then "emits only stable codes without secrets paths or raw error text" {
+				require.True(t, halted)
+				require.NoError(t, recoveryErr)
+				require.NoError(t, marshalErr)
+				for _, output := range []string{logs, string(publicJSON)} {
+					require.NotContains(t, output, "hunter2")
+					require.NotContains(t, output, "secret.internal")
+					require.NotContains(t, output, "/srv/private/movie.mkv")
+				}
+				require.Contains(t, logs, "code=transition_failed")
+				require.Contains(t, logs, "code=state_read_failed")
+			}
+		}
+	}
+
+	given "thirty-two concurrent observers of one degraded generation" {
+		room := &theatre.Room{RoomCode: RoomCode, Playlist: []int64{10}, CurrentItemIndex: 0}
+		manager := &recoveryRoomManager{room: room}
+		controller := &failingRecoveryController{}
+		svc := feedModelTestService(t, true)
+		svc.manager = manager
+		svc.SetController(controller)
+		var replacements atomic.Int32
+		svc.replacePlaylist = func(context.Context, *theatre.Room) (*theatre.Room, error) {
+			replacements.Add(1)
+			manager.room = &theatre.Room{RoomCode: RoomCode, Playlist: []int64{20}, CurrentItemIndex: 0}
+			return manager.room, nil
+		}
+		svc.loadItem = func(context.Context, int64) (*library.MediaItem, error) { return nil, nil }
+		svc.warmItem = func(context.Context, *library.MediaItem) {}
+
+		when "all observers react concurrently" {
+			var wg sync.WaitGroup
+			errs := make(chan error, 32)
+			halted := make(chan bool, 32)
+			start := make(chan struct{})
+			for i := 0; i < 32; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					<-start
+					didHalt, err := svc.handleFeedSignal(context.Background(), room, PlayoutStepResult{Signal: PlayoutSkipToNextItem})
+					halted <- didHalt
+					errs <- err
+				}()
+			}
+			close(start)
+			wg.Wait()
+			close(halted)
+			close(errs)
+
+			then "shares one transition and one activation result" {
+				for value := range halted { require.True(t, value) }
+				for callErr := range errs { require.NoError(t, callErr) }
+				require.Equal(t, int32(1), replacements.Load())
+				require.Equal(t, 1, controller.playCalls)
+			}
+		}
+	}
+
+	given "a successful end-of-playlist reroll" {
+		room := &theatre.Room{RoomCode: RoomCode, Playlist: []int64{10}, CurrentItemIndex: 0}
+		manager := &recoveryRoomManager{room: room}
+		controller := &failingRecoveryController{}
+		svc := feedModelTestService(t, true)
+		svc.manager = manager
+		svc.SetController(controller)
+		svc.replacePlaylist = func(context.Context, *theatre.Room) (*theatre.Room, error) {
+			manager.room = &theatre.Room{RoomCode: RoomCode, Playlist: []int64{20, 30}, CurrentItemIndex: 0}
+			return manager.room, nil
+		}
+		svc.loadItem = func(context.Context, int64) (*library.MediaItem, error) { return nil, nil }
+		svc.warmItem = func(context.Context, *library.MediaItem) {}
+
+		when "the terminal item transitions" {
+			halted, err := svc.handleFeedSignal(context.Background(), room, PlayoutStepResult{Signal: PlayoutSkipToNextItem})
+
+			then "activates the replacement lineup exactly once" {
+				require.True(t, halted)
+				require.NoError(t, err)
+				require.Equal(t, 1, controller.playCalls)
+				require.Equal(t, int64(20), manager.room.Playlist[0])
+			}
+		}
+	}
+
+	given "an end-of-playlist activation that outlives the recovery deadline" {
+		room := &theatre.Room{RoomCode: RoomCode, Playlist: []int64{10}, CurrentItemIndex: 0}
+		manager := &recoveryRoomManager{room: room}
+		controller := &failingRecoveryController{blockPlay: true, playErr: errors.New("late backend failure")}
+		svc := feedModelTestService(t, true)
+		svc.manager = manager
+		svc.SetController(controller)
+		svc.feedRecoveryBudget = 25 * time.Millisecond
+		svc.replacePlaylist = func(context.Context, *theatre.Room) (*theatre.Room, error) {
+			manager.room = &theatre.Room{RoomCode: RoomCode, Playlist: []int64{20}, CurrentItemIndex: 0}
+			return manager.room, nil
+		}
+		svc.loadItem = func(context.Context, int64) (*library.MediaItem, error) { return nil, nil }
+		svc.warmItem = func(context.Context, *library.MediaItem) {}
+
+		when "activation returns after the deadline" {
+			halted, err := svc.handleFeedSignal(context.Background(), room, PlayoutStepResult{Signal: PlayoutSkipToNextItem})
+			haltedAgain, errAgain := svc.handleFeedSignal(context.Background(), room, PlayoutStepResult{Signal: PlayoutSkipToNextItem})
+			diagnostic := svc.summaryFeedDiagnostic(runtimeState{})
+
+			then "classifies the deadline terminally without activating twice" {
+				require.True(t, halted)
+				require.True(t, haltedAgain)
+				require.NoError(t, err)
+				require.NoError(t, errAgain)
+				require.Equal(t, 1, controller.playCalls)
+				require.Equal(t, "recovery_deadline_exceeded", diagnostic.ReasonCode)
+			}
+		}
+	}
+
+	given "an end-of-playlist activation failure" {
+		room := &theatre.Room{RoomCode: RoomCode, Playlist: []int64{10}, CurrentItemIndex: 0}
+		manager := &recoveryRoomManager{room: room}
+		controller := &failingRecoveryController{playErr: errors.New("secret.internal activation password=hunter2 /srv/private/movie.mkv")}
+		svc := feedModelTestService(t, true)
+		svc.manager = manager
+		svc.SetController(controller)
+		svc.replacePlaylist = func(context.Context, *theatre.Room) (*theatre.Room, error) {
+			manager.room = &theatre.Room{RoomCode: RoomCode, Playlist: []int64{20}, CurrentItemIndex: 0}
+			return manager.room, nil
+		}
+		svc.loadItem = func(context.Context, int64) (*library.MediaItem, error) { return nil, nil }
+		svc.warmItem = func(context.Context, *library.MediaItem) {}
+
+		when "the replacement cannot be activated" {
+			var halted, haltedAgain bool
+			var err, errAgain error
+			logs := captureRecoveryLogs(func() {
+				halted, err = svc.handleFeedSignal(context.Background(), room, PlayoutStepResult{Signal: PlayoutSkipToNextItem})
+				haltedAgain, errAgain = svc.handleFeedSignal(context.Background(), room, PlayoutStepResult{Signal: PlayoutSkipToNextItem})
+			})
+			diagnostic := svc.summaryFeedDiagnostic(runtimeState{})
+
+			then "latches after the first and only activation attempt" {
+				require.True(t, halted)
+				require.True(t, haltedAgain)
+				require.NoError(t, err)
+				require.NoError(t, errAgain)
+				require.Equal(t, 1, controller.playCalls)
+				require.Equal(t, "recovery_activation_failed", diagnostic.ReasonCode)
+				require.Contains(t, logs, "code=activation_failed")
+				require.NotContains(t, logs, "hunter2")
+				require.NotContains(t, logs, "secret.internal")
+				require.NotContains(t, logs, "/srv/private/movie.mkv")
+			}
+		}
+	}
+
+	given "a persistent transition failure containing sensitive manager detail" {
+		room := &theatre.Room{RoomCode: RoomCode, Playlist: []int64{10, 20}, CurrentItemIndex: 0}
+		manager := &recoveryRoomManager{room: room, advanceErr: errors.New("postgres password=hunter2 host=secret.internal")}
+		svc := feedModelTestService(t, true)
+		svc.manager = manager
+		result := PlayoutStepResult{Signal: PlayoutSkipToNextItem, LiveLead: -12.352}
+
+		when "the generation consumes its bounded retry budget" {
+			haltedOne, errOne := svc.handleFeedSignal(context.Background(), room, result)
+			haltedTwo, errTwo := svc.handleFeedSignal(context.Background(), room, result)
+			haltedThree, errThree := svc.handleFeedSignal(context.Background(), room, result)
+			haltedFour, errFour := svc.handleFeedSignal(context.Background(), room, result)
+			diagnostic := svc.summaryFeedDiagnostic(runtimeState{})
+			publicJSON, marshalErr := json.Marshal(Summary{FeedState: diagnostic.State, FeedReasonCode: diagnostic.ReasonCode, FeedReason: diagnostic.Reason})
+
+			then "latches terminal recovery without double advancing or exposing the raw error" {
+				require.False(t, haltedOne)
+				require.False(t, haltedTwo)
+				require.Error(t, errOne)
+				require.Error(t, errTwo)
+				require.True(t, haltedThree)
+				require.True(t, haltedFour)
+				require.NoError(t, errThree)
+				require.NoError(t, errFour)
+				require.Equal(t, 3, manager.advances)
+				require.Equal(t, 0, manager.room.CurrentItemIndex)
+				require.Equal(t, "recovery_budget_exhausted", diagnostic.ReasonCode)
+				require.False(t, strings.Contains(diagnostic.Reason, "hunter2"))
+				require.False(t, strings.Contains(diagnostic.Reason, "secret.internal"))
+				require.NoError(t, marshalErr)
+				require.NotContains(t, string(publicJSON), "hunter2")
+				require.NotContains(t, string(publicJSON), "secret.internal")
+			}
+		}
+	}
+
+	given "a cursor mutation followed by activation failure" {
+		room := &theatre.Room{RoomCode: RoomCode, Playlist: []int64{10, 20}, CurrentItemIndex: 0}
+		manager := &recoveryRoomManager{room: room}
+		svc := feedModelTestService(t, true)
+		svc.manager = manager
+		svc.SetController(&failingRecoveryController{playErr: errors.New("secret activation backend")})
+		svc.loadItem = func(context.Context, int64) (*library.MediaItem, error) { return nil, nil }
+		svc.warmItem = func(context.Context, *library.MediaItem) {}
+		result := PlayoutStepResult{Signal: PlayoutSkipToNextItem}
+
+		when "the stale generation is observed again" {
+			haltedOne, errOne := svc.handleFeedSignal(context.Background(), room, result)
+			oldSnapshot := &theatre.Room{RoomCode: RoomCode, Playlist: []int64{10, 20}, CurrentItemIndex: 0}
+			haltedTwo, errTwo := svc.handleFeedSignal(context.Background(), oldSnapshot, result)
+			diagnostic := svc.summaryFeedDiagnostic(runtimeState{})
+
+			then "terminally latches the mutated generation without skipping twice" {
+				require.True(t, haltedOne)
+				require.True(t, haltedTwo)
+				require.NoError(t, errOne)
+				require.NoError(t, errTwo)
+				require.Equal(t, 1, manager.advances)
+				require.Equal(t, 1, manager.room.CurrentItemIndex)
+				require.Equal(t, "recovery_activation_failed", diagnostic.ReasonCode)
+				require.False(t, strings.Contains(diagnostic.Reason, "secret activation backend"))
+			}
+		}
+	}
+
+	given "an advance response with no authoritative room" {
+		room := &theatre.Room{RoomCode: RoomCode, Playlist: []int64{10, 20}, CurrentItemIndex: 0}
+		manager := &recoveryRoomManager{room: room, returnNil: true}
+		svc := feedModelTestService(t, true)
+		svc.manager = manager
+
+		when "the ambiguous response is handled" {
+			halted, err := svc.handleFeedSignal(context.Background(), room, PlayoutStepResult{Signal: PlayoutSkipToNextItem})
+			diagnostic := svc.summaryFeedDiagnostic(runtimeState{})
+
+			then "terminally latches rather than retrying a possibly committed advance" {
+				require.True(t, halted)
+				require.NoError(t, err)
+				require.Equal(t, 1, manager.advances)
+				require.Equal(t, "recovery_state_unknown", diagnostic.ReasonCode)
+			}
+		}
+	}
+
+	given "a manager call that blocks until its recovery context expires" {
+		room := &theatre.Room{RoomCode: RoomCode, Playlist: []int64{10, 20}, CurrentItemIndex: 0}
+		manager := &recoveryRoomManager{room: room, blockAdvance: true}
+		svc := feedModelTestService(t, true)
+		svc.manager = manager
+		svc.feedRecoveryBudget = 25 * time.Millisecond
+
+		when "the hard generation deadline expires" {
+			started := time.Now()
+			halted, err := svc.handleFeedSignal(context.Background(), room, PlayoutStepResult{Signal: PlayoutSkipToNextItem})
+			elapsed := time.Since(started)
+			haltedAgain, errAgain := svc.handleFeedSignal(context.Background(), room, PlayoutStepResult{Signal: PlayoutSkipToNextItem})
+			diagnostic := svc.summaryFeedDiagnostic(runtimeState{})
+
+			then "returns bounded and terminally prevents any later retry" {
+				require.True(t, halted)
+				require.True(t, haltedAgain)
+				require.NoError(t, err)
+				require.NoError(t, errAgain)
+				require.Less(t, elapsed, 250*time.Millisecond)
+				require.Equal(t, 1, manager.advances)
+				require.Equal(t, 0, manager.room.CurrentItemIndex)
+				require.Equal(t, "recovery_deadline_exceeded", diagnostic.ReasonCode)
+			}
+		}
+	}
+}

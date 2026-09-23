@@ -1,0 +1,200 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/odvcencio/goetrope/pkg/segment"
+	"github.com/odvcencio/goetrope/pkg/transcode"
+	"github.com/odvcencio/goetrope/pkg/worker"
+)
+
+type activationOptionalExecutor struct{}
+
+func (activationOptionalExecutor) Capabilities() transcode.Capabilities {
+	return transcode.Capabilities{HasFFmpeg: true, CPUAvailable: true, PreferredBackend: transcode.BackendCPU, VideoEncoders: []string{"libx264"}}
+}
+
+func (activationOptionalExecutor) Execute(context.Context, transcode.Job, worker.ProgressSink) (transcode.Completion, error) {
+	return transcode.Completion{Success: true}, nil
+}
+
+type activationPathReceiver struct {
+	calls atomic.Int64
+	path  string
+}
+
+func (r *activationPathReceiver) SetFFmpegPath(path string) {
+	r.calls.Add(1)
+	r.path = path
+}
+
+unit "optional Discord activation" {
+	then "a configured Discord outage leaves existing-owner startup ready-degraded and starts other loops exactly once" {
+		marker := "https://user:DISCORD_CREDENTIAL_MARKER@discord.invalid/commands"
+		var registrations atomic.Int64
+		var backgroundStarts atomic.Int64
+		var backgroundExits atomic.Int64
+		warnings := make(chan string, 1)
+		components := serveRuntimeComponents{
+			startWorker: func(_ context.Context, runtimeCtx context.Context) (*worker.EmbeddedRunner, error) {
+				return worker.StartEmbedded(runtimeCtx, transcode.NewCoordinator(), worker.EmbeddedConfig{
+					Label: "embedded", MediaRoots: []string{t.TempDir()}, Executor: activationOptionalExecutor{},
+				})
+			},
+			registerDiscord: func(context.Context) error {
+				registrations.Add(1)
+				return errors.New(marker)
+			},
+			warn: func(message string) { warnings <- message },
+			runRandom: func(ctx context.Context) {
+				backgroundStarts.Add(1)
+				<-ctx.Done()
+				backgroundExits.Add(1)
+			},
+		}
+		controller, err := newApplicationRuntimeController(context.Background(), components.start)
+		expect err == nil
+		expect controller.EnsureStarted(context.Background()) == nil
+		expect controller.EnsureStarted(context.Background()) == nil
+		deadline := time.Now().Add(time.Second)
+		for (backgroundStarts.Load() != 1 || registrations.Load() != 1 || !controller.Readiness().Degraded) && time.Now().Before(deadline) { time.Sleep(time.Millisecond) }
+		warning := ""
+		select { case warning = <-warnings: case <-time.After(time.Second): t.Fatal("missing Discord degradation warning") }
+		state := controller.Readiness()
+		expect state.Ready
+		expect state.Degraded
+		expect registrations.Load() == 1
+		expect backgroundStarts.Load() == 1
+		expect warning == discordRegistrationDegradedWarning
+		reject strings.Contains(warning, "DISCORD_CREDENTIAL_MARKER")
+		reject strings.Contains(warning, "discord.invalid")
+		controller.Close()
+		deadline = time.Now().Add(time.Second)
+		for backgroundExits.Load() != 1 && time.Now().Before(deadline) { time.Sleep(time.Millisecond) }
+		expect backgroundExits.Load() == 1
+	}
+
+	then "bootstrap activation retries a required local failure and still treats Discord registration as optional" {
+		localFailure := errors.New("local worker unavailable")
+		var workerAttempts atomic.Int64
+		var registrations atomic.Int64
+		components := serveRuntimeComponents{
+			startWorker: func(_ context.Context, runtimeCtx context.Context) (*worker.EmbeddedRunner, error) {
+				if workerAttempts.Add(1) == 1 { return nil, localFailure }
+				return worker.StartEmbedded(runtimeCtx, transcode.NewCoordinator(), worker.EmbeddedConfig{
+					Label: "embedded", MediaRoots: []string{t.TempDir()}, Executor: activationOptionalExecutor{},
+				})
+			},
+			registerDiscord: func(context.Context) error {
+				registrations.Add(1)
+				return errors.New("discord unavailable")
+			},
+			warn: func(string) {},
+		}
+		controller, err := newApplicationRuntimeController(context.Background(), components.start)
+		expect err == nil
+		expect errors.Is(controller.EnsureStarted(context.Background()), localFailure)
+		reject controller.Readiness().Ready
+		expect controller.EnsureStarted(context.Background()) == nil
+		deadline := time.Now().Add(time.Second)
+		for (registrations.Load() != 1 || !controller.Readiness().Degraded) && time.Now().Before(deadline) { time.Sleep(time.Millisecond) }
+		expect workerAttempts.Load() == 2
+		expect registrations.Load() == 1
+		expect controller.Readiness().Ready
+		expect controller.Readiness().Degraded
+		controller.Close()
+	}
+
+	then "a blocked Discord netfetch attempt cannot consume the application activation deadline" {
+		entered := make(chan struct{})
+		exited := make(chan struct{})
+		components := serveRuntimeComponents{
+			startWorker: func(_ context.Context, runtimeCtx context.Context) (*worker.EmbeddedRunner, error) {
+				return worker.StartEmbedded(runtimeCtx, transcode.NewCoordinator(), worker.EmbeddedConfig{
+					Label: "embedded", MediaRoots: []string{t.TempDir()}, Executor: activationOptionalExecutor{},
+				})
+			},
+			registerDiscord: func(ctx context.Context) error {
+				close(entered)
+				<-ctx.Done()
+				close(exited)
+				return ctx.Err()
+			},
+			registerLimit: 25 * time.Millisecond,
+			warn: func(string) {},
+		}
+		controller, err := newApplicationRuntimeController(context.Background(), components.start)
+		expect err == nil
+		started := time.Now()
+		expect controller.EnsureStarted(context.Background()) == nil
+		expect time.Since(started) < time.Second
+		expect controller.Readiness().Ready
+		select { case <-entered: case <-time.After(time.Second): t.Fatal("Discord registration did not start") }
+		select { case <-exited: case <-time.After(time.Second): t.Fatal("Discord registration did not honor its deadline") }
+		deadline := time.Now().Add(time.Second)
+		for !controller.Readiness().Degraded && time.Now().Before(deadline) { time.Sleep(time.Millisecond) }
+		expect controller.Readiness().Degraded
+		controller.Close()
+	}
+}
+
+@serial
+unit "owner-gated media capability preparation" {
+	then "constructor composition performs zero pre-owner probes and exactly one committed activation probe" {
+		original := serveNewExecutor
+		defer func() { serveNewExecutor = original }()
+		var probes atomic.Int64
+		serveNewExecutor = func(context.Context, []string, string, string, *segment.Uploader) (*worker.Executor, error) {
+			probes.Add(1)
+			return &worker.Executor{}, nil
+		}
+		receiver := &activationPathReceiver{}
+		expect probes.Load() == 0
+		executor, err := prepareEmbeddedExecutor(context.Background(), nil, "", "", nil, receiver)
+		expect err == nil
+		expect executor not_nil
+		expect probes.Load() == 1
+		expect receiver.calls.Load() == 1
+	}
+
+	then "the activation context reaches a blocked product probe and a later attempt remains retryable" {
+		original := serveNewExecutor
+		defer func() { serveNewExecutor = original }()
+		entered := make(chan struct{})
+		exited := make(chan struct{})
+		var attempts atomic.Int64
+		serveNewExecutor = func(ctx context.Context, _ []string, _, _ string, _ *segment.Uploader) (*worker.Executor, error) {
+			if attempts.Add(1) == 1 {
+				close(entered)
+				<-ctx.Done()
+				close(exited)
+				return nil, ctx.Err()
+			}
+			return &worker.Executor{}, nil
+		}
+		receiver := &activationPathReceiver{}
+		components := serveRuntimeComponents{
+			startWorker: func(activationCtx, _ context.Context) (*worker.EmbeddedRunner, error) {
+				_, err := prepareEmbeddedExecutor(activationCtx, nil, "", "", nil, receiver)
+				return nil, err
+			},
+		}
+		controller, err := newApplicationRuntimeController(context.Background(), components.start)
+		expect err == nil
+		activationCtx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+		defer cancel()
+		expect errors.Is(controller.EnsureStarted(activationCtx), context.DeadlineExceeded)
+		select { case <-entered: case <-time.After(time.Second): t.Fatal("product probe did not start") }
+		select { case <-exited: case <-time.After(time.Second): t.Fatal("product probe goroutine did not exit") }
+		expect receiver.calls.Load() == 0
+		expect controller.EnsureStarted(context.Background()) == nil
+		expect attempts.Load() == 2
+		expect receiver.calls.Load() == 1
+		controller.Close()
+	}
+}

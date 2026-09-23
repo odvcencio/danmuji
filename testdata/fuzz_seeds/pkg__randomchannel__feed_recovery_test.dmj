@@ -1,0 +1,102 @@
+package randomchannel
+
+import (
+	"context"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/library"
+	"github.com/odvcencio/goetrope/pkg/stream"
+	"github.com/odvcencio/goetrope/pkg/theatre"
+)
+
+unit "Random channel degraded recovery" {
+	given "a scheduler skip signal for an active lineup generation" {
+		room := &theatre.Room{RoomCode: RoomCode, Playlist: []int64{10, 20, 30}, CurrentItemIndex: 0}
+		manager := &recoveryRoomManager{room: room}
+		controller := &fakeRoomController{}
+		svc := feedModelTestService(t, true)
+		svc.manager = manager
+		svc.SetController(controller)
+		svc.loadItem = func(context.Context, int64) (*library.MediaItem, error) { return nil, nil }
+		svc.warmItem = func(context.Context, *library.MediaItem) {}
+		result := PlayoutStepResult{Signal: PlayoutSkipToNextItem, LiveLead: -12.352}
+
+		when "the same degraded generation is handled more than once" {
+			first, firstErr := svc.handleFeedSignal(context.Background(), room, result)
+			oldSnapshot := &theatre.Room{RoomCode: RoomCode, Playlist: []int64{10, 20, 30}, CurrentItemIndex: 0}
+			second, secondErr := svc.handleFeedSignal(context.Background(), oldSnapshot, result)
+
+			then "advances exactly once and suppresses stale policy work" {
+				expect firstErr == nil
+				expect secondErr == nil
+				expect first
+				expect second
+				expect manager.advances == 1
+				expect manager.room.CurrentItemIndex == 1
+			}
+		}
+	}
+}
+
+unit "Random channel live-cache generation fencing" {
+	given "current next and stale live-cache jobs across a lineup transition" {
+		queue := &generationQueue{jobs: []int64{10, 20, 30, 99}}
+		svc := feedModelTestService(t, true)
+		svc.SetTranscodeQueue(queue)
+		room := &theatre.Room{RoomCode: RoomCode, Playlist: []int64{10, 20, 30}, CurrentItemIndex: 1}
+
+		when "reconciling the new active generation twice" {
+			svc.reconcileFeedWorkGeneration(room)
+			firstCancelled := queue.cancelled
+			svc.reconcileFeedWorkGeneration(room)
+
+			then "keeps current and valid next-item preroll while fencing stale work once" {
+				expect len(queue.kept) == 2
+				expect queue.kept[0] == 20
+				expect queue.kept[1] == 30
+				expect firstCancelled == 2
+				expect queue.cancelled == firstCancelled
+			}
+		}
+	}
+}
+
+unit "Random channel scheduler outstanding generation" {
+	given "an outstanding window for the former current item" {
+		manifest := stream.NewProducedManifest()
+		worker := newFakeSerialWorker(manifest)
+		scheduler := newTestScheduler(manifest, worker, []int64{600_000, 600_000, 600_000}, []string{"live"})
+		scheduler.SetPosition(0, 0)
+		scheduler.Step(0)
+
+		when "the active item advances" {
+			scheduler.SetPosition(1, 0)
+			_, _, _, _, outstanding := scheduler.outstandingWindow()
+
+			then "releases stale outstanding bookkeeping" {
+				reject outstanding
+			}
+		}
+	}
+
+	given "an outstanding pre-roll window for the next item" {
+		manifest := stream.NewProducedManifest()
+		worker := newFakeSerialWorker(manifest)
+		scheduler := newTestScheduler(manifest, worker, []int64{10_500, 600_000, 600_000}, []string{"live"})
+		for idx := 0; idx <= stream.LastContentSegmentIndexForDuration(10_500, stream.LowLatencySegmentDuration); idx++ {
+			manifest.OnSegmentReceived(1, "live", idx, stream.LowLatencySegmentDuration)
+		}
+		scheduler.SetPosition(0, 10)
+		scheduler.Step(0)
+
+		when "the pre-rolled item becomes current" {
+			scheduler.SetPosition(1, 0)
+			item, _, _, _, outstanding := scheduler.outstandingWindow()
+
+			then "preserves the valid pre-roll as the sole outstanding window" {
+				expect outstanding
+				expect item == 2
+			}
+		}
+	}
+}

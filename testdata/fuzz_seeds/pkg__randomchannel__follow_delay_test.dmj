@@ -1,0 +1,77 @@
+package randomchannel
+
+import (
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/theatre"
+)
+
+type fakeSyncRegistrar struct {
+	edge   theatre.ProducedEdgeProvider
+	follow theatre.FollowDelayProvider
+}
+
+func (f *fakeSyncRegistrar) SetEdgeProvider(provider theatre.ProducedEdgeProvider) {
+	f.edge = provider
+}
+
+func (f *fakeSyncRegistrar) SetFollowDelayProvider(provider theatre.FollowDelayProvider) {
+	f.follow = provider
+}
+
+unit "Random channel viewer follow delay" {
+	given "a feed model service with a viewer delay" {
+		svc := New(nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+		svc.enableFeedModelForTest()
+		svc.viewerFollowDelay = 8
+
+		when "asking for the random channel delay" {
+			delay, ok := svc.FollowDelaySeconds(RoomCode)
+
+			then "returns the configured delay" {
+				expect ok
+				expect delay == 8
+			}
+		}
+
+		when "asking for another room delay" {
+			_, ok := svc.FollowDelaySeconds("PARTY1")
+
+			then "does not delay unrelated rooms" {
+				reject ok
+			}
+		}
+
+		when "registering sync providers" {
+			registrar := &fakeSyncRegistrar{}
+			svc.RegisterEdgeProvider(registrar)
+
+			then "registers the produced-edge provider" {
+				expect registrar.edge != nil
+			}
+
+			then "registers the follow-delay provider" {
+				expect registrar.follow != nil
+			}
+		}
+	}
+
+	given "a legacy service with a viewer delay configured" {
+		svc := New(nil, nil, nil, theatre.NewPlaybackStateManager(), nil)
+		svc.feedModel = false
+		svc.viewerFollowDelay = 8
+
+		when "registering sync providers" {
+			registrar := &fakeSyncRegistrar{}
+			svc.RegisterEdgeProvider(registrar)
+
+			then "does not register the produced-edge provider" {
+				reject registrar.edge != nil
+			}
+
+			then "does not register the follow-delay provider" {
+				reject registrar.follow != nil
+			}
+		}
+	}
+}

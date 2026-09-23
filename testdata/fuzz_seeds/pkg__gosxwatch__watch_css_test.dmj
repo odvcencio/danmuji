@@ -1,0 +1,281 @@
+package gosxwatch
+
+import (
+	"os"
+	"strings"
+	"testing"
+)
+
+unit "GoSX subtitle overlay CSS ordering" {
+	cssBytes, err := os.ReadFile("public/watch.css")
+	expect err == nil
+	css := string(cssBytes)
+	generic := strings.LastIndex(css, "\n.subtitle-overlay {")
+	specific := strings.LastIndex(css, "\n.gosx-video-subtitle-overlay.subtitle-overlay {")
+	block := ""
+	if specific >= 0 {
+		block = css[specific:]
+		if end := strings.Index(block, "}"); end >= 0 {
+			block = block[:end]
+		}
+	}
+
+	then "the GoSX overlay rule wins over the generic overlay rule" {
+		expect generic >= 0
+		expect specific > generic
+	}
+
+	then "the GoSX overlay keeps cues bottom centered" {
+		expect strings.Contains(block, "justify-content: flex-end")
+		expect strings.Contains(block, "align-items: center")
+	}
+}
+
+unit "watch fullscreen chrome reset wins the page cascade" {
+	cssBytes, err := os.ReadFile("public/watch.css")
+	expect err == nil
+	css := string(cssBytes)
+	cardRule := strings.LastIndex(css, "\n.watch-page > .player-shell {")
+	frameRule := strings.LastIndex(css, "\n.watch-page > .player-shell .player-frame {")
+	finalShellReset := strings.LastIndex(css, "\n.watch-page > .player-shell:fullscreen,")
+	finalFrameReset := strings.LastIndex(css, "\n.watch-page > .player-shell:fullscreen .player-frame,")
+
+	then "the final shell reset appears after page-scoped card chrome" {
+		expect cardRule >= 0
+		expect finalShellReset > cardRule
+		expect strings.Contains(css[finalShellReset:], ".player-shell[data-watch-fullscreen=\"true\"]")
+		expect strings.Contains(css[finalShellReset:], "backdrop-filter: none")
+	}
+
+	then "the final frame reset appears after page-scoped rounded frame chrome" {
+		expect frameRule >= 0
+		expect finalFrameReset > frameRule
+		expect strings.Contains(css[finalFrameReset:], "border-radius: 0")
+		expect strings.Contains(css[finalFrameReset:], "aspect-ratio: auto")
+	}
+}
+
+unit "watch party stage controls stay responsive" {
+	cssBytes, err := os.ReadFile("public/watch.css")
+	expect err == nil
+	css := string(cssBytes)
+
+	then "the party stage has first-screen player affordances" {
+		expect strings.Contains(css, ".party-stage__masthead")
+		expect strings.Contains(css, ".party-stage__progressbar")
+		expect strings.Contains(css, ".player-toolbar--party")
+	}
+
+	then "host controls have complete interaction states" {
+		expect strings.Contains(css, ".transport-button:hover")
+		expect strings.Contains(css, ".transport-button:active")
+		expect strings.Contains(css, ".transport-button--primary")
+	}
+
+	then "subtitle and audio selectors have matching player affordances" {
+		expect strings.Contains(css, ".player-external-controls")
+		expect strings.Contains(css, ".player-external-controls--party")
+		expect strings.Contains(css, ".player-hud-controls")
+		expect strings.Contains(css, ".player-hud-controls--party")
+		expect strings.Contains(css, ".player-caption-controls")
+		expect strings.Contains(css, ".player-audio-controls")
+		expect strings.Contains(css, ".player-sound-toggle")
+		expect strings.Contains(css, "flex: 1 1 18rem")
+		expect strings.Contains(css, "flex: 1 1 12rem")
+		expect strings.Contains(css, "position: absolute")
+		expect strings.Contains(css, "pointer-events: none")
+		expect strings.Contains(css, ".player-hud-controls > *")
+		expect strings.Contains(css, "data-watch-audio-muted=\"true\"")
+		expect strings.Contains(css, "width: 100%")
+		expect strings.Contains(css, "min-width: 0")
+		expect strings.Contains(css, ".player-caption-select,")
+		expect strings.Contains(css, ".player-audio-select")
+		expect strings.Contains(css, ".player-audio-select:focus-visible")
+		expect !strings.Contains(css, ".player-caption-controls {\n  position: absolute")
+		expect !strings.Contains(css, ".player-audio-controls {\n  position: absolute")
+	}
+
+	then "queue state and mobile stacking are explicit" {
+		expect strings.Contains(css, ".queue-row--current")
+		expect strings.Contains(css, ".queue-row--played")
+		expect strings.Contains(css, ".party-transport form")
+		expect strings.Contains(css, ".player-toolbar--party .player-toolbar__actions")
+		expect strings.Contains(css, "flex: 1 1 14rem")
+		expect strings.Contains(css, "flex-wrap: wrap")
+		expect strings.Contains(css, "max-width: 100%")
+		expect strings.Contains(css, ".player-toolbar__actions .chip")
+		expect strings.Contains(css, "overflow-wrap: anywhere")
+		expect strings.Contains(css, ".player-hud-controls .player-caption-controls,")
+		expect strings.Contains(css, "flex-basis: 100%")
+	}
+}
+
+unit "live theatre strip remains compact and informative" {
+	cssBytes, err := os.ReadFile("public/watch.css")
+	expect err == nil
+	css := string(cssBytes)
+
+	then "the popout runtime carries status and progress affordances" {
+		expect strings.Contains(css, ".popout-runtime__meta span")
+		expect strings.Contains(css, ".popout-runtime__progress")
+		expect strings.Contains(css, ".popout-runtime__progress span")
+	}
+
+	then "the live strip stacks without overflow on mobile" {
+		expect strings.Contains(css, ".popout-runtime")
+		expect strings.Contains(css, "grid-template-columns: 1fr")
+		expect strings.Contains(css, ".popout-runtime__clock")
+	}
+
+	then "intermission countdown stays in the player overlay" {
+		expect strings.Contains(css, ".player-shell[data-watch-player-state=\"intermission\"] .gosx-video-sync-overlay")
+		expect strings.Contains(css, ".gosx-video-sync-overlay__count")
+		expect strings.Contains(css, "font-variant-numeric: tabular-nums")
+		reject strings.Contains(css, ".intermission-overlay")
+		expect strings.Contains(css, ".popout-runtime[data-watch-live-mode=\"intermission\"]")
+	}
+}
+
+unit "subtitle presentation prefs refresh cue typography without losing overlay specificity" {
+	cssBytes, err := os.ReadFile("public/watch.css")
+	expect err == nil
+	css := string(cssBytes)
+
+	then "the base cue rule carries the refreshed font stack and a layered text-shadow edge" {
+		// -webkit-text-stroke has no Firefox support, so the "stroke" is faked with a
+		// blurred dark pair (scaled to the picture via cqw) plus two 1px-offset
+		// shadows for a crisp diagonal edge.
+		expect strings.Contains(css, ".subtitle-cue {")
+		expect strings.Contains(css, "font-family: \"Inter\", \"Segoe UI\", system-ui, sans-serif;")
+		expect strings.Contains(css, "font-weight: 500;")
+		expect strings.Contains(css, "0 0 0.15cqw #000,")
+		expect strings.Contains(css, "1px 1px 0 #000,")
+		expect strings.Contains(css, "-1px -1px 0 #000;")
+		reject strings.Contains(css, "-webkit-text-stroke:")
+	}
+
+	then "the cqw sizing mechanics and size/style presentation classes are still in place" {
+		expect strings.Contains(css, "container-type: inline-size")
+		expect strings.Contains(css, "font-size: clamp(0.95rem, 3.1cqw, 2.6rem);")
+		expect strings.Contains(css, ".subtitle-size-s .subtitle-cue")
+		expect strings.Contains(css, ".subtitle-size-m .subtitle-cue")
+		expect strings.Contains(css, ".subtitle-size-l .subtitle-cue")
+		expect strings.Contains(css, ".subtitle-style-classic .subtitle-cue")
+		expect strings.Contains(css, ".subtitle-style-boxed .subtitle-cue")
+		expect strings.Contains(css, ".subtitle-style-minimal .subtitle-cue")
+	}
+
+	then "size prefs scale bitmap cues by the same s/m/l steps as text cues" {
+		expect strings.Contains(css, ".subtitle-size-s .subtitle-image")
+		expect strings.Contains(css, ".subtitle-size-l .subtitle-image")
+		expect strings.Contains(css, "scale(0.85)")
+		expect strings.Contains(css, "scale(1.25)")
+	}
+
+	then "boxed style only backs text cues, and bitmap images stay crisp" {
+		boxedIdx := strings.Index(css, ".subtitle-style-boxed .subtitle-cue {")
+		expect boxedIdx >= 0
+		boxedBlock := ""
+		if boxedIdx >= 0 {
+			boxedBlock = css[boxedIdx:]
+			if end := strings.Index(boxedBlock, "}"); end >= 0 {
+				boxedBlock = boxedBlock[:end]
+			}
+		}
+		expect strings.Contains(boxedBlock, "rgba(0, 0, 0, 0.55)")
+		expect strings.Contains(boxedBlock, "border-radius")
+		reject strings.Contains(css, ".subtitle-style-boxed .subtitle-image")
+		expect strings.Contains(css, "image-rendering: auto;")
+		reject strings.Contains(css, "pixelated")
+	}
+
+	then "fullscreen and interaction padding rules on the overlay root still win over the generic overlay" {
+		expect strings.Contains(css, ".player-shell:has([data-gosx-video-interaction=\"active\"]) .gosx-video-subtitle-overlay,")
+		expect strings.Contains(css, ".player-shell:fullscreen .gosx-video-subtitle-overlay {")
+		expect strings.Contains(css, ".player-shell:fullscreen:has([data-gosx-video-interaction=\"active\"]) .gosx-video-subtitle-overlay,")
+	}
+
+	then "the offset control cluster finally has its own flex layout" {
+		offsetIdx := strings.Index(css, ".player-caption-offset")
+		expect offsetIdx >= 0
+		offsetBlock := ""
+		if offsetIdx >= 0 {
+			offsetBlock = css[offsetIdx:]
+			if end := strings.Index(offsetBlock, "}"); end >= 0 {
+				offsetBlock = offsetBlock[:end]
+			}
+		}
+		expect strings.Contains(offsetBlock, "display: inline-flex")
+		expect strings.Contains(offsetBlock, "align-items: center")
+		expect strings.Contains(offsetBlock, "gap:")
+	}
+
+	then "fullscreen size companions beat the flat 1.72rem default for both fullscreen prefixes" {
+		// Cue nodes carry BOTH classes (`gosx-video-subtitle-cue subtitle-cue`), and
+		// .player-shell:fullscreen .gosx-video-subtitle-cue (0,3,0) outranked
+		// .subtitle-size-s/l .subtitle-cue (0,2,0), so every size choice collapsed to
+		// the same flat fullscreen size. These companions target
+		// .gosx-video-subtitle-cue (not .subtitle-cue) through .subtitle-size-*, for
+		// (0,4,0) — enough to win — while keeping the same 1.72rem ceiling the
+		// default already uses instead of reintroducing the cqw clamp's 2.6rem cap.
+		expect strings.Contains(css, ".player-shell:fullscreen .subtitle-size-s .gosx-video-subtitle-cue {")
+		expect strings.Contains(css, ".player-shell:fullscreen .subtitle-size-m .gosx-video-subtitle-cue {")
+		expect strings.Contains(css, ".player-shell:fullscreen .subtitle-size-l .gosx-video-subtitle-cue {")
+		expect strings.Contains(css, ".player-shell:-webkit-full-screen .subtitle-size-s .gosx-video-subtitle-cue {")
+		expect strings.Contains(css, ".player-shell:-webkit-full-screen .subtitle-size-m .gosx-video-subtitle-cue {")
+		expect strings.Contains(css, ".player-shell:-webkit-full-screen .subtitle-size-l .gosx-video-subtitle-cue {")
+		expect strings.Contains(css, "font-size: calc(1.72rem * 0.85);")
+		expect strings.Contains(css, "font-size: calc(1.72rem * 1.25);")
+
+		sIdx := strings.Index(css, ".player-shell:fullscreen .subtitle-size-s .gosx-video-subtitle-cue {")
+		expect sIdx >= 0
+		if sIdx >= 0 {
+			sBlock := css[sIdx:]
+			if end := strings.Index(sBlock, "}"); end >= 0 {
+				sBlock = sBlock[:end]
+			}
+			expect strings.Contains(sBlock, "calc(1.72rem * 0.85)")
+		}
+
+		mIdx := strings.Index(css, ".player-shell:fullscreen .subtitle-size-m .gosx-video-subtitle-cue {")
+		expect mIdx >= 0
+		if mIdx >= 0 {
+			mBlock := css[mIdx:]
+			if end := strings.Index(mBlock, "}"); end >= 0 {
+				mBlock = mBlock[:end]
+			}
+			expect strings.Contains(mBlock, "1.72rem")
+			reject strings.Contains(mBlock, "calc(")
+		}
+
+		lIdx := strings.Index(css, ".player-shell:fullscreen .subtitle-size-l .gosx-video-subtitle-cue {")
+		expect lIdx >= 0
+		if lIdx >= 0 {
+			lBlock := css[lIdx:]
+			if end := strings.Index(lBlock, "}"); end >= 0 {
+				lBlock = lBlock[:end]
+			}
+			expect strings.Contains(lBlock, "calc(1.72rem * 1.25)")
+		}
+
+		webkitSIdx := strings.Index(css, ".player-shell:-webkit-full-screen .subtitle-size-s .gosx-video-subtitle-cue {")
+		expect webkitSIdx >= 0
+		if webkitSIdx >= 0 {
+			webkitSBlock := css[webkitSIdx:]
+			if end := strings.Index(webkitSBlock, "}"); end >= 0 {
+				webkitSBlock = webkitSBlock[:end]
+			}
+			expect strings.Contains(webkitSBlock, "calc(1.72rem * 0.85)")
+		}
+
+		webkitLIdx := strings.Index(css, ".player-shell:-webkit-full-screen .subtitle-size-l .gosx-video-subtitle-cue {")
+		expect webkitLIdx >= 0
+		if webkitLIdx >= 0 {
+			webkitLBlock := css[webkitLIdx:]
+			if end := strings.Index(webkitLBlock, "}"); end >= 0 {
+				webkitLBlock = webkitLBlock[:end]
+			}
+			expect strings.Contains(webkitLBlock, "calc(1.72rem * 1.25)")
+		}
+	}
+}

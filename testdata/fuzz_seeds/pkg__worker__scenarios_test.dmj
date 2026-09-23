@@ -1,0 +1,187 @@
+package worker
+
+import (
+	"context"
+	"os"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/transcode"
+)
+
+unit "Executor source validation" {
+	given "an executor with a media root" {
+		tmpDir, dirErr := os.MkdirTemp("", "executor-test-*")
+		expect dirErr == nil
+		defer os.RemoveAll(tmpDir)
+
+		exec := mustTestExecutor(t, tmpDir)
+
+		when "source path is empty" {
+			comp, err := exec.Execute(context.Background(), transcode.Job{ID: "j1", Quality: "original", Type: transcode.JobTypeCacheWarmup}, nil)
+
+			then "fails" {
+				expect err != nil
+				reject comp.Success
+			}
+		}
+
+		when "source is outside media root" {
+			comp, err := exec.Execute(context.Background(), transcode.Job{ID: "j2", SourcePath: "/etc/passwd", Quality: "original", Type: transcode.JobTypeCacheWarmup}, nil)
+
+			then "rejects path traversal" {
+				expect err != nil
+				reject comp.Success
+			}
+		}
+
+		when "source does not exist" {
+			comp, err := exec.Execute(context.Background(), transcode.Job{ID: "j3", SourcePath: tmpDir + "/missing.mp4", Quality: "original", Type: transcode.JobTypeCacheWarmup}, nil)
+
+			then "fails" {
+				expect err != nil
+				reject comp.Success
+			}
+		}
+	}
+}
+
+unit "Executor cancellation" {
+	given "a cancelled context" {
+		exec := mustTestExecutor(t, "")
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		when "executing" {
+			comp, err := exec.Execute(ctx, transcode.Job{ID: "c1", SourcePath: "/dev/null", Quality: "original", Type: transcode.JobTypeCacheWarmup}, nil)
+
+			then "returns cancellation" {
+				expect err != nil
+				reject comp.Success
+			}
+		}
+	}
+}
+
+@serial
+unit "Executor capabilities" {
+	given "an executor with no ffmpeg" {
+		exec, activationErr := NewExecutorForRootsWithUploaderContextAndProbe(context.Background(), []string{""}, "", "", nil, StaticCapabilityProbe(transcode.Capabilities{}))
+		expect activationErr == nil
+
+		then "reports no GPU" {
+			caps := exec.Capabilities()
+			reject caps.NVENCAvailable
+			reject caps.VAAPIAvailable
+		}
+	}
+
+	given "a worker with transcode disabled" {
+		caps := maskTranscodeCapabilities(transcode.Capabilities{
+			HasFFmpeg:        true,
+			HasTesseract:     true,
+			CPUAvailable:     true,
+			NVENCAvailable:   true,
+			VAAPIAvailable:   true,
+			PreferredBackend: transcode.BackendNVENC,
+			VideoEncoders:    []string{"libx264", "h264_nvenc"},
+			NativeCUDA:       true,
+			NativeNVENC:      true,
+			NativeNVENCVer:   208,
+		})
+
+		then "keeps OCR capability but hides ffmpeg transcode capability" {
+			reject caps.HasFFmpeg
+			expect caps.HasTesseract
+			reject caps.CPUAvailable
+			reject caps.NVENCAvailable
+			reject caps.VAAPIAvailable
+			expect caps.PreferredBackend == ""
+			expect len(caps.VideoEncoders) == 0
+			reject caps.NativeCUDA
+			reject caps.NativeNVENC
+			expect caps.NativeNVENCVer == 0
+		}
+	}
+
+	given "a worker with OCR disabled" {
+		caps := maskOCRCapabilities(transcode.Capabilities{HasTesseract: true})
+
+		then "masks tesseract capability" {
+			reject caps.HasTesseract
+		}
+	}
+}
+
+unit "SRT formatting helpers" {
+	then "formatSRTMillis formats correctly" {
+		expect formatSRTMillis(0) == "00:00:00,000"
+		expect formatSRTMillis(1000) == "00:00:01,000"
+		expect formatSRTMillis(61500) == "00:01:01,500"
+		expect formatSRTMillis(3661999) == "01:01:01,999"
+	}
+
+	then "formatSRTBlock produces valid SRT" {
+		block := formatSRTBlock(1, 1000, 5000, "Hello world")
+		expect len(block) > 0
+	}
+
+	then "normalizeOCRText cleans whitespace" {
+		expect normalizeOCRText("  hello   world  ") == "hello world"
+		expect normalizeOCRText("") == ""
+	}
+}
+
+unit "Worker config validation" {
+	given "missing server" {
+		cfg := Config{MediaRoot: "/media"}
+
+		then "fails" {
+			expect cfg.Validate() != nil
+		}
+	}
+
+	given "missing media root" {
+		cfg := Config{Server: "127.0.0.1:9090"}
+
+		then "fails" {
+			expect cfg.Validate() != nil
+		}
+	}
+
+	given "valid config" {
+		cfg := Config{Server: "127.0.0.1:9090", MediaRoot: "/media"}
+
+		then "passes" {
+			expect cfg.Validate() == nil
+		}
+	}
+
+	then "health listener accepts only literal loopback addresses" {
+		for _, listen := range []string{"127.0.0.1:9091", "[::1]:9091", ""} {
+			cfg := Config{Server: "127.0.0.1:9090", MediaRoot: "/media", HealthListen: listen}
+			expect cfg.Validate() == nil
+		}
+		for _, listen := range []string{":9091", "0.0.0.0:9091", "[::]:9091", "localhost:9091", "192.0.2.5:9091", "127.0.0.1:not-a-port", "127.0.0.1:0"} {
+			cfg := Config{Server: "127.0.0.1:9090", MediaRoot: "/media", HealthListen: listen}
+			expect cfg.Validate() != nil
+		}
+	}
+
+	then "plaintext worker v1 rejects every non-loopback server" {
+		for _, server := range []string{"goetrope:9090", "0.0.0.0:9090", "192.0.2.5:9090", "grpc://127.0.0.1:9090"} {
+			cfg := Config{Server: server, MediaRoot: "/media"}
+			expect cfg.Validate() != nil
+		}
+	}
+}
+
+unit "ocrSidecarPath" {
+	then "generates correct path" {
+		path := ocrSidecarPath("/media/movie.mp4", "en")
+		expect path == "/media/movie.en.ocr.srt"
+	}
+	then "uses und for empty language" {
+		path := ocrSidecarPath("/media/movie.mp4", "")
+		expect path == "/media/movie.und.ocr.srt"
+	}
+}

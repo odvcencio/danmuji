@@ -1,0 +1,247 @@
+package games_test
+
+import (
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/games"
+)
+
+unit "Yahtzee scoring" {
+	each "category" {
+		defaults { dice: []int{1,1,1,1,1}, category: "ones", expected: 5 }
+
+		{ name: "ones — count matching",        dice: []int{1,2,1,3,1}, category: "ones",           expected: 3 }
+		{ name: "twos — count matching",        dice: []int{2,2,3,4,5}, category: "twos",           expected: 4 }
+		{ name: "threes — count matching",      dice: []int{3,3,3,1,2}, category: "threes",         expected: 9 }
+		{ name: "fours — count matching",       dice: []int{4,4,1,2,3}, category: "fours",          expected: 8 }
+		{ name: "fives — count matching",       dice: []int{5,5,5,5,1}, category: "fives",          expected: 20 }
+		{ name: "sixes — count matching",       dice: []int{6,6,6,6,6}, category: "sixes",          expected: 30 }
+		{ name: "three_of_a_kind — hit",        dice: []int{3,3,3,1,2}, category: "three_of_a_kind", expected: 12 }
+		{ name: "three_of_a_kind — miss",       dice: []int{1,2,3,4,5}, category: "three_of_a_kind", expected: 0 }
+		{ name: "four_of_a_kind — hit",         dice: []int{4,4,4,4,2}, category: "four_of_a_kind",  expected: 18 }
+		{ name: "four_of_a_kind — miss",        dice: []int{1,1,1,2,3}, category: "four_of_a_kind",  expected: 0 }
+		{ name: "full_house — hit",             dice: []int{2,2,3,3,3}, category: "full_house",      expected: 25 }
+		{ name: "full_house — miss",            dice: []int{1,1,1,1,2}, category: "full_house",      expected: 0 }
+		{ name: "small_straight — 1234",        dice: []int{1,2,3,4,4}, category: "small_straight",  expected: 30 }
+		{ name: "small_straight — 2345",        dice: []int{2,3,4,5,1}, category: "small_straight",  expected: 30 }
+		{ name: "small_straight — 3456",        dice: []int{3,4,5,6,6}, category: "small_straight",  expected: 30 }
+		{ name: "small_straight — miss",        dice: []int{1,2,4,5,6}, category: "small_straight",  expected: 0 }
+		{ name: "large_straight — 12345",       dice: []int{1,2,3,4,5}, category: "large_straight",  expected: 40 }
+		{ name: "large_straight — 23456",       dice: []int{2,3,4,5,6}, category: "large_straight",  expected: 40 }
+		{ name: "large_straight — miss",        dice: []int{1,2,3,4,4}, category: "large_straight",  expected: 0 }
+		{ name: "yahtzee — all same",           dice: []int{5,5,5,5,5}, category: "yahtzee",         expected: 50 }
+		{ name: "yahtzee — miss",               dice: []int{5,5,5,5,4}, category: "yahtzee",         expected: 0 }
+		{ name: "chance — sum all",             dice: []int{1,2,3,4,5}, category: "chance",           expected: 15 }
+		{ name: "chance — all sixes",           dice: []int{6,6,6,6,6}, category: "chance",           expected: 30 }
+	} do {
+		then "scores correctly" {
+			d := scenario.dice.([]int)
+			cat := scenario.category.(string)
+			exp := scenario.expected.(int)
+			expect games.ScoreCategory(d, cat) == exp
+		}
+	}
+}
+
+unit "Yahtzee classic mode" {
+	given "alice rolls and scores first in a fresh classic game" {
+		g := games.NewYahtzeeGame("classic", []string{"alice", "bob"})
+		rollErr := g.Roll("alice")
+		expect rollErr == nil
+
+		scoreErr := g.Score("alice", "chance")
+		expect scoreErr == nil
+
+		then "turn advances to bob" {
+			expect g.TurnIndex == 1
+		}
+	}
+
+	given "a fresh classic game where it is alice's turn" {
+		g := games.NewYahtzeeGame("classic", []string{"alice", "bob"})
+
+		when "bob tries to roll on alice's turn" {
+			err := g.Roll("bob")
+
+			then "bob cannot roll on alice's turn" {
+				expect err != nil
+			}
+		}
+	}
+
+	given "a fresh classic game with p1 going first" {
+		g := games.NewYahtzeeGame("classic", []string{"p1", "p2"})
+
+		when "p1 rolls, scores, and then p2 rolls" {
+			_ = g.Roll("p1")
+			_ = g.Score("p1", "chance")
+			err := g.Roll("p2")
+
+			then "p2 can roll after p1 scores" {
+				expect err == nil
+			}
+		}
+	}
+
+	given "a fresh classic game where p2 has not yet had a turn" {
+		g := games.NewYahtzeeGame("classic", []string{"p1", "p2"})
+
+		when "p2 tries to roll before p1 has scored" {
+			err := g.Roll("p2")
+
+			then "p2 cannot roll on p1's turn" {
+				expect err != nil
+			}
+		}
+	}
+}
+
+unit "Yahtzee simultaneous mode" {
+	given "a simultaneous game with two players" {
+		g := games.NewYahtzeeGame("simultaneous", []string{"alice", "bob"})
+
+		when "both players roll independently" {
+			errA := g.Roll("alice")
+			errB := g.Roll("bob")
+
+			then "alice can roll" {
+				expect errA == nil
+			}
+			then "bob can roll" {
+				expect errB == nil
+			}
+		}
+
+		when "both players score independently" {
+			_ = g.Roll("alice")
+			_ = g.Roll("bob")
+			errA := g.Score("alice", "chance")
+			errB := g.Score("bob", "chance")
+
+			then "alice can score" {
+				expect errA == nil
+			}
+			then "bob can score" {
+				expect errB == nil
+			}
+		}
+	}
+}
+
+unit "Yahtzee winning condition" {
+	given "a finished simultaneous game where the first finisher also has the highest score" {
+		g := games.NewYahtzeeGame("simultaneous", []string{"alice", "bob"})
+
+		// Rig scores: fill all categories for both players.
+		// alice finishes first with a higher score.
+		cats := []string{
+			"ones", "twos", "threes", "fours", "fives", "sixes",
+			"three_of_a_kind", "four_of_a_kind", "full_house",
+			"small_straight", "large_straight", "yahtzee", "chance",
+		}
+
+		// Force alice dice to all-sixes (high scorer) and score every category
+		for _, cat := range cats {
+			g.CurrentDice["alice"] = []int{6, 6, 6, 6, 6}
+			g.RollsLeft["alice"] = 2 // simulate one roll already used
+			_ = g.Score("alice", cat)
+		}
+
+		// Force bob dice to all-ones (low scorer) and score every category
+		for _, cat := range cats {
+			g.CurrentDice["bob"] = []int{1, 1, 1, 1, 1}
+			g.RollsLeft["bob"] = 2
+			_ = g.Score("bob", cat)
+		}
+
+		then "the game is finished" {
+			expect g.IsFinished()
+		}
+		then "alice wins (first finisher with highest score)" {
+			winner, _ := g.Winner()
+			expect winner == "alice"
+		}
+	}
+
+	given "a finished simultaneous game where the first finisher has a lower score" {
+		g := games.NewYahtzeeGame("simultaneous", []string{"alice", "bob"})
+
+		cats := []string{
+			"ones", "twos", "threes", "fours", "fives", "sixes",
+			"three_of_a_kind", "four_of_a_kind", "full_house",
+			"small_straight", "large_straight", "yahtzee", "chance",
+		}
+
+		// alice finishes first but with all-ones (low score)
+		for _, cat := range cats {
+			g.CurrentDice["alice"] = []int{1, 1, 1, 1, 1}
+			g.RollsLeft["alice"] = 2
+			_ = g.Score("alice", cat)
+		}
+
+		// bob finishes second but with all-sixes (high score)
+		for _, cat := range cats {
+			g.CurrentDice["bob"] = []int{6, 6, 6, 6, 6}
+			g.RollsLeft["bob"] = 2
+			_ = g.Score("bob", cat)
+		}
+
+		then "bob wins despite finishing second" {
+			winner, _ := g.Winner()
+			expect winner == "bob"
+		}
+	}
+}
+
+unit "Yahtzee validation" {
+	given "a game where the player has used all 3 rolls" {
+		g := games.NewYahtzeeGame("classic", []string{"p1"})
+		_ = g.Roll("p1")
+		_ = g.Roll("p1")
+		_ = g.Roll("p1")
+
+		when "player tries a fourth roll" {
+			err := g.Roll("p1")
+
+			then "returns an error" {
+				expect err != nil
+			}
+		}
+	}
+
+	given "a game where a category has already been scored" {
+		g := games.NewYahtzeeGame("classic", []string{"p1"})
+		_ = g.Roll("p1")
+		_ = g.Score("p1", "chance")
+		_ = g.Roll("p1")
+
+		when "player tries to score the same category again" {
+			err := g.Score("p1", "chance")
+
+			then "returns an error" {
+				expect err != nil
+			}
+		}
+	}
+
+	given "a game where valid hold exists" {
+		g := games.NewYahtzeeGame("classic", []string{"p1"})
+		_ = g.Roll("p1")
+
+		when "player holds an invalid index" {
+			err := g.Hold("p1", []int{5})
+
+			then "returns an error" {
+				expect err != nil
+			}
+		}
+
+		when "player holds a negative index" {
+			err := g.Hold("p1", []int{-1})
+
+			then "returns an error" {
+				expect err != nil
+			}
+		}
+	}
+}

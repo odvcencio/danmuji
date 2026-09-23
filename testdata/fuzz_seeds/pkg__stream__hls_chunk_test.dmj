@@ -1,0 +1,103 @@
+package stream_test
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/stream"
+)
+
+unit "Segment-file HLS playlist completion inference" {
+	given "a chunked cache reaches the content tail without a complete marker" {
+		dir := t.TempDir()
+		for _, idx := range []int{0, 1, 2, 3} {
+			err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("seg%05d.ts", idx)), []byte("not-real-ts"), 0o644)
+			expect err == nil
+		}
+		err := os.WriteFile(filepath.Join(dir, ".chunked"), []byte("grp-1"), 0o644)
+		expect err == nil
+
+		playlist := stream.GeneratePlaylistFromSegmentFilesWithOptions(42, "h264", dir, 1.0, stream.SegmentFilePlaylistOptions{
+			ContentSegmentCount: 4,
+			QuerySuffix:         "ll=1",
+		})
+
+		then "emits an endlist" {
+			expect strings.Contains(playlist, "#EXT-X-ENDLIST")
+		}
+
+		then "marks the generated playlist as vod" {
+			expect strings.Contains(playlist, "#EXT-X-PLAYLIST-TYPE:VOD")
+		}
+	}
+
+	given "a chunked cache has not reached the content tail" {
+		dir := t.TempDir()
+		for _, idx := range []int{0, 1, 2, 3} {
+			err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("seg%05d.ts", idx)), []byte("not-real-ts"), 0o644)
+			expect err == nil
+		}
+
+		playlist := stream.GeneratePlaylistFromSegmentFilesWithOptions(42, "h264", dir, 1.0, stream.SegmentFilePlaylistOptions{
+			ContentSegmentCount: 5,
+			QuerySuffix:         "ll=1",
+		})
+
+		then "stays live" {
+			reject strings.Contains(playlist, "#EXT-X-ENDLIST")
+		}
+
+		then "does not declare playlist type" {
+			reject strings.Contains(playlist, "#EXT-X-PLAYLIST-TYPE")
+		}
+	}
+
+	given "a sliding tail window reaches the content tail" {
+		dir := t.TempDir()
+		for _, idx := range []int{30, 31, 32, 33} {
+			err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("seg%05d.ts", idx)), []byte("not-real-ts"), 0o644)
+			expect err == nil
+		}
+
+		playlist := stream.GeneratePlaylistFromSegmentFilesWithOptions(42, "h264", dir, 1.0, stream.SegmentFilePlaylistOptions{
+			ContentSegmentCount: 34,
+			MinSegmentIndex:     30,
+			QuerySuffix:         "ll=1",
+		})
+
+		then "emits an endlist" {
+			expect strings.Contains(playlist, "#EXT-X-ENDLIST")
+		}
+
+		then "does not mark the suffix window as vod" {
+			reject strings.Contains(playlist, "#EXT-X-PLAYLIST-TYPE")
+		}
+	}
+
+	given "a completed bounded prefix window does not include the full presentation" {
+		dir := t.TempDir()
+		for _, idx := range []int{0, 1, 2, 3} {
+			err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("seg%05d.ts", idx)), []byte("not-real-ts"), 0o644)
+			expect err == nil
+		}
+		err := os.WriteFile(filepath.Join(dir, ".complete"), []byte("done"), 0o644)
+		expect err == nil
+
+		playlist := stream.GeneratePlaylistFromSegmentFilesWithOptions(42, "h264", dir, 1.0, stream.SegmentFilePlaylistOptions{
+			ContentSegmentCount: 10,
+			MaxSegmentIndex:     4,
+			QuerySuffix:         "ll=1",
+		})
+
+		then "emits an endlist" {
+			expect strings.Contains(playlist, "#EXT-X-ENDLIST")
+		}
+
+		then "does not mark the prefix window as vod" {
+			reject strings.Contains(playlist, "#EXT-X-PLAYLIST-TYPE")
+		}
+	}
+}

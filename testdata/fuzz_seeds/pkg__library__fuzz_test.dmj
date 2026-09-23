@@ -1,0 +1,19 @@
+package library_test
+
+import (
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/library"
+)
+
+fuzz "ResolveFilenameMetadata does not panic" with (filename string) {
+	if filename == "" {
+		return
+	}
+	meta := library.ResolveFilenameMetadata(filename + ".mp4")
+	if meta != nil {
+		expect meta.RawTitle != ""
+		expect meta.Confidence >= 0.0
+	}
+	expect true
+}

@@ -1,0 +1,136 @@
+package config
+
+import (
+	"bytes"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"strings"
+	"testing"
+)
+
+func encodedSecuritySpecKey(fill byte) string {
+	return base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{fill}, 32))
+}
+
+unit "secret source references" {
+	then "only supported reference forms parse" {
+		for _, raw := range []string{"file:/run/secrets/goetrope/keys", "env:MASTER_KEYS", "store:systemd/master-keys"} {
+			ref, err := ParseSecretSourceRef(raw)
+			expect err == nil
+			expect ref.String() == raw
+		}
+	}
+
+	then "inline unknown and relative sources fail" {
+		for _, raw := range []string{"marker-secret", "inline:marker-secret", "file:relative", "store:systemd/a/b", "env:bad-name"} {
+			_, err := ParseSecretSourceRef(raw)
+			expect err != nil
+			reject strings.Contains(err.Error(), "marker-secret")
+		}
+	}
+}
+
+@serial
+unit "environment source lifecycle and HKDF separation" {
+	given "two ordered master keys in one environment injection" {
+		marker := "active:" + encodedSecuritySpecKey('A') + "\nold:" + encodedSecuritySpecKey('B') + "\n"
+		t.Setenv("GOETROPE_TEST_MASTER_KEYS", marker)
+		cfg := Defaults()
+		cfg.Security.MasterKeySource = "env:GOETROPE_TEST_MASTER_KEYS"
+		cfg = Normalize(cfg)
+
+		when "security is prepared" {
+			keyring, err := PrepareSecurity(cfg)
+			expect err == nil
+			defer keyring.Destroy()
+
+			then "the environment is consumed and removed" {
+				_, exists := os.LookupEnv("GOETROPE_TEST_MASTER_KEYS")
+				reject exists
+			}
+
+			then "the first key is active and the rest verify only" {
+				redacted := keyring.Redacted()
+				expect len(redacted.Keys) == 2
+				expect redacted.Keys[0].ID == "active"
+				expect redacted.Keys[0].State == "active"
+				expect redacted.Keys[1].ID == "old"
+				expect redacted.Keys[1].State == "verify-only"
+			}
+
+			then "labels derive independent keys while preserving IDs" {
+				session := keyring.Active(KeySessionMetadata)
+				stream := keyring.Active(KeyStream)
+				expect session.ID() == "active"
+				expect stream.ID() == "active"
+				reject bytes.Equal(session.Bytes(), stream.Bytes())
+				expect len(keyring.Verification(KeyRoomGuest)) == 2
+			}
+
+			then "redacted renderings never contain source material" {
+				runtimeKey := keyring.Active(KeyStream)
+				derived := runtimeKey.Bytes()
+				runtimeJSON, runtimeJSONErr := json.Marshal(runtimeKey)
+				expect runtimeJSONErr == nil
+				keyringJSON, keyringJSONErr := json.Marshal(keyring)
+				expect keyringJSONErr == nil
+				rendered := fmt.Sprintf("%v %+v %#v %v %+v %#v %s %s", runtimeKey, runtimeKey, runtimeKey, keyring, keyring, keyring, runtimeJSON, keyringJSON)
+				reject strings.Contains(rendered, encodedSecuritySpecKey('A'))
+				reject strings.Contains(rendered, encodedSecuritySpecKey('B'))
+				reject strings.Contains(rendered, string(derived))
+				reject strings.Contains(rendered, hex.EncodeToString(derived))
+				reject strings.Contains(rendered, base64.StdEncoding.EncodeToString(derived))
+			}
+		}
+	}
+}
+
+@serial
+unit "retired ambient secret variables" {
+	then "loader reports the legacy field name without reading its value" {
+		t.Chdir(t.TempDir())
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		marker := "LEGACY_MARKER_MUST_NOT_RENDER"
+		t.Setenv("GOETROPE_SESSION_SECRET", marker)
+		_, err := Load(LoadOptions{})
+		expect err != nil
+		expect strings.Contains(err.Error(), "GOETROPE_SESSION_SECRET")
+		reject strings.Contains(err.Error(), marker)
+	}
+}
+
+unit "development ephemeral keyring" {
+	then "valid loopback development may create only a redacted ephemeral ring" {
+		cfg := Defaults()
+		cfg.Security.Runtime = RuntimeDevelopment
+		cfg = Normalize(cfg)
+		keyring, err := PrepareSecurity(cfg)
+		expect err == nil
+		defer keyring.Destroy()
+		expect keyring.Redacted().Ephemeral
+		expect keyring.Active(KeyCSRF).ID() == "ephemeral"
+		expect len(keyring.Active(KeyCSRF).Bytes()) == 32
+	}
+}
+
+unit "destroyed keyring authority" {
+	then "destroy clears lookup state and invalidates a previously issued handle" {
+		cfg := Defaults()
+		cfg.Security.Runtime = RuntimeDevelopment
+		cfg = Normalize(cfg)
+		keyring, err := PrepareSecurity(cfg)
+		expect err == nil
+		handle := keyring.Active(KeyStream)
+		expect len(handle.Bytes()) == 32
+		keyring.Destroy()
+		keyring.Destroy()
+		expect keyring.Active(KeyStream).ID() == ""
+		expect len(keyring.Active(KeyStream).Bytes()) == 0
+		expect len(keyring.Verification(KeyStream)) == 0
+		expect len(keyring.KeyIDs()) == 0
+		expect len(handle.Bytes()) == 0
+	}
+}

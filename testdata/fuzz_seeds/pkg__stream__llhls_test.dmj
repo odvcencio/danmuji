@@ -1,0 +1,103 @@
+package stream_test
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/odvcencio/goetrope/pkg/stream"
+)
+
+unit "RewriteLowLatencyCMAFPlaylist" {
+	given "a live single-file cmaf playlist with tail parts" {
+		source := strings.Join([]string{
+			"#EXTM3U",
+			"#EXT-X-VERSION:7",
+			"#EXT-X-MEDIA-SEQUENCE:0",
+			"#EXT-X-PLAYLIST-TYPE:EVENT",
+			"#EXT-X-INDEPENDENT-SEGMENTS",
+			"#EXT-X-MAP:URI=\"playlist.m4s\",BYTERANGE=\"100@0\"",
+			"#EXTINF:0.250,",
+			"#EXT-X-BYTERANGE:100@100",
+			"playlist.m4s",
+			"#EXTINF:0.250,",
+			"#EXT-X-BYTERANGE:100@200",
+			"playlist.m4s",
+			"#EXTINF:0.250,",
+			"#EXT-X-BYTERANGE:100@300",
+			"playlist.m4s",
+			"#EXTINF:0.250,",
+			"#EXT-X-BYTERANGE:100@400",
+			"playlist.m4s",
+			"#EXTINF:0.250,",
+			"#EXT-X-BYTERANGE:100@500",
+			"playlist.m4s",
+		}, "\n")
+
+		when "rewriting for ll-hls" {
+			rewritten, ok, err := stream.RewriteLowLatencyCMAFPlaylist(source, stream.LowLatencyRewriteOptions{
+				MediaBasePath:   "/stream/7/original",
+				QuerySuffix:     "?ll=1",
+				SegmentDuration: stream.LowLatencySegmentDuration,
+				DefaultPartDur:  stream.LowLatencyPartDuration,
+				CanBlockReload:  true,
+			})
+
+			then "succeeds" {
+				expect err == nil
+				expect ok
+			}
+
+			then "emits part tags" {
+				expect strings.Count(rewritten, "#EXT-X-PART:") == 5
+				expect strings.Contains(rewritten, "#EXT-X-PART-INF:PART-TARGET=0.250")
+			}
+
+			then "groups the first second into a byterange segment" {
+				expect strings.Contains(rewritten, "#EXTINF:1.000,")
+				expect strings.Contains(rewritten, "#EXT-X-BYTERANGE:400@100")
+			}
+
+			then "rewrites media uris onto the stream route" {
+				expect strings.Contains(rewritten, "/stream/7/original/playlist.m4s?ll=1")
+				expect strings.Contains(rewritten, "#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"/stream/7/original/playlist.m4s?ll=1\",BYTERANGE-START=600")
+			}
+		}
+	}
+
+	given "a completed cmaf playlist" {
+		source := strings.Join([]string{
+			"#EXTM3U",
+			"#EXT-X-VERSION:7",
+			"#EXT-X-MEDIA-SEQUENCE:0",
+			"#EXT-X-PLAYLIST-TYPE:VOD",
+			"#EXT-X-MAP:URI=\"playlist.m4s\",BYTERANGE=\"100@0\"",
+			"#EXTINF:0.500,",
+			"#EXT-X-BYTERANGE:200@100",
+			"playlist.m4s",
+			"#EXTINF:0.500,",
+			"#EXT-X-BYTERANGE:200@300",
+			"playlist.m4s",
+			"#EXT-X-ENDLIST",
+		}, "\n")
+
+		when "rewriting for ll-hls" {
+			rewritten, ok, err := stream.RewriteLowLatencyCMAFPlaylist(source, stream.LowLatencyRewriteOptions{
+				MediaBasePath:   "/stream/9/h264-720p",
+				QuerySuffix:     "?ll=1",
+				SegmentDuration: stream.LowLatencySegmentDuration,
+				DefaultPartDur:  stream.LowLatencyPartDuration,
+				CanBlockReload:  true,
+			})
+
+			then "succeeds" {
+				expect err == nil
+				expect ok
+			}
+
+			then "keeps the endlist and skips preload hints" {
+				expect strings.Contains(rewritten, "#EXT-X-ENDLIST")
+				reject strings.Contains(rewritten, "#EXT-X-PRELOAD-HINT:")
+			}
+		}
+	}
+}
