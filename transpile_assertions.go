@@ -3,6 +3,7 @@ package danmuji
 import (
 	"fmt"
 	gotreesitter "github.com/odvcencio/gotreesitter"
+	"strconv"
 	"strings"
 )
 
@@ -59,6 +60,112 @@ func (t *dmjTranspiler) isNumericLiteral(n *gotreesitter.Node) bool {
 	return false
 }
 
+// expectKind classifies an expect_statement/reject_statement node by walking
+// its *direct parse-tree children and fields* — never by substring-matching
+// the statement's raw source text. Keyword forms like `is_nil`, `not_nil`,
+// and `contains` are grammar literals that show up as distinct unnamed
+// child tokens (see grammar.go's expect_statement rule); a string literal
+// like "field_not_nil" that merely *contains* those letters produces no
+// such child and must never be mistaken for the keyword.
+type expectKind int
+
+const (
+	expectKindBare expectKind = iota
+	expectKindBinary
+	expectKindIsNil
+	expectKindNotNil
+	expectKindContains
+	expectKindMessageContains
+	expectKindUnorderedEqual
+	expectKindIs
+	expectKindMatches
+	expectKindMatcher
+	// expectKindEq / expectKindNeq cover the grammar's explicit
+	// `expect X == Y` / `expect X != Y` alternatives. In practice Go's own
+	// expression grammar absorbs `==`/`!=` into a binary_expression before
+	// these alternatives get a chance to match (see expectKindBinary), but
+	// the tokens are classified structurally here too in case a future
+	// grammar revision makes this path reachable.
+	expectKindEq
+	expectKindNeq
+)
+
+func (t *dmjTranspiler) classifyExpect(n *gotreesitter.Node) expectKind {
+	sawMessage := false
+	sawIs := false
+	for i := 0; i < int(n.ChildCount()); i++ {
+		switch t.nodeType(n.Child(i)) {
+		case "is_nil":
+			return expectKindIsNil
+		case "not_nil":
+			return expectKindNotNil
+		case "unordered_equal":
+			return expectKindUnorderedEqual
+		case "contains":
+			if sawMessage {
+				return expectKindMessageContains
+			}
+			return expectKindContains
+		case "message":
+			sawMessage = true
+		case "is":
+			sawIs = true
+		case "==":
+			return expectKindEq
+		case "!=":
+			return expectKindNeq
+		}
+	}
+	if sawIs {
+		return expectKindIs
+	}
+	if t.childByField(n, "match") != nil {
+		return expectKindMatches
+	}
+	if t.childByField(n, "matcher") != nil {
+		return expectKindMatcher
+	}
+	if actual := t.childByField(n, "actual"); actual != nil &&
+		t.nodeType(actual) == "binary_expression" && actual.ChildCount() >= 3 {
+		return expectKindBinary
+	}
+	return expectKindBare
+}
+
+// expectStatementNeedsPollingHelpers reports whether an expect_statement
+// needs the shared danmujiDeepEqual/danmujiMatches/danmujiUnorderedEqual
+// helper bundle, based on its actual matcher classification — never on
+// whether the DSL keywords happen to appear as a substring of the
+// statement's raw source text (see classifyExpect's doc comment for why
+// that is unsound).
+func (t *dmjTranspiler) expectStatementNeedsPollingHelpers(n *gotreesitter.Node) bool {
+	switch t.classifyExpect(n) {
+	case expectKindMatches, expectKindUnorderedEqual:
+		return true
+	default:
+		return false
+	}
+}
+
+// verifyStatementCallsWithArgs reports whether a verify_statement uses the
+// `called with (...)` form (which needs the danmuji arg-matching helpers),
+// by checking for the assertion's own literal "with" child token rather
+// than searching the whole statement's source text for the words "called"
+// and "with" (which could also appear inside the verify target's own
+// identifier or arguments).
+func (t *dmjTranspiler) verifyStatementCallsWithArgs(n *gotreesitter.Node) bool {
+	assertion := t.childByField(n, "assertion")
+	if assertion == nil {
+		return false
+	}
+	for i := 0; i < int(assertion.ChildCount()); i++ {
+		if t.nodeType(assertion.Child(i)) == "with" {
+			return true
+		}
+	}
+	return false
+}
+
 func (t *dmjTranspiler) emitExpectCondition(n *gotreesitter.Node) string {
 	actual := t.childByField(n, "actual")
 	expected := t.childByField(n, "expected")
@@ -68,76 +175,48 @@ func (t *dmjTranspiler) emitExpectCondition(n *gotreesitter.Node) string {
 	if actual == nil {
 		return "false"
 	}
-	nodeText := t.text(n)
+	actualText := t.emit(actual)
 
-	if matchNode != nil {
-		return fmt.Sprintf("danmujiMatches(%s, %s)", t.emitMatchBlock(matchNode), t.emit(actual))
-	}
-	if strings.Contains(nodeText, "unordered_equal") && expected != nil {
-		return fmt.Sprintf("danmujiUnorderedEqual(%s, %s)", t.emit(expected), t.emit(actual))
-	}
-	if strings.Contains(nodeText, " message contains ") && expected != nil {
-		actualText := t.emit(actual)
+	switch t.classifyExpect(n) {
+	case expectKindMatches:
+		return fmt.Sprintf("danmujiMatches(%s, %s)", t.emitMatchBlock(matchNode), actualText)
+	case expectKindUnorderedEqual:
+		return fmt.Sprintf("danmujiUnorderedEqual(%s, %s)", t.emit(expected), actualText)
+	case expectKindMessageContains:
 		expectedText := t.emit(expected)
 		t.addImport("strings")
 		return fmt.Sprintf("%s != nil && strings.Contains(%s.Error(), %s)", actualText, actualText, expectedText)
-	}
-	if strings.Contains(nodeText, " is ") && expected != nil {
-		actualText := t.emit(actual)
+	case expectKindIs:
 		expectedText := t.emit(expected)
 		t.addImport("errors")
 		return fmt.Sprintf("errors.Is(%s, %s)", actualText, expectedText)
-	}
-
-	if matcher != nil {
-		actualText := t.emit(actual)
+	case expectKindMatcher:
 		matcherText := strings.TrimSpace(t.emit(matcher))
 		if expected != nil {
-			expectedText := t.emit(expected)
-			return fmt.Sprintf("%s(%s, %s)", matcherText, actualText, expectedText)
+			return fmt.Sprintf("%s(%s, %s)", matcherText, actualText, t.emit(expected))
 		}
 		return fmt.Sprintf("%s(%s)", matcherText, actualText)
-	}
-
-	if strings.Contains(nodeText, "is_nil") {
-		actualText := t.emit(actual)
+	case expectKindIsNil:
 		return fmt.Sprintf("%s == nil", actualText)
-	}
-	if strings.Contains(nodeText, "not_nil") {
-		actualText := t.emit(actual)
+	case expectKindNotNil:
 		return fmt.Sprintf("%s != nil", actualText)
-	}
-	if strings.Contains(nodeText, "contains") && expected != nil {
-		actualText := t.emit(actual)
+	case expectKindContains:
+		return fmt.Sprintf("danmujiContains(%s, %s)", actualText, t.emit(expected))
+	case expectKindNeq:
 		expectedText := t.emit(expected)
-		return fmt.Sprintf("danmujiContains(%s, %s)", actualText, expectedText)
-	}
-
-	// If the grammar's explicit expected field is populated, use it directly.
-	if expected != nil {
-		actualText := t.emit(actual)
+		if expectedText == "nil" {
+			return fmt.Sprintf("%s != nil", actualText)
+		}
+		return fmt.Sprintf("!danmujiDeepEqual(%s, %s)", expectedText, actualText)
+	case expectKindEq:
 		expectedText := t.emit(expected)
-		if strings.Contains(nodeText, "!=") {
-			// Special case: x != nil
-			if expectedText == "nil" {
-				return fmt.Sprintf("%s != nil", actualText)
-			}
-			return fmt.Sprintf("!danmujiDeepEqual(%s, %s)", expectedText, actualText)
-		}
-		// Special case: err == nil → require.NoError
-		if expectedText == "nil" && strings.HasSuffix(actualText, "err") {
-			return fmt.Sprintf("%s == nil", actualText)
-		}
-		// Special case: x == nil
 		if expectedText == "nil" {
 			return fmt.Sprintf("%s == nil", actualText)
 		}
 		return fmt.Sprintf("danmujiDeepEqual(%s, %s)", expectedText, actualText)
-	}
-
-	// If actual is a binary_expression (e.g. Go absorbed "x == 5" into one node),
-	// extract left/op/right from its children.
-	if t.nodeType(actual) == "binary_expression" && actual.ChildCount() >= 3 {
+	case expectKindBinary:
+		// actual is a binary_expression (Go absorbed "x == 5" into one node);
+		// extract left/op/right from its own children.
 		left := actual.Child(0)
 		op := actual.Child(1)
 		right := actual.Child(2)
@@ -172,7 +251,6 @@ func (t *dmjTranspiler) emitExpectCondition(n *gotreesitter.Node) string {
 	}
 
 	// Bare expect (truthiness check)
-	actualText := t.emit(actual)
 	return actualText
 }
 
@@ -189,10 +267,11 @@ func (t *dmjTranspiler) emitExpectAssertion(n *gotreesitter.Node) string {
 	ld := t.lineDirective(n)
 	nodeText := t.text(n)
 	msg := t.expectFailureContext("expect", strings.TrimSpace(nodeText), n)
+	actualText := t.emit(actual)
 
-	if matchNode != nil {
+	switch t.classifyExpect(n) {
+	case expectKindMatches:
 		t.addImport("github.com/stretchr/testify/assert")
-		actualText := t.emit(actual)
 		matchText := t.emitMatchBlock(matchNode)
 		var b strings.Builder
 		b.WriteString(ld)
@@ -202,10 +281,8 @@ func (t *dmjTranspiler) emitExpectAssertion(n *gotreesitter.Node) string {
 		b.WriteString("}\n")
 		b.WriteString("}")
 		return b.String()
-	}
-	if strings.Contains(nodeText, "unordered_equal") && expected != nil {
+	case expectKindUnorderedEqual:
 		t.addImport("github.com/stretchr/testify/assert")
-		actualText := t.emit(actual)
 		expectedText := t.emit(expected)
 		var b strings.Builder
 		b.WriteString(ld)
@@ -215,22 +292,15 @@ func (t *dmjTranspiler) emitExpectAssertion(n *gotreesitter.Node) string {
 		b.WriteString("}\n")
 		b.WriteString("}")
 		return b.String()
-	}
-	if strings.Contains(nodeText, " message contains ") && expected != nil {
+	case expectKindMessageContains:
 		t.addImport("github.com/stretchr/testify/assert")
-		actualText := t.emit(actual)
 		expectedText := t.emit(expected)
 		return ld + fmt.Sprintf("assert.ErrorContains(%s, %s, %s, %s)", t.testVar, actualText, expectedText, msg)
-	}
-	if strings.Contains(nodeText, " is ") && expected != nil {
+	case expectKindIs:
 		t.addImport("github.com/stretchr/testify/assert")
-		actualText := t.emit(actual)
 		expectedText := t.emit(expected)
 		return ld + fmt.Sprintf("assert.ErrorIs(%s, %s, %s, %s)", t.testVar, actualText, expectedText, msg)
-	}
-
-	if matcher != nil {
-		actualText := t.emit(actual)
+	case expectKindMatcher:
 		matcherText := strings.TrimSpace(t.emit(matcher))
 		t.addImport("github.com/stretchr/testify/assert")
 		if expected != nil {
@@ -238,37 +308,27 @@ func (t *dmjTranspiler) emitExpectAssertion(n *gotreesitter.Node) string {
 			return ld + fmt.Sprintf("assert.True(%s, %s(%s, %s), %s)", t.testVar, matcherText, actualText, expectedText, msg)
 		}
 		return ld + fmt.Sprintf("assert.True(%s, %s(%s), %s)", t.testVar, matcherText, actualText, msg)
-	}
-
-	if strings.Contains(nodeText, "is_nil") {
+	case expectKindIsNil:
 		t.addImport("github.com/stretchr/testify/assert")
-		actualText := t.emit(actual)
 		return ld + fmt.Sprintf("assert.Nil(%s, %s, %s)", t.testVar, actualText, msg)
-	}
-	if strings.Contains(nodeText, "not_nil") {
+	case expectKindNotNil:
 		t.addImport("github.com/stretchr/testify/assert")
-		actualText := t.emit(actual)
 		return ld + fmt.Sprintf("assert.NotNil(%s, %s, %s)", t.testVar, actualText, msg)
-	}
-	if strings.Contains(nodeText, "contains") && expected != nil {
+	case expectKindContains:
 		t.addImport("github.com/stretchr/testify/assert")
-		actualText := t.emit(actual)
 		expectedText := t.emit(expected)
 		return ld + fmt.Sprintf("assert.Contains(%s, %s, %s, %s)", t.testVar, actualText, expectedText, msg)
-	}
-
-	if expected != nil {
-		actualText := t.emit(actual)
+	case expectKindNeq:
 		expectedText := t.emit(expected)
-		if strings.Contains(nodeText, "!=") {
-			if expectedText == "nil" {
-				t.addImport("github.com/stretchr/testify/assert")
-				return ld + fmt.Sprintf("assert.NotNil(%s, %s, %s)", t.testVar, actualText, msg)
-			}
+		if expectedText == "nil" {
 			t.addImport("github.com/stretchr/testify/assert")
-			assertionName := t.inequalityAssertionName(actual, expected)
-			return ld + fmt.Sprintf("%s(%s, %s, %s, %s)", assertionName, t.testVar, expectedText, actualText, msg)
+			return ld + fmt.Sprintf("assert.NotNil(%s, %s, %s)", t.testVar, actualText, msg)
 		}
+		t.addImport("github.com/stretchr/testify/assert")
+		assertionName := t.inequalityAssertionName(actual, expected)
+		return ld + fmt.Sprintf("%s(%s, %s, %s, %s)", assertionName, t.testVar, expectedText, actualText, msg)
+	case expectKindEq:
+		expectedText := t.emit(expected)
 		if expectedText == "nil" && strings.HasSuffix(actualText, "err") {
 			t.addImport("github.com/stretchr/testify/require")
 			return ld + fmt.Sprintf("require.NoError(%s, %s, %s)", t.testVar, actualText, msg)
@@ -280,9 +340,7 @@ func (t *dmjTranspiler) emitExpectAssertion(n *gotreesitter.Node) string {
 		t.addImport("github.com/stretchr/testify/assert")
 		assertionName := t.equalityAssertionName(actual, expected)
 		return ld + fmt.Sprintf("%s(%s, %s, %s, %s)", assertionName, t.testVar, expectedText, actualText, msg)
-	}
-
-	if t.nodeType(actual) == "binary_expression" && actual.ChildCount() >= 3 {
+	case expectKindBinary:
 		left := actual.Child(0)
 		op := actual.Child(1)
 		right := actual.Child(2)
@@ -326,7 +384,6 @@ func (t *dmjTranspiler) emitExpectAssertion(n *gotreesitter.Node) string {
 	}
 
 	t.addImport("github.com/stretchr/testify/assert")
-	actualText := t.emit(actual)
 	return ld + fmt.Sprintf("assert.True(%s, %s, %s)", t.testVar, actualText, msg)
 }
 
@@ -452,7 +509,13 @@ func (t *dmjTranspiler) emitPolling(n *gotreesitter.Node, mode string) string {
 		fmt.Fprintf(&b, "\t}\n")
 	}
 	fmt.Fprintf(&b, "\tif !satisfied {\n")
-	fmt.Fprintf(&b, "\t\t%[1]s.Errorf(\"danmuji:%[2]d %[3]s check %[4]s failed after %[5]s\")\n", t.testVar, line, mode, name, timeout)
+	// name is arbitrary user text (e.g. `eventually "50% success rate"
+	// within 5s`) and MUST NOT be spliced into the format string itself —
+	// a literal "%" in name would reach t.Errorf as a bogus verb (go vet:
+	// "possible formatting directive in Errorf call"). Pass it as its own
+	// %s argument instead.
+	fmt.Fprintf(&b, "\t\t%[1]s.Errorf(\"danmuji:%[2]d %[3]s check %%s failed after %[4]s\", %[5]s)\n",
+		t.testVar, line, mode, timeout, strconv.Quote(name))
 	fmt.Fprintf(&b, "\t}\n")
 	fmt.Fprintf(&b, "}\n")
 	return b.String()
@@ -486,6 +549,13 @@ func (t *dmjTranspiler) emitProperty(n *gotreesitter.Node) string {
 		return t.text(n)
 	}
 
+	if !t.propertyBodyCanFail(bodyNode) {
+		t.addSemanticError(n,
+			fmt.Sprintf("property %q has no expect, reject, or return statement — it can never fail, so quick.Check would vacuously pass without checking anything", name),
+			`property "name" (x int) { expect x + 0 == x }`)
+		return ""
+	}
+
 	t.addImport("testing/quick")
 
 	line := t.lineOf(n)
@@ -512,8 +582,11 @@ func (t *dmjTranspiler) emitPropertyBody(b *strings.Builder, n *gotreesitter.Nod
 	for i := 0; i < int(n.NamedChildCount()); i++ {
 		c := n.NamedChild(i)
 		if t.nodeType(c) == "statement_list" {
-			for j := 0; j < int(c.NamedChildCount()); j++ {
+			lastWasReturn := false
+			stmtCount := int(c.NamedChildCount())
+			for j := 0; j < stmtCount; j++ {
 				stmt := c.NamedChild(j)
+				lastWasReturn = t.nodeType(stmt) == "return_statement"
 				switch t.nodeType(stmt) {
 				case "expect_statement", "reject_statement":
 					b.WriteString(indent)
@@ -526,11 +599,40 @@ func (t *dmjTranspiler) emitPropertyBody(b *strings.Builder, n *gotreesitter.Nod
 					t.appendIndented(b, t.emit(stmt), indent)
 				}
 			}
-			b.WriteString(indent + "return true\n")
+			// Only append the fallthrough "return true" when the body
+			// didn't already end in an explicit return: appending one
+			// unconditionally produced dead code that `go vet` flags
+			// whenever the last statement was itself a return.
+			if !lastWasReturn {
+				b.WriteString(indent + "return true\n")
+			}
 			return
 		}
 	}
 	b.WriteString(indent + "return true\n")
+}
+
+// propertyBodyCanFail reports whether a property block's body contains at
+// least one path that can return false: an expect/reject statement (which
+// compiles to `if !(...) { return false }`) or an explicit return
+// statement. A property with neither always reports success regardless of
+// what testing/quick throws at it — silently vacuous, exactly the kind of
+// "test that can never fail" this project exists to catch.
+func (t *dmjTranspiler) propertyBodyCanFail(n *gotreesitter.Node) bool {
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		c := n.NamedChild(i)
+		if t.nodeType(c) != "statement_list" {
+			continue
+		}
+		for j := 0; j < int(c.NamedChildCount()); j++ {
+			switch t.nodeType(c.NamedChild(j)) {
+			case "expect_statement", "reject_statement", "return_statement":
+				return true
+			}
+		}
+		return false
+	}
+	return false
 }
 
 func (t *dmjTranspiler) emitPollingBody(b *strings.Builder, n *gotreesitter.Node, indent string) {
