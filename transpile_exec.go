@@ -154,7 +154,7 @@ func (t *dmjTranspiler) walkChildren(n *gotreesitter.Node, fn func(*gotreesitter
 		child := n.Child(i)
 		nt := t.nodeType(child)
 		switch nt {
-		case "block", "statement_list":
+		case "block", "statement_list", "matrix_dimensions_block":
 			t.walkChildren(child, fn)
 		default:
 			if child.IsNamed() {

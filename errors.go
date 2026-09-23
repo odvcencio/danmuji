@@ -368,6 +368,21 @@ func scanForKeyword(text string, kwMap map[string]string) (string, string) {
 	return kw, prod
 }
 
+// isBareKnownKeyword reports whether an ERROR node's entire trimmed text is
+// exactly one recognized danmuji keyword, with nothing else in its span.
+// See the Layer 1 skip in formatSingleError.
+func isBareKnownKeyword(source []byte, errNode *gotreesitter.Node) bool {
+	if !errNode.IsError() {
+		return false
+	}
+	text := strings.TrimSpace(errNode.Text(source))
+	if text == "" {
+		return false
+	}
+	_, ok := keywordToProduction[text]
+	return ok
+}
+
 // buildPrefixSignature walks the parent's children up to (but not including)
 // errNode and returns a comma-separated string of their Tree-sitter node types.
 // This signature is used as the suffix of overlay map keys.
@@ -590,7 +605,20 @@ func formatSingleError(source []byte, errNode *gotreesitter.Node, lang *gotreesi
 	}
 
 	// Layer 1: grammar-derived expectations.
-	if message == "" && parent != nil {
+	//
+	// Skip this generic, purely positional diagnostic when the ERROR node's
+	// entire span is itself one bare danmuji DSL keyword (e.g. "given").
+	// As of gotreesitter v0.53.0, GLR recovery for an incomplete DSL block
+	// often isolates just the keyword token into its own ERROR sibling
+	// under the nearest enclosing structural node (e.g. the outer "block"),
+	// rather than under the DSL production it was starting (e.g.
+	// given_block). describeExpected would then report what the enclosing
+	// node expects next ("expected statement_list or \"}\""), which is
+	// true but far less useful than Layer 3's keyword-derived diagnostic
+	// ("expected string after \"given\""). A bare keyword ERROR node is
+	// exactly the case Layer 3 (and the "production|keyword" overlays) are
+	// built to handle, so let it run instead.
+	if message == "" && parent != nil && !isBareKnownKeyword(source, errNode) {
 		if msg := describeExpected(parent, errNode, lang, expectations); msg != "" {
 			// Only use if it's more specific than the generic fallback.
 			if !strings.HasPrefix(msg, "unexpected token") {

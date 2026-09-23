@@ -4,5 +4,7 @@ github.com/odvcencio/gotreesitter v0.19.1 h1:OYp/gOvm/uQnmR1ZlBcp6bDOdN8HtRBS74c
 github.com/odvcencio/gotreesitter v0.19.1/go.mod h1:hBVkghd0paaYAVwd2087vfwdeU984bQbMo9LvpE0moo=
 github.com/odvcencio/gotreesitter v0.20.5 h1:V/F/Xv3fld61IVLnlRAgdZXrwuPQba6VPDWyXTOfooc=
 github.com/odvcencio/gotreesitter v0.20.5/go.mod h1:hBVkghd0paaYAVwd2087vfwdeU984bQbMo9LvpE0moo=
+github.com/odvcencio/gotreesitter v0.53.0 h1:VWoixJYMb01xde2BSXejzMmvLagj8B01sOSqNUUqsfA=
+github.com/odvcencio/gotreesitter v0.53.0/go.mod h1:hBVkghd0paaYAVwd2087vfwdeU984bQbMo9LvpE0moo=
 golang.org/x/sys v0.13.0 h1:Af8nKPmuFypiUBjVoU9V20FiaFXOcuZI21p0ycVYYGE=
 golang.org/x/sys v0.13.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=

@@ -182,6 +182,8 @@
 ;; factory_declaration
 (factory_declaration name: (identifier) @type.definition)
 
+;; matrix_dimensions_block
+
 ;; matrix_block
 (matrix_block name: (_) @string)
 
