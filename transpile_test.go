@@ -3143,3 +3143,129 @@ unit "u" {
 		})
 	}
 }
+
+// TestTranspileDanmujiNestedGivenDistributesHooksPerThen proves — by
+// counting real executions through a compiled `go test -v` run, not by
+// reading the generated source — that `before each`/`after each` declared
+// above a `given` block fire once per leaf `then` inside that `given`, not
+// once for the whole group.
+//
+// Regression: emitSubtestBodyWithHooks used to splice the hook body once at
+// the top of the given's own Run function and then hand the given's nested
+// statement list to the hookless emitBlockInner, so a hook declared above a
+// `given` ran exactly once no matter how many `then` blocks the `given`
+// held.
+func TestTranspileDanmujiNestedGivenDistributesHooksPerThen(t *testing.T) {
+	source := []byte(`package main_test
+
+import "testing"
+
+unit "nested given hook distribution" {
+	before each {
+		t.Logf("HOOK_BEFORE_FIRED")
+	}
+
+	after each {
+		t.Logf("HOOK_AFTER_FIRED")
+	}
+
+	given "context A" {
+		then "assertion one" {
+			expect 1 == 1
+		}
+
+		then "assertion two" {
+			expect 1 == 1
+		}
+
+		then "assertion three" {
+			expect 1 == 1
+		}
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "main_test.go", goCode)
+
+	cmd := exec.Command("go", "test", "-v", "./...")
+	cmd.Dir = tmpDir
+	cmd.Env = goEnv()
+	out, err := cmd.CombinedOutput()
+	t.Logf("go test output:\n%s", string(out))
+	if err != nil {
+		t.Fatalf("go test failed: %v\n%s", err, out)
+	}
+
+	const leafCount = 3 // "assertion one", "assertion two", "assertion three"
+	if got := strings.Count(string(out), "HOOK_BEFORE_FIRED"); got != leafCount {
+		t.Errorf("before each: want %d executions (once per then inside the nested given), got %d", leafCount, got)
+	}
+	if got := strings.Count(string(out), "HOOK_AFTER_FIRED"); got != leafCount {
+		t.Errorf("after each: want %d executions (once per then inside the nested given), got %d", leafCount, got)
+	}
+}
+
+// TestTranspileDanmujiDeeplyNestedGivenWhenDistributesHooksPerThen checks
+// the same distribution through two levels of nesting (given -> when ->
+// then), so a hook declared on the outer given must reach every leaf then
+// under every when, not just the direct children of the given.
+func TestTranspileDanmujiDeeplyNestedGivenWhenDistributesHooksPerThen(t *testing.T) {
+	source := []byte(`package main_test
+
+import "testing"
+
+unit "deeply nested hook distribution" {
+	given "context A" {
+		before each {
+			t.Logf("HOOK_BEFORE_FIRED")
+		}
+
+		when "action one" {
+			then "assertion one" {
+				expect 1 == 1
+			}
+
+			then "assertion two" {
+				expect 1 == 1
+			}
+		}
+
+		when "action two" {
+			then "assertion three" {
+				expect 1 == 1
+			}
+		}
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "main_test.go", goCode)
+
+	cmd := exec.Command("go", "test", "-v", "./...")
+	cmd.Dir = tmpDir
+	cmd.Env = goEnv()
+	out, err := cmd.CombinedOutput()
+	t.Logf("go test output:\n%s", string(out))
+	if err != nil {
+		t.Fatalf("go test failed: %v\n%s", err, out)
+	}
+
+	const leafCount = 3 // "assertion one", "assertion two", "assertion three"
+	if got := strings.Count(string(out), "HOOK_BEFORE_FIRED"); got != leafCount {
+		t.Errorf("before each: want %d executions (once per then, two when levels deep), got %d", leafCount, got)
+	}
+}

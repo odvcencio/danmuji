@@ -18,13 +18,14 @@ unit "UserService" {
 
 	given "valid input" {
 		when "creating a user" {
-			name := "alice"
-			err := repo.Save(name)
-
 			then "succeeds" {
+				name := "alice"
+				err := repo.Save(name)
 				expect err == nil
 			}
 			then "returns name" {
+				name := "alice"
+				repo.Save(name)
 				expect name == "alice"
 			}
 		}
