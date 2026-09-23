@@ -2,10 +2,10 @@ package danmuji
 
 import (
 	"fmt"
+	gotreesitter "github.com/odvcencio/gotreesitter"
 	"strconv"
 	"strings"
 	"unicode"
-	gotreesitter "github.com/odvcencio/gotreesitter"
 )
 
 const (
@@ -564,7 +564,7 @@ func (t *dmjTranspiler) emitStop(n *gotreesitter.Node) string {
 	fmt.Fprintf(&b, "\tselect {\n")
 	fmt.Fprintf(&b, "\tcase err := <-done:\n")
 	fmt.Fprintf(&b, "\t\tif exitErr, ok := err.(*exec.ExitError); ok {\n")
-		fmt.Fprintf(&b, "\t\t\texitCode = exitErr.ExitCode()\n")
+	fmt.Fprintf(&b, "\t\t\texitCode = exitErr.ExitCode()\n")
 	fmt.Fprintf(&b, "\t\t}\n")
 	fmt.Fprintf(&b, "\tcase <-time.After(%s):\n", timeoutExpr)
 	fmt.Fprintf(&b, "\t\t_ = %s.Process.Kill()\n", processVarName)

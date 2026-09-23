@@ -2,9 +2,9 @@ package danmuji
 
 import (
 	"fmt"
+	gotreesitter "github.com/odvcencio/gotreesitter"
 	"strconv"
 	"strings"
-	gotreesitter "github.com/odvcencio/gotreesitter"
 )
 
 // ---------------------------------------------------------------------------

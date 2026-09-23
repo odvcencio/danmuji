@@ -2,8 +2,8 @@ package danmuji
 
 import (
 	"fmt"
-	"strings"
 	gotreesitter "github.com/odvcencio/gotreesitter"
+	"strings"
 )
 
 // ---------------------------------------------------------------------------
