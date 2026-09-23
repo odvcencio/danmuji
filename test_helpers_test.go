@@ -10,6 +10,14 @@ import (
 
 var sharedTestModuleDir string
 
+// goEnv returns the environment for "go" subprocesses spawned by tests.
+// GOWORK=off keeps a stray go.work anywhere above the process's temp
+// directory (for example under the shared /tmp root) from hijacking module
+// resolution for the isolated test module we just wrote.
+func goEnv() []string {
+	return append(os.Environ(), "GOWORK=off")
+}
+
 func TestMain(m *testing.M) {
 	if _, err := getDanmujiLanguage(); err != nil {
 		fmt.Fprintf(os.Stderr, "prime danmuji language: %v\n", err)
@@ -59,6 +67,7 @@ import _ "google.golang.org/grpc"
 
 	cmd := exec.Command("go", "mod", "tidy")
 	cmd.Dir = tmpDir
+	cmd.Env = goEnv()
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("go mod tidy: %w\n%s", err, out)
 	}
