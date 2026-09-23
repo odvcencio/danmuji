@@ -300,13 +300,13 @@ unit "database tests" {
 
 ```dmj
 @slow
-@smoke
+@skip
 integration "heavy test" { ... }
 ```
 
-Danmuji test blocks run in parallel by default. Use `@serial` to opt out when a test must stay sequential. `process`-backed tests also stay sequential automatically.
+Danmuji test blocks run in parallel by default. Use `@serial` (or `@sequential`) to opt out when a test must stay sequential. `process`-backed tests also stay sequential automatically.
 
-`@slow` adds `if testing.Short() { t.Skip() }`. `@skip` skips unconditionally. `@parallel` is accepted for compatibility and readability, but is redundant now that parallel is the default. Any `@identifier` is a valid tag.
+`@slow` adds `if testing.Short() { t.Skip() }`. `@skip` skips unconditionally. `@parallel` is accepted for compatibility and readability, but is redundant now that parallel is the default. Danmuji only recognizes `@slow`, `@skip`, `@serial`, `@sequential`, and `@parallel` — an unrecognized tag (a typo like `@skipp`, or an aspirational tag that has no actual effect) is a build error, not silently ignored.
 
 ### Scenario-driven tests
 
@@ -319,14 +319,12 @@ unit "AuthMiddleware" {
         { name: "expired token", token: "exp456", expect_status: 401 }
         { name: "wrong role",    token: "guest",  expect_status: 403 }
     } do {
-        given scenario.name {
-            req := buildRequest(scenario.method, scenario.token)
-            rec := httptest.NewRecorder()
-            handler.ServeHTTP(rec, req)
+        req := buildRequest(scenario.method, scenario.token)
+        rec := httptest.NewRecorder()
+        handler.ServeHTTP(rec, req)
 
-            then "correct status" {
-                expect rec.Code == scenario.expect_status
-            }
+        then "correct status" {
+            expect rec.Code == scenario.expect_status
         }
     }
 }
@@ -512,8 +510,8 @@ Generates `b.RunParallel`.
 ```dmj
 load "checkout endpoint" {
     rate 50
-    duration 30s
-    rampup 5s
+    duration 30 * time.Second
+    rampup 5 * time.Second
     target post "http://localhost:8080/api/checkout"
 
     then "fast enough" {
@@ -524,7 +522,7 @@ load "checkout endpoint" {
 
 Generates [vegeta](https://github.com/tsenart/vegeta) attack code with rate limiting, duration, and metrics collection. Load tests get `//go:build e2e` by default.
 
-Additional load config options: `rampup` and `concurrency`. `duration` and `rampup` accept duration literals such as `30s`, `500ms`, or plain expressions.
+Additional load config options: `rampup` and `concurrency`. `duration` and `rampup` accept plain Go duration expressions such as `30 * time.Second`. The bare `30s`/`500ms` shorthand is parsed correctly only when it is the very last statement in the `load { }` block; write it as an explicit expression everywhere else (tracked as a known gotreesitter parser limitation).
 
 ### Profiling
 
