@@ -1,11 +1,22 @@
 package danmuji
 
 import (
+	"fmt"
+	"go/format"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func gofmtSource(src string) (string, error) {
+	out, err := format.Source([]byte(src))
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
 
 func TestTranspileDanmujiSimple(t *testing.T) {
 	source := []byte(`package myservice_test
@@ -132,6 +143,7 @@ unit "basic" {
 	// Run go test
 	cmd := exec.Command("go", "test", "-v", "./...")
 	cmd.Dir = tmpDir
+	cmd.Env = goEnv()
 	out, err := cmd.CombinedOutput()
 	t.Logf("go test output:\n%s", string(out))
 	if err != nil {
@@ -166,6 +178,7 @@ unit "failing" {
 
 	cmd := exec.Command("go", "test", "-v", "./...")
 	cmd.Dir = tmpDir
+	cmd.Env = goEnv()
 	out, _ := cmd.CombinedOutput()
 	t.Logf("go test output:\n%s", string(out))
 
@@ -203,6 +216,7 @@ unit "with mock" {
 
 	cmd := exec.Command("go", "test", "-v", "./...")
 	cmd.Dir = tmpDir
+	cmd.Env = goEnv()
 	out, err := cmd.CombinedOutput()
 	t.Logf("go test output:\n%s", string(out))
 	if err != nil {
@@ -314,6 +328,7 @@ unit "tempdir fixture" {
 
 	cmd := exec.Command("go", "test", "-v", "./...")
 	cmd.Dir = tmpDir
+	cmd.Env = goEnv()
 	out, err := cmd.CombinedOutput()
 	t.Logf("go test output:\n%s", string(out))
 	if err != nil {
@@ -361,6 +376,7 @@ unit "http fixture" {
 
 	cmd := exec.Command("go", "test", "-v", "./...")
 	cmd.Dir = tmpDir
+	cmd.Env = goEnv()
 	out, err := cmd.CombinedOutput()
 	t.Logf("go test output:\n%s", string(out))
 	if err != nil {
@@ -410,6 +426,7 @@ unit "factory build" {
 
 	cmd := exec.Command("go", "test", "-v", "./...")
 	cmd.Dir = tmpDir
+	cmd.Env = goEnv()
 	out, err := cmd.CombinedOutput()
 	t.Logf("go test output:\n%s", string(out))
 	if err != nil {
@@ -470,6 +487,7 @@ unit "struct literals" {
 
 	cmd := exec.Command("go", "test", "-v", "./...")
 	cmd.Dir = tmpDir
+	cmd.Env = goEnv()
 	out, err := cmd.CombinedOutput()
 	t.Logf("go test output:\n%s", string(out))
 	if err != nil {
@@ -536,6 +554,7 @@ unit "rich assertions" {
 
 	cmd := exec.Command("go", "test", "-v", "./...")
 	cmd.Dir = tmpDir
+	cmd.Env = goEnv()
 	out, err := cmd.CombinedOutput()
 	t.Logf("go test output:\n%s", string(out))
 	if err != nil {
@@ -585,6 +604,7 @@ unit "await channel values" {
 
 	cmd := exec.Command("go", "test", "-v", "./...")
 	cmd.Dir = tmpDir
+	cmd.Env = goEnv()
 	out, err := cmd.CombinedOutput()
 	t.Logf("go test output:\n%s", string(out))
 	if err != nil {
@@ -649,8 +669,8 @@ import "testing"
 
 load "api throughput" {
 	rate 10
-	duration 5s
-	rampup 1s
+	duration 5 * time.Second
+	rampup 1 * time.Second
 	target get "http://localhost:8080/health"
 	then "healthy" {
 		expect true
@@ -710,6 +730,7 @@ unit "mixed numeric comparison" {
 
 	runCmd := exec.Command("go", "test", "-v", "./...")
 	runCmd.Dir = tmpDir
+	runCmd.Env = goEnv()
 	out, err := runCmd.CombinedOutput()
 	t.Logf("go test output:\n%s", string(out))
 	if err != nil {
@@ -755,6 +776,7 @@ unit "mixed numeric equality" {
 
 	runCmd := exec.Command("go", "test", "-v", "./...")
 	runCmd.Dir = tmpDir
+	runCmd.Env = goEnv()
 	out, err := runCmd.CombinedOutput()
 	t.Logf("go test output:\n%s", string(out))
 	if err != nil {
@@ -789,6 +811,7 @@ unit "mixed numeric inequality" {
 
 	runCmd := exec.Command("go", "test", "-v", "./...")
 	runCmd.Dir = tmpDir
+	runCmd.Env = goEnv()
 	out, _ := runCmd.CombinedOutput()
 	t.Logf("go test output:\n%s", string(out))
 
@@ -821,6 +844,7 @@ unit "echo" {
 
 	runCmd := exec.Command("go", "test", "-v", "./...")
 	runCmd.Dir = tmpDir
+	runCmd.Env = goEnv()
 	out, err := runCmd.CombinedOutput()
 	t.Logf("go test output:\n%s", string(out))
 	if err != nil {
@@ -877,6 +901,7 @@ benchmark "addition" {
 
 	cmd := exec.Command("go", "test", "-bench=.", "-benchtime=1x", "-v", "./...")
 	cmd.Dir = tmpDir
+	cmd.Env = goEnv()
 	out, err := cmd.CombinedOutput()
 	t.Logf("go test output:\n%s", string(out))
 	if err != nil {
@@ -1091,6 +1116,7 @@ unit "time travel" {
 
 	runCmd := exec.Command("go", "test", "-v", "./...")
 	runCmd.Dir = tmpDir
+	runCmd.Env = goEnv()
 	out, err := runCmd.CombinedOutput()
 	t.Logf("go test output:\n%s", string(out))
 	if err != nil {
@@ -1143,6 +1169,7 @@ func TestTranspileDanmujiFullStack(t *testing.T) {
 
 	cmd := exec.Command("go", "test", "-v", "-bench=.", "-benchtime=1x", "./...")
 	cmd.Dir = tmpDir
+	cmd.Env = goEnv()
 	out, err := cmd.CombinedOutput()
 	t.Logf("go test output:\n%s", string(out))
 	if err != nil {
@@ -1416,6 +1443,7 @@ unit "addition" {
 
 	runCmd := exec.Command("go", "test", "-v", "./...")
 	runCmd.Dir = tmpDir
+	runCmd.Env = goEnv()
 	out, err := runCmd.CombinedOutput()
 	t.Logf("go test output:\n%s", string(out))
 	if err != nil {
@@ -1525,6 +1553,7 @@ unit "matrix aliases" {
 
 	cmd := exec.Command("go", "test", "-v", "./...")
 	cmd.Dir = tmpDir
+	cmd.Env = goEnv()
 	out, err := cmd.CombinedOutput()
 	t.Logf("go test output:\n%s", string(out))
 	if err != nil {
@@ -1566,6 +1595,7 @@ unit "integer invariants" {
 	// Quick is from the standard library.
 	runCmd := exec.Command("go", "test", "-v", "./...")
 	runCmd.Dir = tmpDir
+	runCmd.Env = goEnv()
 	out, err := runCmd.CombinedOutput()
 	t.Logf("go test output:\n%s", string(out))
 	if err != nil {
@@ -1600,6 +1630,7 @@ unit "invalid invariants" {
 	// This property should fail; expect tests to fail and report the property failure.
 	runCmd := exec.Command("go", "test", "-v", "./...")
 	runCmd.Dir = tmpDir
+	runCmd.Env = goEnv()
 	out, _ := runCmd.CombinedOutput()
 	t.Logf("go test output:\n%s", string(out))
 	if !strings.Contains(string(out), "FAIL") {
@@ -1639,6 +1670,7 @@ fuzz "round trip text" with (input string, b byte) {
 
 	runCmd := exec.Command("go", "test", "-v", "./...")
 	runCmd.Dir = tmpDir
+	runCmd.Env = goEnv()
 	out, err := runCmd.CombinedOutput()
 	t.Logf("go test output:\n%s", string(out))
 	if err != nil {
@@ -1705,6 +1737,7 @@ unit "handler helpers" {
 
 	runCmd := exec.Command("go", "test", "-v", "./...")
 	runCmd.Dir = tmpDir
+	runCmd.Env = goEnv()
 	out, err := runCmd.CombinedOutput()
 	t.Logf("go test output:\n%s", string(out))
 	if err != nil {
@@ -1785,6 +1818,7 @@ unit "websocket helpers" {
 
 	runCmd := exec.Command("go", "test", "-v", "./...")
 	runCmd.Dir = tmpDir
+	runCmd.Env = goEnv()
 	out, err := runCmd.CombinedOutput()
 	t.Logf("go test output:\n%s", string(out))
 	if err != nil {
@@ -1873,6 +1907,7 @@ unit "grpc helpers" {
 
 	runCmd := exec.Command("go", "test", "-v", "./...")
 	runCmd.Dir = tmpDir
+	runCmd.Env = goEnv()
 	out, err := runCmd.CombinedOutput()
 	t.Logf("go test output:\n%s", string(out))
 	if err != nil {
@@ -1907,6 +1942,7 @@ unit "math scenarios" {
 
 	cmd := exec.Command("go", "test", "-v", "./...")
 	cmd.Dir = tmpDir
+	cmd.Env = goEnv()
 	out, err := cmd.CombinedOutput()
 	t.Logf("go test output:\n%s", string(out))
 	if err != nil {
@@ -2390,5 +2426,720 @@ unit "explicit serial" {
 
 	if strings.Contains(goCode, "t.Parallel()") {
 		t.Error("expected @serial to suppress t.Parallel()")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// V2 regression: assertion classification must dispatch on parse-tree
+// fields, never on a substring search over the statement's raw text. A
+// string literal that happens to *contain* the letters "is_nil", "not_nil",
+// "contains", "unordered_equal", or " is " must never be mistaken for the
+// corresponding DSL matcher keyword.
+// ---------------------------------------------------------------------------
+
+// TestTranspileDanmujiKeywordLookalikeStringLiteralsCompareByValue is the
+// direct V2 reproduction: `expect code == "field_not_nil"` must transpile to
+// a real equality comparison (and therefore FAIL when code != that string),
+// not `assert.NotNil(t, code == "field_not_nil")` (which is always true,
+// because a bool is never nil, so the generated test always passes).
+func TestTranspileDanmujiKeywordLookalikeStringLiteralsCompareByValue(t *testing.T) {
+	cases := []struct {
+		name        string
+		spec        string
+		mustNotHave string
+		mustHave    []string
+	}{
+		{
+			name: "not_nil substring in string literal",
+			spec: `unit "u" {
+	given "a value" {
+		code := "actual_value"
+		then "t" {
+			expect code == "field_not_nil"
+		}
+	}
+}
+`,
+			mustNotHave: "assert.NotNil(",
+		},
+		{
+			name: "is_nil substring in string literal",
+			spec: `unit "u" {
+	given "a value" {
+		code := "actual_value"
+		then "t" {
+			expect code == "status_is_nil_x"
+		}
+	}
+}
+`,
+			mustNotHave: "assert.Nil(",
+		},
+		{
+			name: "contains substring in string literal",
+			spec: `unit "u" {
+	given "a value" {
+		code := "actual_value"
+		then "t" {
+			expect code == "it_contains_stuff"
+		}
+	}
+}
+`,
+			mustNotHave: "assert.Contains(",
+		},
+		{
+			name: "unordered_equal substring in string literal",
+			spec: `unit "u" {
+	given "a value" {
+		code := "actual_value"
+		then "t" {
+			expect code == "unordered_equal_marker"
+		}
+	}
+}
+`,
+			mustNotHave: "danmujiUnorderedEqualDetail(",
+		},
+		{
+			name: "is word inside string literal",
+			spec: `unit "u" {
+	given "a value" {
+		code := "actual_value"
+		then "t" {
+			expect code == "this is a sentence"
+		}
+	}
+}
+`,
+			mustNotHave: "assert.ErrorIs(",
+		},
+		{
+			name: "message contains phrase inside string literal",
+			spec: `unit "u" {
+	given "a value" {
+		code := "actual_value"
+		then "t" {
+			expect code == "the message contains text"
+		}
+	}
+}
+`,
+			mustNotHave: "assert.ErrorContains(",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			source := []byte("package main_test\n\nimport \"testing\"\n\n" + tc.spec)
+			goCode, err := TranspileDanmuji(source, TranspileOptions{})
+			if err != nil {
+				t.Fatalf("transpile: %v", err)
+			}
+			t.Logf("Transpiled Go:\n%s", goCode)
+
+			if strings.Contains(goCode, tc.mustNotHave) {
+				t.Errorf("expected generated code NOT to contain %q (substring-keyword misclassification); got:\n%s", tc.mustNotHave, goCode)
+			}
+			if !strings.Contains(goCode, "assert.Equal") {
+				t.Errorf("expected a real equality assertion (assert.Equal/assert.EqualValues) in output, got:\n%s", goCode)
+			}
+
+			// End-to-end: the comparison is false (code != the RHS string),
+			// so the generated test MUST fail, proving the assertion is real.
+			tmpDir := newTestModule(t)
+			writeModuleFile(t, tmpDir, "main_test.go", goCode)
+
+			cmd := exec.Command("go", "test", "-v", "./...")
+			cmd.Dir = tmpDir
+			cmd.Env = goEnv()
+			out, _ := cmd.CombinedOutput()
+			t.Logf("go test output:\n%s", string(out))
+
+			if !strings.Contains(string(out), "FAIL") {
+				t.Errorf("expected the generated test to FAIL (values differ), but it passed:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestTranspileDanmujiRealMatcherKeywordsStillWork proves the fix in
+// TestTranspileDanmujiKeywordLookalikeStringLiteralsCompareByValue did not
+// regress genuine keyword matchers: when is_nil/not_nil/contains/
+// unordered_equal are used as actual DSL keywords (not substrings inside a
+// string literal), the corresponding matcher assertion must still be
+// emitted.
+func TestTranspileDanmujiRealMatcherKeywordsStillWork(t *testing.T) {
+	source := []byte(`package main_test
+
+import "testing"
+
+unit "matchers" {
+	given "values" {
+		var err error
+		items := []string{"a", "b"}
+		then "is_nil matches" {
+			expect err is_nil
+		}
+		then "not_nil matches" {
+			expect items not_nil
+		}
+		then "contains matches" {
+			expect items contains "a"
+		}
+	}
+}
+`)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	for _, want := range []string{"assert.Nil(", "assert.NotNil(", "assert.Contains("} {
+		if !strings.Contains(goCode, want) {
+			t.Errorf("expected genuine matcher keyword to still emit %q; got:\n%s", want, goCode)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// V1 regression: a DSL-only construct used outside its valid parent must
+// fail the build with a semantic error, never silently disappear. The
+// grammar accepts setup/measure/load_config/target/defaults/scenario_*/
+// process_args/process_env/ready/signal/timeout anywhere a statement is
+// valid (see grammar.go's dslStatement wiring), but each one only has
+// emitter support when its real owner (benchmark/load/each.../process/stop)
+// walks its own children by hand. Before the fix, the generic emit()
+// dispatcher silently returned "" for these node types no matter where
+// they appeared, so a misplaced `setup { expect ... }` inside a `unit`
+// vanished and the test PASSed.
+// ---------------------------------------------------------------------------
+
+func TestTranspileDanmujiRejectsSetupOutsideBenchmark(t *testing.T) {
+	source := []byte(`package main_test
+
+import "testing"
+
+unit "misused setup" {
+	setup {
+		expect 1 == 2
+	}
+	then "should still check something" {
+		expect true
+	}
+}
+`)
+	_, err := TranspileDanmuji(source, TranspileOptions{})
+	if err == nil {
+		t.Fatal("expected transpile to fail: setup{} is not valid inside a unit")
+	}
+	if !strings.Contains(err.Error(), "setup_block") {
+		t.Errorf("expected error to name setup_block, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), ":6:") {
+		t.Errorf("expected error to point at line 6 (the setup block), got: %v", err)
+	}
+}
+
+func TestTranspileDanmujiRejectsMeasureOutsideBenchmark(t *testing.T) {
+	source := []byte(`package main_test
+
+import "testing"
+
+unit "misused measure" {
+	measure {
+		expect 1 == 2
+	}
+}
+`)
+	_, err := TranspileDanmuji(source, TranspileOptions{})
+	if err == nil {
+		t.Fatal("expected transpile to fail: measure{} is not valid inside a unit")
+	}
+	if !strings.Contains(err.Error(), "measure_block") {
+		t.Errorf("expected error to name measure_block, got: %v", err)
+	}
+}
+
+// TestTranspileDanmujiRejectsMisplacedDSLConstructs sweeps every DSL-only
+// node type that grammar.go wires into the general _statement rule but
+// whose emitter only ever consumes it from a specific owning parent
+// (benchmark/load/exec/each.../matrix/process/stop). Each one, dropped
+// into a plain `unit`, must fail the build rather than vanish.
+func TestTranspileDanmujiRejectsMisplacedDSLConstructs(t *testing.T) {
+	cases := []struct {
+		name       string
+		body       string
+		wantErrHas string
+	}{
+		{"setup", `setup { expect true }`, "setup_block"},
+		{"measure", `measure { expect true }`, "measure_block"},
+		{"parallel_measure", `parallel measure { expect true }`, "parallel_measure_block"},
+		{"report_allocs", `report_allocs`, "report_directive"},
+		{"load_config", `rate 10`, "load_config"},
+		{"target", `target get "http://localhost"`, "target_block"},
+		{"run_command", `run "echo hi"`, "run_command"},
+		{"process_args", `args "-x"`, "process_args"},
+		{"process_env", `env { KEY: "value" }`, "process_env"},
+		{"ready", `ready tcp ":8080"`, "ready_clause"},
+		{"signal", `signal SIGTERM`, "signal_directive"},
+		{"timeout", `timeout 10s`, "timeout_directive"},
+		{"defaults", `defaults { count: 1 }`, "defaults_block"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			source := []byte(fmt.Sprintf(`package main_test
+
+import "testing"
+
+unit "misused %s" {
+	%s
+	then "still runs" {
+		expect true
+	}
+}
+`, tc.name, tc.body))
+			_, err := TranspileDanmuji(source, TranspileOptions{})
+			if err == nil {
+				t.Fatalf("expected transpile to fail: %s{} is not valid inside a unit", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrHas) {
+				t.Errorf("expected error to name %s, got: %v", tc.wantErrHas, err)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// V3 regression: deleting a single "{" must never let the build succeed
+// silently. Before this check, gotreesitter's error recovery could re-sync
+// a few tokens after an unbalanced brace with HasError() == false, quietly
+// dropping the rest of a `then` block (its assertion AND the next `then`
+// header) with no ERROR/MISSING node anywhere in the tree. `danmuji build`
+// exited 0 and the miscompiled `go test` passed.
+// ---------------------------------------------------------------------------
+
+func TestTranspileDanmujiRejectsUnbalancedBraceSilentDrop(t *testing.T) {
+	// This is the exact V3 reproduction: the "{" after `then "a"` is
+	// missing, so the parser resyncs past `expect 1 == 2` and the entire
+	// `then "b" {` header before it recovers.
+	source := []byte(`package p
+
+import "testing"
+
+unit "u" {
+	then "a"
+		expect 1 == 2
+	}
+	then "b" {
+		expect true
+	}
+}
+`)
+	_, err := TranspileDanmuji(source, TranspileOptions{SourceFile: "v3.dmj"})
+	if err == nil {
+		t.Fatal("expected transpile to fail: a brace was deleted and source text was silently dropped")
+	}
+	t.Logf("error: %v", err)
+	if !strings.Contains(err.Error(), "silently dropped") {
+		t.Errorf("expected a byte-coverage error naming the silent drop, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "v3.dmj:") {
+		t.Errorf("expected the error to carry the source file name, got: %v", err)
+	}
+}
+
+// TestCheckTreeCoversSourceAcceptsCleanFiles is a sanity check that the new
+// byte-coverage pass does not false-positive on ordinary, well-formed
+// specs across the existing testdata corpus.
+func TestCheckTreeCoversSourceAcceptsCleanFiles(t *testing.T) {
+	files, err := filepath.Glob(filepath.Join("testdata", "*.dmj"))
+	if err != nil {
+		t.Fatalf("glob testdata: %v", err)
+	}
+	metaFiles, err := filepath.Glob(filepath.Join("testdata", "meta", "*.dmj"))
+	if err != nil {
+		t.Fatalf("glob testdata/meta: %v", err)
+	}
+	files = append(files, metaFiles...)
+	if len(files) == 0 {
+		t.Fatal("expected at least one .dmj fixture")
+	}
+
+	for _, f := range files {
+		f := f
+		t.Run(filepath.Base(f), func(t *testing.T) {
+			src, err := os.ReadFile(f)
+			if err != nil {
+				t.Fatalf("read %s: %v", f, err)
+			}
+			if _, err := TranspileDanmuji(src, TranspileOptions{SourceFile: f}); err != nil {
+				t.Fatalf("transpile %s: %v", f, err)
+			}
+		})
+	}
+}
+
+// TestTranspileDanmujiRejectsMidBlockDurationShorthand documents a defect
+// CheckTreeCoversSource discovered in the pinned gotreesitter build: a
+// unit-suffixed duration_literal (e.g. "200ms") loses its unit and falls
+// back to Go's own int_literal ("200") when it is not the very last
+// statement in its enclosing block. Before this check existed, `duration
+// 200ms` inside testdata/meta/load_runtime_meta.dmj silently became
+// `200 * time.Second` (not 200 * time.Millisecond) with no error anywhere
+// — the load attack ran for ~200s instead of ~200ms. The fix (in both
+// testdata/load.dmj and testdata/meta/load_runtime_meta.dmj) is to spell
+// the duration as an explicit, unambiguous Go expression, e.g.
+// `200 * time.Millisecond`, which has no such ambiguity. This test keeps
+// the underlying defect visible until the gotreesitter upgrade (item 2)
+// resolves the lexer ambiguity at its root.
+func TestTranspileDanmujiRejectsMidBlockDurationShorthand(t *testing.T) {
+	source := []byte(`package main_test
+
+import "testing"
+
+load "x" {
+	rate 10
+	duration 5s
+	rampup 1s
+	target get "http://localhost"
+}
+`)
+	_, err := TranspileDanmuji(source, TranspileOptions{SourceFile: "duration_shorthand.dmj"})
+	if err == nil {
+		t.Fatal("expected transpile to fail: mid-block \"5s\" duration shorthand silently drops its unit in the pinned gotreesitter build")
+	}
+	if !strings.Contains(err.Error(), "silently dropped") {
+		t.Errorf("expected a byte-coverage error, got: %v", err)
+	}
+	t.Logf("confirmed still-open defect: %v", err)
+}
+
+// ---------------------------------------------------------------------------
+// Item 5 acceptance test: //line directives must be at column 1 (the Go
+// toolchain silently ignores an indented "//line file:N" and reports
+// failures against the *generated* file instead), and must resolve to the
+// exact source line at every nesting depth, not just depth 1.
+// ---------------------------------------------------------------------------
+
+func TestTranspileDanmujiLineDirectivesResolveAtEveryNestingDepth(t *testing.T) {
+	// Depths 1, 3, and 6: unit>then (1), unit>given>when>then (3), and
+	// unit>given>when>given>when>given>then (6). Each expect deliberately
+	// fails so `go test -v` reports a real failure location.
+	source := []byte(`package depth_test
+
+import "testing"
+
+unit "depths" {
+	then "depth one fails" {
+		expect 1 == 2
+	}
+	given "g1" {
+		when "w1" {
+			then "depth three fails" {
+				expect 1 == 2
+			}
+		}
+	}
+	given "g1" {
+		when "w1" {
+			given "g2" {
+				when "w2" {
+					given "g3" {
+						then "depth six fails" {
+							expect 1 == 2
+						}
+					}
+				}
+			}
+		}
+	}
+}
+`)
+
+	sourceFile := "depth.dmj"
+	goCode, err := TranspileDanmuji(source, TranspileOptions{SourceFile: sourceFile})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	// Every //line directive must start at column 1 (no leading
+	// whitespace) — that's the only form the Go toolchain honors.
+	for _, line := range strings.Split(goCode, "\n") {
+		trimmed := strings.TrimLeft(line, " \t")
+		if strings.HasPrefix(trimmed, "//line ") && trimmed != line {
+			t.Errorf("//line directive is indented (must start at column 1): %q", line)
+		}
+	}
+
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "depth_test.go", goCode)
+
+	cmd := exec.Command("go", "test", "-v", "./...")
+	cmd.Dir = tmpDir
+	cmd.Env = goEnv()
+	out, _ := cmd.CombinedOutput()
+	output := string(out)
+	t.Logf("go test output:\n%s", output)
+
+	for _, wantLine := range []string{
+		sourceFile + ":7:",  // depth 1: "expect 1 == 2" under "depth one fails"
+		sourceFile + ":12:", // depth 3
+		sourceFile + ":22:", // depth 6
+	} {
+		if !strings.Contains(output, wantLine) {
+			t.Errorf("expected go test output to reference %s (source failure location), got:\n%s", wantLine, output)
+		}
+	}
+	if strings.Contains(output, "depth_test.go:") {
+		t.Errorf("go test output referenced the generated file instead of %s — a //line directive did not take effect:\n%s", sourceFile, output)
+	}
+
+	vetCmd := exec.Command("go", "vet", "./...")
+	vetCmd.Dir = tmpDir
+	vetCmd.Env = goEnv()
+	vetOut, vetErr := vetCmd.CombinedOutput()
+	t.Logf("go vet output:\n%s", vetOut)
+	if vetErr != nil {
+		t.Errorf("go vet failed on generated code: %v\n%s", vetErr, vetOut)
+	}
+}
+
+// TestTranspileOutputIsAlwaysGofmtClean is the item 6 acceptance test:
+// every spec that transpiles successfully — across testdata/*.dmj,
+// testdata/meta/*.dmj, and a sample of the goetrope corpus copy in
+// testdata/fuzz_seeds — must produce gofmt-canonical output. This is
+// mostly a guard against regressing TranspileDanmuji's format.Source()
+// call (transpile_core.go): `gofmt -l` reports a file as dirty exactly
+// when reformatting it changes its bytes, so re-formatting the output and
+// diffing is equivalent to `gofmt -l` without shelling out.
+func TestTranspileOutputIsAlwaysGofmtClean(t *testing.T) {
+	var files []string
+	for _, pattern := range []string{
+		filepath.Join("testdata", "*.dmj"),
+		filepath.Join("testdata", "meta", "*.dmj"),
+	} {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			t.Fatalf("glob %s: %v", pattern, err)
+		}
+		files = append(files, matches...)
+	}
+	// Sample the (larger) goetrope corpus copy rather than all 151 files,
+	// to keep this test fast; the fuzz target already exercises the full
+	// set for the "no silent drops" property, and this test only cares
+	// about formatting.
+	seedSample, err := filepath.Glob(filepath.Join("testdata", "fuzz_seeds", "*.dmj"))
+	if err != nil {
+		t.Fatalf("glob fuzz_seeds: %v", err)
+	}
+	for i, f := range seedSample {
+		if i%5 == 0 {
+			files = append(files, f)
+		}
+	}
+	if len(files) == 0 {
+		t.Fatal("expected at least one .dmj fixture")
+	}
+
+	checked := 0
+	for _, f := range files {
+		f := f
+		t.Run(filepath.Base(f), func(t *testing.T) {
+			src, err := os.ReadFile(f)
+			if err != nil {
+				t.Fatalf("read %s: %v", f, err)
+			}
+			goCode, err := TranspileDanmuji(src, TranspileOptions{SourceFile: f})
+			if err != nil {
+				// Not every corpus file is guaranteed to transpile (some
+				// exercise syntax danmuji intentionally rejects); that's
+				// covered elsewhere. This test only checks formatting for
+				// specs that DO transpile.
+				return
+			}
+			checked++
+			refmt, err := gofmtSource(goCode)
+			if err != nil {
+				t.Fatalf("gofmt the transpiled output: %v\n%s", err, goCode)
+			}
+			if refmt != goCode {
+				t.Errorf("transpiled output for %s is not gofmt-clean; diff (gofmt-wanted vs got):\n--- wanted ---\n%s\n--- got ---\n%s", f, refmt, goCode)
+			}
+		})
+	}
+	t.Logf("checked %d/%d corpus files that transpiled successfully", checked, len(files))
+}
+
+// TestTranspileDanmujiEmptyPropertyIsACompileError is an item 6 regression:
+// a property block with no expect/reject/return statement can never fail
+// (quick.Check always sees `return true`), so it silently claims to
+// validate an invariant it never actually checks. That must be a build
+// error, not a vacuously green test.
+func TestTranspileDanmujiEmptyPropertyIsACompileError(t *testing.T) {
+	source := []byte(`package main_test
+
+import "testing"
+
+unit "u" {
+	then "empty property" {
+		property "vacuous" for all (x int) {
+		}
+	}
+}
+`)
+	_, err := TranspileDanmuji(source, TranspileOptions{})
+	if err == nil {
+		t.Fatal("expected an empty property block to fail the build")
+	}
+	if !strings.Contains(err.Error(), "vacuous") || !strings.Contains(err.Error(), "never fail") {
+		t.Errorf("expected error to explain the property can never fail, got: %v", err)
+	}
+}
+
+// TestTranspileDanmujiPropertyEndingInReturnHasNoDeadCode is an item 6
+// regression: emitPropertyBody used to append an unconditional "return
+// true" after the body, which `go vet` flags as unreachable code whenever
+// the property's last statement was itself an explicit return.
+func TestTranspileDanmujiPropertyEndingInReturnHasNoDeadCode(t *testing.T) {
+	source := []byte(`package main_test
+
+import "testing"
+
+unit "u" {
+	then "explicit return" {
+		property "manual" for all (x int) {
+			return x == x
+		}
+	}
+}
+`)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "main_test.go", goCode)
+
+	cmd := exec.Command("go", "vet", "./...")
+	cmd.Dir = tmpDir
+	cmd.Env = goEnv()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("go vet failed (likely unreachable code after an explicit return): %v\n%s", err, out)
+	}
+}
+
+// TestTranspileDanmujiEventuallyNameWithPercentIsNotAFormatDirective is an
+// item 6 regression: a "%" in an eventually/consistently block's own name
+// used to be spliced directly into t.Errorf's format string, which go vet
+// flags ("possible formatting directive in Errorf call") and which
+// corrupts the failure message at runtime. The name must always be passed
+// as its own %s argument.
+func TestTranspileDanmujiEventuallyNameWithPercentIsNotAFormatDirective(t *testing.T) {
+	source := []byte(`package main_test
+
+import "testing"
+
+unit "u" {
+	then "t" {
+		eventually "50% success rate" within 10ms {
+			expect false
+		}
+	}
+}
+`)
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if strings.Contains(goCode, `failed after %s", "50%% success rate"`) {
+		t.Error("expected the literal name, not a double-escaped %%, in the emitted argument")
+	}
+	if !strings.Contains(goCode, `"50% success rate"`) {
+		t.Error("expected the eventually name to appear as its own quoted argument")
+	}
+
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "main_test.go", goCode)
+
+	vetCmd := exec.Command("go", "vet", "./...")
+	vetCmd.Dir = tmpDir
+	vetCmd.Env = goEnv()
+	if out, err := vetCmd.CombinedOutput(); err != nil {
+		t.Fatalf("go vet flagged the generated Errorf call: %v\n%s", err, out)
+	}
+
+	runCmd := exec.Command("go", "test", "-v", "./...")
+	runCmd.Dir = tmpDir
+	runCmd.Env = goEnv()
+	out, _ := runCmd.CombinedOutput()
+	t.Logf("go test output:\n%s", out)
+	if !strings.Contains(string(out), "50% success rate") {
+		t.Errorf("expected the runtime failure message to contain the literal name, got:\n%s", out)
+	}
+	if strings.Contains(string(out), "%!") {
+		t.Errorf("expected no broken format verb (%%!) in the failure message, got:\n%s", out)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// V6 regression: an unrecognized @tag (a typo like @skipp, or an
+// aspirational tag with no implemented effect like @focus) must fail the
+// build, not compile clean and silently do nothing.
+// ---------------------------------------------------------------------------
+
+func TestTranspileDanmujiRejectsUnknownTags(t *testing.T) {
+	for _, tag := range []string{"@skipp", "@focus", "@smoke", "@flaky", "@wip"} {
+		tag := tag
+		t.Run(tag, func(t *testing.T) {
+			source := []byte(fmt.Sprintf(`package main_test
+
+import "testing"
+
+%s
+unit "u" {
+	then "t" {
+		expect true
+	}
+}
+`, tag))
+			_, err := TranspileDanmuji(source, TranspileOptions{})
+			if err == nil {
+				t.Fatalf("expected %s to be rejected as an unknown tag", tag)
+			}
+			if !strings.Contains(err.Error(), "unknown tag") {
+				t.Errorf("expected an \"unknown tag\" error, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestTranspileDanmujiAcceptsKnownTags(t *testing.T) {
+	for _, tag := range []string{"@skip", "@slow", "@serial", "@sequential", "@parallel"} {
+		tag := tag
+		t.Run(tag, func(t *testing.T) {
+			source := []byte(fmt.Sprintf(`package main_test
+
+import "testing"
+
+%s
+unit "u" {
+	then "t" {
+		expect true
+	}
+}
+`, tag))
+			if _, err := TranspileDanmuji(source, TranspileOptions{}); err != nil {
+				t.Errorf("expected %s to be accepted, got: %v", tag, err)
+			}
+		})
 	}
 }
