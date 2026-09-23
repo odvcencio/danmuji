@@ -183,6 +183,157 @@ func helper() {
 	}
 }
 
+// TestCheckRecursiveAllClean verifies that `danmuji check` on a directory of
+// valid .dmj files reports no problems and, unlike `danmuji build`, writes
+// no _danmuji_test.go output anywhere.
+func TestCheckRecursiveAllClean(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeFile(t, filepath.Join(tmpDir, "example_test.dmj"), `package example_test
+
+import "testing"
+
+unit "hello" {
+	then "works" {
+		expect 1 == 1
+	}
+}
+`)
+	writeFile(t, filepath.Join(tmpDir, "nested", "service_test.dmj"), `package nested_test
+
+import "testing"
+
+unit "nested" {
+	then "works" {
+		expect true
+	}
+}
+`)
+
+	if err := check(tmpDir); err != nil {
+		t.Fatalf("check: %v", err)
+	}
+
+	for _, outputFile := range []string{
+		filepath.Join(tmpDir, "example_danmuji_test.go"),
+		filepath.Join(tmpDir, "nested", "service_danmuji_test.go"),
+	} {
+		if _, statErr := os.Stat(outputFile); !os.IsNotExist(statErr) {
+			t.Fatalf("expected check to write no output, but found %s", outputFile)
+		}
+	}
+}
+
+// TestCheckReportsSilentDropAsFileLineDiagnostic proves `danmuji check`
+// surfaces the byte-coverage safety net (CheckTreeCoversSource) — the same
+// guarantee `danmuji build`/`danmuji test` enforce — with a file:line
+// diagnostic, and still writes no output.
+func TestCheckReportsSilentDropAsFileLineDiagnostic(t *testing.T) {
+	tmpDir := t.TempDir()
+	dmjPath := filepath.Join(tmpDir, "unbalanced_test.dmj")
+	// Missing "{" after `then "a"`: the exact V3 reproduction also covered
+	// by TestTranspileDanmujiRejectsUnbalancedBraceSilentDrop.
+	writeFile(t, dmjPath, `package p
+
+import "testing"
+
+unit "u" {
+	then "a"
+		expect 1 == 2
+	}
+	then "b" {
+		expect true
+	}
+}
+`)
+
+	err := check(dmjPath)
+	if err == nil {
+		t.Fatal("expected check to report the unbalanced brace")
+	}
+	if !strings.Contains(err.Error(), "unbalanced_test.dmj:") {
+		t.Errorf("expected a file:line diagnostic naming the file, got: %v", err)
+	}
+
+	outputFile := filepath.Join(tmpDir, "unbalanced_danmuji_test.go")
+	if _, statErr := os.Stat(outputFile); !os.IsNotExist(statErr) {
+		t.Fatalf("expected check to write no output even on failure, but found %s", outputFile)
+	}
+}
+
+// TestCheckReportsUnknownTag proves `danmuji check` surfaces tag validation
+// (an unrecognized @tag), not just parse-level problems.
+func TestCheckReportsUnknownTag(t *testing.T) {
+	tmpDir := t.TempDir()
+	dmjPath := filepath.Join(tmpDir, "tag_test.dmj")
+	writeFile(t, dmjPath, `package tag_test
+
+import "testing"
+
+@bogus unit "tagged" {
+	then "works" {
+		expect true
+	}
+}
+`)
+
+	err := check(dmjPath)
+	if err == nil {
+		t.Fatal("expected check to reject the unknown @bogus tag")
+	}
+	if !strings.Contains(err.Error(), "tag_test.dmj:") {
+		t.Errorf("expected a file:line diagnostic naming the file, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), `unknown tag "@bogus"`) {
+		t.Errorf("expected the unknown-tag message, got: %v", err)
+	}
+}
+
+// TestCheckAggregatesMultipleFileErrors mirrors
+// TestBuildRecursiveAggregatesErrors: a bad file's problem must not hide a
+// good file's cleanliness, or vice versa, and every file gets checked.
+func TestCheckAggregatesMultipleFileErrors(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeFile(t, filepath.Join(tmpDir, "good_test.dmj"), `package good_test
+
+import "testing"
+
+unit "good" {
+	then "works" {
+		expect true
+	}
+}
+`)
+	writeFile(t, filepath.Join(tmpDir, "bad_test.dmj"), `package bad_test
+
+func helper() {
+		expect
+}
+`)
+
+	err := check(tmpDir)
+	if err == nil {
+		t.Fatal("expected check to report the bad file's transpile error")
+	}
+	if !strings.Contains(err.Error(), `expected expression after "expect"`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	for _, name := range []string{"good_danmuji_test.go", "bad_danmuji_test.go"} {
+		if _, statErr := os.Stat(filepath.Join(tmpDir, name)); !os.IsNotExist(statErr) {
+			t.Fatalf("expected check to write no output, but found %s", name)
+		}
+	}
+}
+
+// TestCheckNoFiles matches runTest's no .dmj files case: check must fail
+// loudly, not silently report success on an empty set.
+func TestCheckNoFiles(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := check(tmpDir); err == nil {
+		t.Fatal("expected check to error when no .dmj files exist")
+	}
+}
+
 func TestBuildSingleFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	dmjPath := filepath.Join(tmpDir, "single.dmj")

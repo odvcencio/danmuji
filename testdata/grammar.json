@@ -2640,10 +2640,6 @@
               "type": "SYMBOL"
             },
             {
-              "name": "matrix_field",
-              "type": "SYMBOL"
-            },
-            {
               "content": {
                 "name": "process_block",
                 "type": "SYMBOL"
@@ -5023,6 +5019,15 @@
           "content": {
             "type": "STRING",
             "value": "snapshot"
+          },
+          "named": true,
+          "type": "ALIAS",
+          "value": "identifier"
+        },
+        {
+          "content": {
+            "type": "STRING",
+            "value": "handler"
           },
           "named": true,
           "type": "ALIAS",
@@ -7915,7 +7920,7 @@
         "type": "PATTERN",
         "value": "[0-9]+(?:\\.[0-9]+)?(?:ns|us|µs|ms|s|m|h)"
       },
-      "type": "IMMEDIATE_TOKEN"
+      "type": "TOKEN"
     },
     "mock_method": {
       "members": [
@@ -9338,6 +9343,90 @@
       ],
       "type": "SEQ"
     },
+    "matrix_dimensions_block": {
+      "members": [
+        {
+          "type": "STRING",
+          "value": "{"
+        },
+        {
+          "members": [
+            {
+              "members": [
+                {
+                  "name": "matrix_field",
+                  "type": "SYMBOL"
+                },
+                {
+                  "content": {
+                    "members": [
+                      {
+                        "members": [
+                          {
+                            "type": "PATTERN",
+                            "value": "\\n"
+                          },
+                          {
+                            "type": "STRING",
+                            "value": ";"
+                          },
+                          {
+                            "type": "STRING",
+                            "value": "\u0000"
+                          }
+                        ],
+                        "type": "CHOICE"
+                      },
+                      {
+                        "name": "matrix_field",
+                        "type": "SYMBOL"
+                      }
+                    ],
+                    "type": "SEQ"
+                  },
+                  "type": "REPEAT"
+                },
+                {
+                  "members": [
+                    {
+                      "members": [
+                        {
+                          "type": "PATTERN",
+                          "value": "\\n"
+                        },
+                        {
+                          "type": "STRING",
+                          "value": ";"
+                        },
+                        {
+                          "type": "STRING",
+                          "value": "\u0000"
+                        }
+                      ],
+                      "type": "CHOICE"
+                    },
+                    {
+                      "type": "BLANK"
+                    }
+                  ],
+                  "type": "CHOICE"
+                }
+              ],
+              "type": "SEQ"
+            },
+            {
+              "type": "BLANK"
+            }
+          ],
+          "type": "CHOICE"
+        },
+        {
+          "type": "STRING",
+          "value": "}"
+        }
+      ],
+      "type": "SEQ"
+    },
     "matrix_block": {
       "members": [
         {
@@ -9354,7 +9443,7 @@
         },
         {
           "content": {
-            "name": "block",
+            "name": "matrix_dimensions_block",
             "type": "SYMBOL"
           },
           "name": "dimensions",
@@ -10061,10 +10150,6 @@
     [
       "_statement",
       "scenario_field"
-    ],
-    [
-      "_statement",
-      "matrix_field"
     ],
     [
       "_statement",

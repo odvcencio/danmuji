@@ -68,8 +68,18 @@ func (f *dmjFormatter) formatSourceFile(n *gotreesitter.Node) string {
 	var b strings.Builder
 	prevEnd := n.StartByte()
 
-	for i := 0; i < n.ChildCount(); i++ {
-		child := n.Child(i)
+	// Iterate named children only. source_file's grammar rule interleaves
+	// explicit "\n"/";"/"\x00" statement-separator tokens between
+	// declarations (for Go-style ASI); those are anonymous siblings, not
+	// declarations. Walking every child, separators included, double-counts
+	// each separator: once via the byte-gap blank-line heuristic below and
+	// once more via format(child) rendering its own literal "\n" text.
+	// formatBlock already does this correctly via NamedChild; source_file
+	// did not, and the resulting doubled blank lines only surfaced once
+	// gotreesitter v0.53.0 started exposing separators as ordinary tree
+	// nodes here (see TestFormatDanmujiPreservesBlankLines).
+	for i := 0; i < n.NamedChildCount(); i++ {
+		child := n.NamedChild(i)
 		// Preserve blank lines between top-level declarations.
 		gap := string(f.src[prevEnd:child.StartByte()])
 		blankLines := strings.Count(gap, "\n")

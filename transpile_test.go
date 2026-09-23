@@ -2780,10 +2780,26 @@ unit "misused %s" {
 // exited 0 and the miscompiled `go test` passed.
 // ---------------------------------------------------------------------------
 
+// TestTranspileDanmujiRejectsUnbalancedBraceSilentDrop is the exact V3
+// reproduction: the "{" after `then "a"` is missing, so a naive parser
+// could resync past `expect 1 == 2` and the entire `then "b" {` header
+// before it recovers, silently dropping both with no ERROR/MISSING node to
+// show for it (root.HasError() == false). That was the gotreesitter
+// v0.20.5 behavior CheckTreeCoversSource's byte-coverage pass exists to
+// catch, and TranspileDanmuji used to surface this case through that
+// coverage error (message containing "silently dropped").
+//
+// gotreesitter v0.53.0 fixes the root cause for this shape of defect: the
+// same malformed input now sets root.HasError() == true, so
+// TranspileDanmuji returns the ordinary parse-error diagnostic before
+// CheckTreeCoversSource is even reached (see the HasError() branch in
+// TranspileDanmuji, transpile_core.go). CheckTreeCoversSource itself is
+// unchanged and stays in place as defense in depth (its own
+// TestCheckTreeCoversSourceAcceptsCleanFiles still guards against false
+// positives); this test only needed to stop asserting on which of the two
+// mechanisms caught the defect, since both make the same safety guarantee:
+// transpile must fail loudly, never succeed with dropped content.
 func TestTranspileDanmujiRejectsUnbalancedBraceSilentDrop(t *testing.T) {
-	// This is the exact V3 reproduction: the "{" after `then "a"` is
-	// missing, so the parser resyncs past `expect 1 == 2` and the entire
-	// `then "b" {` header before it recovers.
 	source := []byte(`package p
 
 import "testing"
@@ -2799,14 +2815,17 @@ unit "u" {
 `)
 	_, err := TranspileDanmuji(source, TranspileOptions{SourceFile: "v3.dmj"})
 	if err == nil {
-		t.Fatal("expected transpile to fail: a brace was deleted and source text was silently dropped")
+		t.Fatal("expected transpile to fail: a brace was deleted and the file no longer parses cleanly")
 	}
 	t.Logf("error: %v", err)
-	if !strings.Contains(err.Error(), "silently dropped") {
-		t.Errorf("expected a byte-coverage error naming the silent drop, got: %v", err)
-	}
 	if !strings.Contains(err.Error(), "v3.dmj:") {
 		t.Errorf("expected the error to carry the source file name, got: %v", err)
+	}
+	// The diagnostic must localize the defect at or after the missing
+	// brace (line 6, `then "a"` with no body), not silently point somewhere
+	// unrelated or, worse, say nothing about the dropped content at all.
+	if !strings.Contains(err.Error(), "v3.dmj:6:") {
+		t.Errorf("expected the error to localize the missing brace at line 6, got: %v", err)
 	}
 }
 
@@ -2841,39 +2860,51 @@ func TestCheckTreeCoversSourceAcceptsCleanFiles(t *testing.T) {
 	}
 }
 
-// TestTranspileDanmujiRejectsMidBlockDurationShorthand documents a defect
-// CheckTreeCoversSource discovered in the pinned gotreesitter build: a
-// unit-suffixed duration_literal (e.g. "200ms") loses its unit and falls
-// back to Go's own int_literal ("200") when it is not the very last
-// statement in its enclosing block. Before this check existed, `duration
-// 200ms` inside testdata/meta/load_runtime_meta.dmj silently became
-// `200 * time.Second` (not 200 * time.Millisecond) with no error anywhere
-// — the load attack ran for ~200s instead of ~200ms. The fix (in both
-// testdata/load.dmj and testdata/meta/load_runtime_meta.dmj) is to spell
-// the duration as an explicit, unambiguous Go expression, e.g.
-// `200 * time.Millisecond`, which has no such ambiguity. This test keeps
-// the underlying defect visible until the gotreesitter upgrade (item 2)
-// resolves the lexer ambiguity at its root.
-func TestTranspileDanmujiRejectsMidBlockDurationShorthand(t *testing.T) {
+// TestTranspileDanmujiMidBlockDurationShorthandParses closes out a defect
+// CheckTreeCoversSource discovered against gotreesitter v0.20.5: a
+// unit-suffixed duration_literal (e.g. "5s") lost its unit and fell back to
+// Go's own int_literal ("5") when it was not the very last statement in its
+// enclosing block — `duration 200ms` inside a load{} block silently became
+// `200 * time.Second` (not `200 * time.Millisecond`) with no error anywhere.
+// The workaround, still in effect in testdata/load.dmj and
+// testdata/meta/load_runtime_meta.dmj, is to spell the duration as an
+// explicit, unambiguous Go expression like `200 * time.Millisecond`.
+//
+// The gotreesitter v0.53.0 upgrade fixes the root cause: duration_literal's
+// grammar rule switched from ImmToken to a plain Token (see grammar.go), so
+// longest-match now correctly prefers the full "5s"/"200ms" token over a
+// truncated bare int_literal in every position, not just the last statement
+// in a block. Mid-block duration shorthand now parses correctly and
+// transpiles to the right time.Duration expression; this test proves both,
+// so a future regression here fails loudly instead of silently truncating
+// a load test's timing.
+func TestTranspileDanmujiMidBlockDurationShorthandParses(t *testing.T) {
 	source := []byte(`package main_test
 
 import "testing"
 
 load "x" {
 	rate 10
-	duration 5s
+	duration 200ms
 	rampup 1s
 	target get "http://localhost"
 }
 `)
-	_, err := TranspileDanmuji(source, TranspileOptions{SourceFile: "duration_shorthand.dmj"})
-	if err == nil {
-		t.Fatal("expected transpile to fail: mid-block \"5s\" duration shorthand silently drops its unit in the pinned gotreesitter build")
+	goCode, err := TranspileDanmuji(source, TranspileOptions{SourceFile: "duration_shorthand.dmj"})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
 	}
-	if !strings.Contains(err.Error(), "silently dropped") {
-		t.Errorf("expected a byte-coverage error, got: %v", err)
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	if !strings.Contains(goCode, "duration := 200 * time.Millisecond") {
+		t.Errorf("expected mid-block \"200ms\" to keep its unit as 200 * time.Millisecond, got:\n%s", goCode)
 	}
-	t.Logf("confirmed still-open defect: %v", err)
+	if !strings.Contains(goCode, "rampup := 1 * time.Second") {
+		t.Errorf("expected mid-block \"1s\" to keep its unit as 1 * time.Second, got:\n%s", goCode)
+	}
+	if !strings.HasPrefix(goCode, "//go:build e2e\n\npackage main_test") {
+		t.Error("expected load build tag at the top of the generated file")
+	}
 }
 
 // ---------------------------------------------------------------------------

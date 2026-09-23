@@ -66,8 +66,17 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
+	case "check":
+		if len(os.Args) < 3 {
+			fmt.Fprintf(os.Stderr, "Usage: danmuji check <path>...\n")
+			os.Exit(1)
+		}
+		if err := checkPaths(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown command: %s\nUsage: danmuji <build|test|init|fmt> <path>\n", os.Args[1])
+		fmt.Fprintf(os.Stderr, "Unknown command: %s\nUsage: danmuji <build|test|init|fmt|check> <path>\n", os.Args[1])
 		os.Exit(1)
 	}
 }
@@ -498,5 +507,76 @@ func fmtFile(path string) error {
 		return fmt.Errorf("write %s: %w", path, err)
 	}
 	fmt.Printf("  %s\n", filepath.Base(path))
+	return nil
+}
+
+// check transpiles every .dmj file under path (or path itself, if it names a
+// single file) and runs every validation TranspileDanmuji performs on it —
+// parse errors, CheckTreeCoversSource's silent-drop/byte-coverage check, and
+// semantic errors like an unrecognized @tag — without writing any output
+// file anywhere. It aggregates every failing file's error (mirroring
+// transpileFiles's aggregation in build) so one bad file does not hide
+// problems, or successes, in the rest. It returns nil only when every .dmj
+// file under path is clean.
+func check(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+
+	var files []string
+	if info.IsDir() {
+		files, err = collectDanmujiFiles(path)
+		if err != nil {
+			return err
+		}
+	} else {
+		files = []string{path}
+	}
+	if len(files) == 0 {
+		return fmt.Errorf("danmuji check: no .dmj files found at %s", path)
+	}
+
+	var failures []string
+	for _, f := range files {
+		if err := checkFile(f); err != nil {
+			failures = append(failures, err.Error())
+		}
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("%d file(s) failed:\n%s", len(failures), strings.Join(failures, "\n"))
+	}
+	return nil
+}
+
+// checkFile transpiles a single .dmj file and discards the generated Go
+// code; it never writes to disk. A non-nil error carries the same
+// file:line diagnostic transpileFile's error would (TranspileOptions.
+// SourceFile is set the same way), since check runs the identical
+// TranspileDanmuji pipeline build does, just without the os.WriteFile step.
+func checkFile(path string) error {
+	source, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	absPath, _ := filepath.Abs(path)
+	_, err = danmuji.TranspileDanmuji(source, danmuji.TranspileOptions{SourceFile: absPath})
+	return err
+}
+
+// checkPaths runs check across every CLI-provided path (each may be a file
+// or a directory) and aggregates the results into one summary. It is the
+// entry point for `danmuji check <path>...`.
+func checkPaths(paths []string) error {
+	var failures []string
+	for _, p := range paths {
+		if err := check(p); err != nil {
+			failures = append(failures, err.Error())
+		}
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("danmuji check found problems:\n%s", strings.Join(failures, "\n"))
+	}
+	fmt.Printf("danmuji check: %s: no problems found\n", strings.Join(paths, ", "))
 	return nil
 }

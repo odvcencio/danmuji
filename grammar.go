@@ -23,6 +23,17 @@ func DanmujiGrammar() *Grammar {
 
 		// Danmuji keywords should remain usable as ordinary Go identifiers when
 		// they appear in Go syntax like `exec := ...` or `profile := ...`.
+		//
+		// "handler" joined this list after gotreesitter v0.53.0's reserved-word
+		// fix (the lexer now promotes a word to its keyword token whenever the
+		// parse state has a keyword action, matching C's ts_parser__lex,
+		// instead of the inverted pre-v0.53 rule this alias list originally
+		// compensated for). Without an explicit identifier alias, `handler`
+		// can never again be a plain variable name — every occurrence, not
+		// just `handler := ...`, locks to handler_directive's keyword token
+		// and fails to parse (TestTranspileDanmujiNeedsHTTPServer,
+		// TestTranspileDanmujiHTTPTestHelpers, TestTranspileDanmujiGRPCHelpers,
+		// and README example 16 all hit this).
 		g.Define("identifier",
 			Choice(
 				Sym("_danmuji_base_identifier"),
@@ -30,6 +41,7 @@ func DanmujiGrammar() *Grammar {
 				softKeywordIdentifier("exec"),
 				softKeywordIdentifier("profile"),
 				softKeywordIdentifier("snapshot"),
+				softKeywordIdentifier("handler"),
 			))
 
 		// ---------------------------------------------------------------
@@ -139,8 +151,19 @@ func DanmujiGrammar() *Grammar {
 			))
 
 		// Optional shorthand durations for polling and time DSL (e.g., 5s, 2.5m, 30ms).
+		//
+		// This is a plain Token, not ImmToken. As of gotreesitter v0.53.0,
+		// ImmToken lost longest-match priority against a competing plain
+		// Token when both start at the same position: "200ms" would lex as
+		// int_literal "200" followed by an ERROR on "ms", even though
+		// duration_literal's match is strictly longer. Plain Token restores
+		// longest-match priority and still tolerates leading whitespace
+		// (extras) the same way ImmToken did in practice here, since every
+		// call site is preceded by a keyword ("within"/"for"/"duration"/...)
+		// separated by ordinary whitespace, not by another token this must
+		// stay adjacent to. See TestDanmujiDurationLiteralWinsLongestMatch.
 		g.Define("duration_literal",
-			ImmToken(Pat(`[0-9]+(?:\.[0-9]+)?(?:ns|us|µs|ms|s|m|h)`)),
+			Token(Pat(`[0-9]+(?:\.[0-9]+)?(?:ns|us|µs|ms|s|m|h)`)),
 		)
 
 		// ---------------------------------------------------------------
@@ -516,12 +539,43 @@ func DanmujiGrammar() *Grammar {
 			Str("}"),
 		))
 
-		// matrix_block: "matrix" string block "do" block
-		// The first block contains matrix_field statements.
+		// matrix_dimensions_block: "{" matrix_field (sep matrix_field)* "}"
+		//
+		// This is a dedicated newline/semicolon-separated list, deliberately
+		// not the generic Go "block"/"statement_list" that each_do_block's
+		// "scenarios" field reuses. "codec: { ... }" bare inside a matrix
+		// dimensions block is byte-for-byte identical to Go's
+		// labeled_statement prefix ("identifier ':' statement", where a
+		// block is a valid statement), so routing this field through the
+		// generic block/_statement machinery lets Go's labeled_statement
+		// compete for the same input and win the GLR tie in gotreesitter
+		// v0.53.0 (it did not in v0.20.5, but relying on an unspecified
+		// tie-break either way is fragile). Restricting the dimensions list
+		// to matrix_field alone removes the ambiguity outright: no
+		// labeled_statement production is even reachable here.
+		// walkChildren (transpile_exec.go) recurses into this node type the
+		// same way it does "block"/"statement_list".
+		g.Define("matrix_dimensions_block", Seq(
+			Str("{"),
+			Choice(
+				Seq(
+					Sym("matrix_field"),
+					Repeat(Seq(
+						Choice(Pat(`\n`), Str(";"), Str("\x00")),
+						Sym("matrix_field"),
+					)),
+					Optional(Choice(Pat(`\n`), Str(";"), Str("\x00"))),
+				),
+				Blank(),
+			),
+			Str("}"),
+		))
+
+		// matrix_block: "matrix" string matrix_dimensions_block "do" block
 		g.Define("matrix_block", Seq(
 			Str("matrix"),
 			Field("name", Sym("_string_literal")),
-			Field("dimensions", Sym("block")),
+			Field("dimensions", Sym("matrix_dimensions_block")),
 			Str("do"),
 			Field("body", Sym("block")),
 		))
@@ -736,7 +790,6 @@ func DanmujiGrammar() *Grammar {
 			dslStatement("defaults_block"),
 			Sym("scenario_entry"),
 			Sym("scenario_field"),
-			Sym("matrix_field"),
 			dslStatement("process_block"),
 			dslStatement("process_args"),
 			dslStatement("process_env"),
@@ -786,7 +839,6 @@ func DanmujiGrammar() *Grammar {
 		AddConflict(g, "_statement", "factory_trait_block")
 		AddConflict(g, "_statement", "scenario_entry")
 		AddConflict(g, "_statement", "scenario_field")
-		AddConflict(g, "_statement", "matrix_field")
 		AddConflict(g, "_statement", "eventually_block")
 		AddConflict(g, "_statement", "consistently_block")
 		AddConflict(g, "_statement", "await_statement")
