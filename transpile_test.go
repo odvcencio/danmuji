@@ -1561,6 +1561,65 @@ unit "matrix aliases" {
 	}
 }
 
+// TestTranspileDanmujiMatrixDistributesHooksPerThenAcrossRows checks the
+// hook-distribution fix composes correctly with table-driven `matrix ...
+// do`: a `before each` declared inside a do-block, above a nested `given`,
+// must fire once per (row x leaf then), not once per row. The do-block's
+// own body rendering (transpile_data.go) reuses the same emitBlockInner
+// that TestTranspileDanmujiNestedGivenDistributesHooksPerThen exercises, so
+// this closes the gap flagged in review: no existing test combined a
+// scenario table with nested BDD hooks.
+func TestTranspileDanmujiMatrixDistributesHooksPerThenAcrossRows(t *testing.T) {
+	source := []byte(`package main_test
+
+import "testing"
+
+unit "scenarios" {
+	matrix "cases" {
+		code: { 200, 404 }
+	} do {
+		before each {
+			t.Logf("HOOK_BEFORE_FIRED")
+		}
+
+		given "nested" {
+			then "check a" {
+				expect true
+			}
+
+			then "check b" {
+				expect true
+			}
+		}
+	}
+}
+`)
+
+	goCode, err := TranspileDanmuji(source, TranspileOptions{})
+	if err != nil {
+		t.Fatalf("transpile: %v", err)
+	}
+	t.Logf("Transpiled Go:\n%s", goCode)
+
+	tmpDir := newTestModule(t)
+	writeModuleFile(t, tmpDir, "main_test.go", goCode)
+
+	cmd := exec.Command("go", "test", "-v", "./...")
+	cmd.Dir = tmpDir
+	cmd.Env = goEnv()
+	out, err := cmd.CombinedOutput()
+	t.Logf("go test output:\n%s", string(out))
+	if err != nil {
+		t.Fatalf("go test failed: %v\n%s", err, out)
+	}
+
+	// 2 rows x 2 leaf thens ("check a", "check b") = 4 hook executions.
+	const want = 4
+	if got := strings.Count(string(out), "HOOK_BEFORE_FIRED"); got != want {
+		t.Errorf("before each: want %d executions (once per row x leaf then), got %d", want, got)
+	}
+}
+
 func TestTranspileDanmujiProperty(t *testing.T) {
 	source := []byte(`package property_test
 
