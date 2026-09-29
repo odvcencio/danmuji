@@ -43,5 +43,5 @@ jobs:
         # Short smoke pass, not the full mutation budget: exercises the
         # seed corpus plus a bit of real mutation on every PR so a
         # regression that reintroduces a silent-drop defect fails fast.
-        # Run the full budget locally/on buildbox with a longer -fuzztime.
+        # Run the full budget locally or on a dedicated host with a longer -fuzztime.
         run: go test . -run '^$' -fuzz '^FuzzTranspileNeverLosesAssertions$' -fuzztime 30s
